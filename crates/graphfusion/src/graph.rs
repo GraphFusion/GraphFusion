@@ -6,10 +6,12 @@ use datafusion::{
         datatypes::{DataType, SchemaRef},
         record_batch::RecordBatch,
     },
-    datasource::MemTable,
+    datasource::{MemTable, TableProvider},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::File,
+    path::Path,
     sync::Arc,
 };
 
@@ -31,9 +33,15 @@ pub(crate) struct Table {
     pub labels: BTreeSet<String>,
     pub schema: SchemaRef,
     pub batches: Vec<RecordBatch>,
-    pub provider: Arc<MemTable>,
+    pub provider: Arc<dyn TableProvider>,
+    pub row_count: usize,
 }
 impl NodeTable {
+    /// Reads an external Parquet table and validates it for a subsequent graph import.
+    pub fn read_parquet(labels: Vec<String>, path: impl AsRef<Path>) -> Result<Self> {
+        let (schema, batches) = read_parquet(path.as_ref())?;
+        Self::try_new(labels, schema, batches)
+    }
     /// Rows share a label set and property layout. IDs must be non-null UInt64.
     pub fn try_new(
         labels: Vec<String>,
@@ -44,6 +52,14 @@ impl NodeTable {
     }
 }
 impl EdgeTable {
+    pub fn read_parquet(
+        labels: Vec<String>,
+        directed: bool,
+        path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let (schema, batches) = read_parquet(path.as_ref())?;
+        Self::try_new(labels, directed, schema, batches)
+    }
     /// Undirected edges use the same endpoints; their ordering is immaterial.
     pub fn try_new(
         labels: Vec<String>,
@@ -57,8 +73,21 @@ impl EdgeTable {
         })
     }
 }
+
+fn read_parquet(path: &Path) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)
+        .map_err(datafusion::error::DataFusionError::from)?;
+    let schema = reader.schema().clone();
+    let batches = reader
+        .build()
+        .map_err(datafusion::error::DataFusionError::from)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(datafusion::error::DataFusionError::from)?;
+    Ok((schema, batches))
+}
 impl Table {
-    fn try_new(
+    pub(crate) fn try_new(
         labels: Vec<String>,
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
@@ -127,6 +156,7 @@ impl Table {
         Ok(Self {
             labels: label_set,
             schema,
+            row_count: batches.iter().map(RecordBatch::num_rows).sum(),
             batches,
             provider,
         })
@@ -184,18 +214,10 @@ impl GraphData {
         Ok(Self { nodes, edges })
     }
     pub fn node_count(&self) -> usize {
-        self.nodes
-            .iter()
-            .flat_map(|t| &t.0.batches)
-            .map(RecordBatch::num_rows)
-            .sum()
+        self.nodes.iter().map(|t| t.0.row_count).sum()
     }
     pub fn edge_count(&self) -> usize {
-        self.edges
-            .iter()
-            .flat_map(|t| &t.table.batches)
-            .map(RecordBatch::num_rows)
-            .sum()
+        self.edges.iter().map(|t| t.table.row_count).sum()
     }
 }
 pub(crate) fn property_types<'a>(

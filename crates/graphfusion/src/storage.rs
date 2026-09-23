@@ -1,4 +1,4 @@
-//! Storage generations with immutable Arrow graphs and internal commit-protocol test rows.
+//! Storage generations with immutable Arrow/Parquet graphs and commit-protocol test rows.
 //! No participant may publish independently of the catalog coordinator.
 use crate::{
     catalog::{CommitSeq, ObjectId},
@@ -17,6 +17,8 @@ pub(crate) struct Generation {
     pub rows: BTreeMap<String, Row>,
     #[serde(default)]
     pub graph_version: CommitSeq,
+    #[serde(default)]
+    pub parquet: Option<Arc<crate::parquet::GraphManifest>>,
     #[serde(
         default,
         serialize_with = "serialize_memory_graph",
@@ -36,6 +38,10 @@ pub(crate) enum StorageChange {
     ReplaceGraph {
         generation: ObjectId,
         data: Arc<crate::graph::GraphData>,
+    },
+    ReplaceParquet {
+        generation: ObjectId,
+        manifest: Arc<crate::parquet::GraphManifest>,
     },
     Create(ObjectId),
     Retire(ObjectId),
@@ -58,6 +64,22 @@ impl StorageSnapshot {
                     return Err(Error::Conflict("graph generation was retired".into()));
                 }
                 target.graph = Some(data.clone());
+                target.parquet = None;
+                target.graph_version = seq;
+            }
+            StorageChange::ReplaceParquet {
+                generation,
+                manifest,
+            } => {
+                let target = self
+                    .generations
+                    .get_mut(generation)
+                    .ok_or_else(|| Error::Corrupt("missing graph generation".into()))?;
+                if target.retired_at.is_some() {
+                    return Err(Error::Conflict("graph generation was retired".into()));
+                }
+                target.graph = None;
+                target.parquet = Some(manifest.clone());
                 target.graph_version = seq;
             }
             StorageChange::Create(id) => {
@@ -70,6 +92,7 @@ impl StorageSnapshot {
                         retired_at: None,
                         rows: BTreeMap::new(),
                         graph: None,
+                        parquet: None,
                         graph_version: 0,
                     },
                 );

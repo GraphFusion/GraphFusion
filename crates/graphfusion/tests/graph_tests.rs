@@ -106,6 +106,69 @@ fn database() -> (Database, Session) {
     session.replace_graph_data(fixture()).unwrap();
     (db, session)
 }
+
+#[tokio::test]
+async fn parquet_matches_arrow_semantics_after_checkpoint_and_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "graphfusion-layouts-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let db = Database::open(
+            &path,
+            graphfusion::OpenOptions {
+                create_if_missing: true,
+            },
+        )
+        .unwrap();
+        let mut session = db.session();
+        session
+            .execute("CREATE GRAPH social ANY GRAPH; SESSION SET GRAPH social")
+            .unwrap();
+        session.replace_graph_data(fixture()).unwrap();
+        db.checkpoint().unwrap();
+    }
+    {
+        let db = Database::open(&path, graphfusion::OpenOptions::default()).unwrap();
+        let mut durable = db.session();
+        durable.execute("SESSION SET GRAPH social").unwrap();
+        let (_memory, mut memory) = database();
+        for query in [
+            "MATCH (n) RETURN n.name AS name, n.age AS age ORDER BY name",
+            "MATCH (n:Person&Admin) RETURN n.name AS name",
+            "MATCH (a)-[e:Friend]-(b) RETURN a.name AS a, b.name AS b ORDER BY a, b",
+            "MATCH (a)-[:Knows]->(b)-[:Knows]->(c) RETURN a.name AS a, c.name AS c ORDER BY a, c",
+            "MATCH (a)<-[:Knows]-(b) RETURN a.name AS a, b.name AS b ORDER BY a, b",
+            "MATCH (n) WHERE PROPERTY_EXISTS(n, age) RETURN n.name AS name ORDER BY name",
+            "MATCH (n) WHERE n.age IS NULL RETURN n.name AS name ORDER BY name",
+            "MATCH (n:Missing) RETURN n.name AS name",
+        ] {
+            assert_eq!(
+                strings(&durable.query(query).await.unwrap()),
+                strings(&memory.query(query).await.unwrap()),
+                "{query}"
+            );
+        }
+        let empty_table = GraphData::try_new(
+            vec![nodes(&["Person"], vec![], vec![], Some(vec![]))],
+            vec![],
+        )
+        .unwrap();
+        durable.replace_graph_data(empty_table).unwrap();
+        let result = durable
+            .query("MATCH (n:Person) RETURN n.age AS age")
+            .await
+            .unwrap();
+        assert_eq!(result.row_count(), 0);
+        assert_eq!(result.schema.field(0).data_type(), &DataType::Int64);
+        db.checkpoint().unwrap();
+    }
+    std::fs::remove_dir_all(path).unwrap();
+}
 fn strings(result: &QueryResult) -> Vec<Vec<String>> {
     result
         .batches

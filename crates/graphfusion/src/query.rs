@@ -49,10 +49,19 @@ pub(crate) async fn execute(
     let [ast::Statement::Query(query)] = program.statements.as_slice() else {
         return Err(unsupported("query() requires exactly one read-only query"));
     };
+    execute_statement(db, session, query, program.at_schema.as_ref()).await
+}
+
+pub(crate) async fn execute_statement(
+    db: &Database,
+    session: &SessionState,
+    query: &ast::QueryStatement,
+    at_schema: Option<&ast::SchemaReference>,
+) -> Result<QueryResult> {
     // The lease is held through planning AND materialization, including every await.
     let mut tx = StatementTxn::begin(db)?;
     let mut context = session.clone();
-    if let Some(schema) = &program.at_schema {
+    if let Some(schema) = at_schema {
         context.current_schema = crate::session::schema_reference(&mut tx, session, schema)?;
     }
     let plan = plan(query, &context, &mut tx)?;

@@ -1,7 +1,7 @@
 # Catalog, sessions, and commit protocol
 
 GraphFusion implements a persistent catalog and a session executor for catalog
-DDL. It also coordinates [in-memory Arrow graph snapshots](graphs.md) for MATCH;
+DDL. It also coordinates [Arrow and Parquet graph snapshots](graphs.md) for MATCH;
 GQL graph data modifications remain unimplemented. The
 internal storage participant stores versioned test rows to verify that catalog
 and data changes share one transaction; it is not a graph storage engine.
@@ -126,7 +126,8 @@ local reference count is used as authority for another process's readers.
 
 ## Durable format and recovery
 
-`MANIFEST` identifies the database, format, checkpoint generation, commit and ID
+Format version 2 adds durable graph manifests; earlier format versions are rejected
+and there is no migration command yet. `MANIFEST` identifies the database, format, checkpoint generation, commit and ID
 watermarks, and obsolete file generations. It names corresponding
 `catalog-N.snapshot`, `data-N.snapshot`, and `wal-N.log` files. Snapshots and the
 WAL header repeat identity and generation information to reject mixed files.
@@ -137,8 +138,8 @@ Documents and log records use JSON payloads inside binary frames with magic,
 length, header CRC32, payload CRC32 and a final marker. The frame protects length
 independently so length corruption cannot silently discard later committed data.
 Each document/frame currently has a 64 MiB limit, including each complete
-checkpoint snapshot. This format is intended for the initial catalog and test
-storage participant, not large graph datasets.
+checkpoint snapshot. Graph rows live in separate immutable Parquet files; the
+framed metadata stores their schemas, labels, sizes, row counts, and file IDs.
 
 A commit frame contains catalog deltas and storage deltas together. Object IDs
 are reserved in durable blocks before exposure, permitting gaps but preventing
@@ -184,9 +185,10 @@ references already reclaimed data. Checkpoint never truncates the old WAL before
 the replacement manifest is durable. Retired rows cannot fall through to a stale
 checkpoint because catalog and data snapshot generations move together.
 
-A future physical graph engine must generate its data changes through this
-coordinator. If logs reference external newly created files, those files and
-their directory entries must be durable before committing the references.
+The Parquet storage engine generates its graph changes through this coordinator.
+New graph files and their directory entries are durable before committing their
+references. Checkpoint also reclaims unreferenced managed Parquet files after the
+new manifest is durable, using the same exclusive lease as catalog reclamation.
 Removing properties or indexes must retire their resources using the same
 snapshot and checkpoint gates; it must not mutate old readers' layouts in place.
 

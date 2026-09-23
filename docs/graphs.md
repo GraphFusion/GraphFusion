@@ -1,8 +1,8 @@
 # Arrow graph storage and MATCH
 
-GraphFusion can now import an in-memory property graph and run fixed-length GQL
+GraphFusion can import an Arrow property graph and run fixed-length GQL
 MATCH queries through DataFusion. The catalog selects the graph; DataFusion scans
-Arrow/MemTable providers and executes the joins. There is no graph traversal loop
+Arrow/MemTable or Parquet providers and executes the joins. There is no graph traversal loop
 outside DataFusion.
 
 Run the complete example:
@@ -89,18 +89,17 @@ Disjoint graph replacements can commit concurrently; two replacements of the sam
 version cannot both commit. Catalog identity checks also reject a writer whose
 graph was dropped or replaced.
 
-Readers keep the old Arrow buffers and catalog snapshot through physical planning
+Readers keep the old Arrow buffers or Parquet files and catalog snapshot through physical planning
 and materialization. DROP retires the storage generation; checkpoint cannot
 reclaim it until all statement leases are released. The import API has no direct
 path that can independently publish a provider outside the coordinator.
 
-This task supports `Database::new()` with open graphs. Import into persistent or
-typed graphs is rejected before any changes publish; typed graph scanning also
-waits for schema binding. Memory graph data deliberately cannot be serialized to
-the metadata log/checkpoint, preventing a misleading durability promise. The next
-storage task will stage immutable Parquet files and commit their manifest through
-this same coordinator. GQL writes, a persistent CLI, and standard conformance are
-still required before the overall database objective is complete.
+Both `Database::new()` and `Database::open(...)` support open graph imports.
+Persistent databases stage immutable Parquet files and publish their manifests
+through the same coordinator; see [storage and CLI](storage-cli.md). Typed graph
+imports and scans still wait for schema binding and validation. Memory buffers
+cannot be serialized into the metadata log/checkpoint. GQL writes and standard
+conformance are still required before the overall database objective is complete.
 
 ## Evidence and semantic references
 
@@ -108,7 +107,7 @@ still required before the overall database objective is complete.
 multi-label identity, duplicates/cycles, all principal edge directions, graph
 selection, stale references, typed nulls and binding isolation. Library tests
 exercise graph replacement conflicts, old snapshots across replacement and DROP,
-memory-serialization rejection and durable-import rejection.
+memory-serialization rejection, durable import/recovery, and Parquet file reclamation.
 
 Implementation behavior was cross-checked against these primary implementation
 documents. They are not a substitute for the final normative ISO coverage audit:

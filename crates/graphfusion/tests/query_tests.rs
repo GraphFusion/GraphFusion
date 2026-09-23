@@ -1,6 +1,40 @@
 use datafusion::{arrow::datatypes::DataType, common::ScalarValue};
 use graphfusion::{Database, Error, QueryResult, Value};
 
+#[tokio::test]
+async fn mixed_program_outputs_schema_context_and_atomic_continuations() {
+    let db = Database::new();
+    let mut session = db.session();
+    let outputs = session
+        .run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; RETURN 42 AS result")
+        .await
+        .unwrap();
+    assert_eq!(outputs.len(), 3);
+    assert!(
+        matches!(&outputs[2], graphfusion::StatementOutput::Query(result) if result.row_count() == 1)
+    );
+    let outputs = session
+        .run("AT SCHEMA main USE GRAPH g MATCH (n) RETURN ELEMENT_ID(n) AS id")
+        .await
+        .unwrap();
+    assert!(
+        matches!(&outputs[0], graphfusion::StatementOutput::Query(result) if result.row_count() == 0)
+    );
+    assert!(session
+        .run("CREATE GRAPH rolled_back ANY GRAPH NEXT RETURN 1 AS n")
+        .await
+        .is_err());
+    assert!(session
+        .query("USE GRAPH rolled_back MATCH (n) RETURN ELEMENT_ID(n) AS id")
+        .await
+        .is_err());
+    assert!(session.run("SESSION CLOSE; RETURN 1 AS n").await.is_err());
+    assert!(matches!(
+        session.run("RETURN 1 AS n").await,
+        Err(Error::SessionClosed)
+    ));
+}
+
 fn row(result: &QueryResult) -> Vec<ScalarValue> {
     assert_eq!(result.row_count(), 1);
     let batch = result.batches.iter().find(|b| b.num_rows() > 0).unwrap();

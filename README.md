@@ -36,7 +36,25 @@ MATCH over validated Arrow graph tables. Run
 `cargo run -p graphfusion --example scalar --locked` for an executable example.
 See [query execution](docs/query.md) and [graph import and MATCH](docs/graphs.md).
 `cargo run -p graphfusion --example social --locked` runs a two-hop social graph
-query. Persistent graph storage and GQL mutations are subsequent tasks.
+query. Pass a new database directory after `--` to persist the example in Parquet.
+GQL mutations are a subsequent task.
+
+## CLI and Parquet storage
+
+The CLI runs a GQL file or query, imports external Parquet tables, and checkpoints
+a persistent database. For example:
+
+```sh
+cargo run -p graphfusion --example social --locked -- /tmp/graphfusion-social
+cargo run -p graphfusion --locked -- run --database /tmp/graphfusion-social \
+  --query "USE GRAPH social MATCH (n:Person) RETURN n.name AS name ORDER BY name" --explain
+cargo run -p graphfusion --locked -- checkpoint --database /tmp/graphfusion-social
+```
+
+`Session::replace_graph_data` writes immutable Parquet files in durable databases;
+DataFusion scans those files directly. `Session::run(...).await` executes mixed
+catalog/session/query programs. See [storage and CLI usage](docs/storage-cli.md)
+for the import manifest, transaction boundaries, crash recovery, and limits.
 
 ## Catalog and Sessions
 
