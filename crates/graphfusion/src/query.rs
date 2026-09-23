@@ -2,6 +2,7 @@
 mod arithmetic;
 mod expressions;
 mod graph;
+mod mutations;
 
 use crate::{
     catalog::CommitSeq, gql as ast, transaction::StatementTxn, Database, Error, Result,
@@ -11,10 +12,43 @@ use datafusion::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
     execution::context::SessionContext,
     logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder},
-    physical_plan::{collect, displayable},
 };
 use expressions::Binder;
 use std::collections::BTreeSet;
+
+pub(crate) fn write_query(statement: &ast::Statement) -> Option<ast::QueryStatement> {
+    let clause = match statement {
+        ast::Statement::Query(query) => return Some(query.clone()),
+        ast::Statement::Insert(s) => ast::QueryClause::Insert(s.clone()),
+        ast::Statement::Set(s) => ast::QueryClause::Set(s.clone()),
+        ast::Statement::Remove(s) => ast::QueryClause::Remove(s.clone()),
+        ast::Statement::Delete(s) => ast::QueryClause::Delete(s.clone()),
+        _ => return None,
+    };
+    Some(ast::QueryStatement {
+        at_schema: None,
+        use_graph: None,
+        set_operations: vec![],
+        body: ast::QueryBody {
+            clauses: vec![clause],
+            result_clause: ast::ResultClause {
+                kind: ast::ResultKind::Finish,
+                quantifier: None,
+                distinct: false,
+                items: vec![],
+            },
+            select_from: vec![],
+            select_query: None,
+            select_where: None,
+            group_by: vec![],
+            empty_grouping_set: false,
+            having: None,
+            order_by: vec![],
+            offset: None,
+            limit: None,
+        },
+    })
+}
 
 #[derive(Debug)]
 pub struct QueryResult {
@@ -24,6 +58,8 @@ pub struct QueryResult {
     pub commit_seq: CommitSeq,
     pub logical_plan: String,
     pub physical_plan: String,
+    /// Inserted/deleted elements plus distinct targets per SET/REMOVE item.
+    pub affected_elements: usize,
 }
 
 impl QueryResult {
@@ -49,7 +85,7 @@ pub(crate) async fn execute(
     let [ast::Statement::Query(query)] = program.statements.as_slice() else {
         return Err(unsupported("query() requires exactly one read-only query"));
     };
-    execute_statement(db, session, query, program.at_schema.as_ref()).await
+    execute_statement(db, session, query, program.at_schema.as_ref(), false).await
 }
 
 pub(crate) async fn execute_statement(
@@ -57,6 +93,7 @@ pub(crate) async fn execute_statement(
     session: &SessionState,
     query: &ast::QueryStatement,
     at_schema: Option<&ast::SchemaReference>,
+    allow_writes: bool,
 ) -> Result<QueryResult> {
     // The lease is held through planning AND materialization, including every await.
     let mut tx = StatementTxn::begin(db)?;
@@ -64,20 +101,31 @@ pub(crate) async fn execute_statement(
     if let Some(schema) = at_schema {
         context.current_schema = crate::session::schema_reference(&mut tx, session, schema)?;
     }
-    let plan = plan(query, &context, &mut tx)?;
-    let logical_plan = plan.display_indent().to_string();
     let ctx = SessionContext::new();
-    let physical = ctx.state().create_physical_plan(&plan).await?;
-    let schema = physical.schema();
-    let physical_plan = displayable(physical.as_ref()).indent(true).to_string();
-    let batches = collect(physical, ctx.task_ctx()).await?;
+    let mut writes = mutations::Writes::default();
+    let mut trace = mutations::Trace::default();
+    let plan = plan(
+        query,
+        &context,
+        &mut tx,
+        &ctx,
+        &mut writes,
+        &mut trace,
+        allow_writes,
+    )
+    .await?;
+    let (schema, batches) = trace.collect(&ctx, &plan).await?;
+    for (graph, data) in writes.graphs {
+        tx.replace_graph_data(graph, data)?;
+    }
     let commit_seq = tx.commit()?;
     Ok(QueryResult {
         schema,
         batches,
         commit_seq,
-        logical_plan,
-        physical_plan,
+        logical_plan: trace.logical.join("\n"),
+        physical_plan: trace.physical.join("\n"),
+        affected_elements: writes.affected,
     })
 }
 
@@ -85,10 +133,15 @@ fn unsupported(feature: &str) -> Error {
     Error::UnsupportedFeature(feature.into())
 }
 
-fn plan(
+#[allow(clippy::too_many_arguments)]
+async fn plan(
     query: &ast::QueryStatement,
     initial: &SessionState,
     tx: &mut StatementTxn,
+    ctx: &SessionContext,
+    writes: &mut mutations::Writes,
+    trace: &mut mutations::Trace,
+    allow_writes: bool,
 ) -> Result<LogicalPlan> {
     let mut context = initial.clone();
     if let Some(schema) = &query.at_schema {
@@ -111,8 +164,10 @@ fn plan(
     if !body.group_by.is_empty() || body.empty_grouping_set || body.having.is_some() {
         return Err(unsupported("grouping and HAVING"));
     }
-    if body.result_clause.kind == ast::ResultKind::Finish {
-        return Err(unsupported("FINISH query results"));
+    if !allow_writes && body.clauses.iter().any(mutations::is_mutation) {
+        return Err(unsupported(
+            "query() is read-only; use run() for graph mutations",
+        ));
     }
     let mut plan = LogicalPlanBuilder::empty(true);
     for clause in &body.clauses {
@@ -123,7 +178,7 @@ fn plan(
             ast::QueryClause::Match(clause) => {
                 let id = current_graph
                     .ok_or_else(|| Error::InvalidReference("current graph is unset".into()))?;
-                let data = tx.graph_data(id)?;
+                let data = writes.data(tx, id)?;
                 plan = graph::matches(plan, &mut scope, session, id, &data, clause)?;
             }
             ast::QueryClause::Let(clause) => {
@@ -165,12 +220,24 @@ fn plan(
                     Some(&scope),
                 )?;
             }
+            clause if mutations::is_mutation(clause) => {
+                let id = current_graph
+                    .ok_or_else(|| Error::InvalidReference("current graph is unset".into()))?;
+                plan = mutations::apply(
+                    plan, &mut scope, session, id, clause, tx, ctx, writes, trace,
+                )
+                .await?;
+            }
             _ => {
                 return Err(unsupported(
                     "graph, procedure, or data-modifying query clause",
                 ))
             }
         }
+    }
+    if body.result_clause.kind == ast::ResultKind::Finish {
+        trace.collect(ctx, &plan.build()?).await?;
+        return Ok(LogicalPlanBuilder::empty(false).build()?);
     }
     if let Some(predicate) = &body.select_where {
         let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;

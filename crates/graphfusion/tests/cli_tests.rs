@@ -14,13 +14,15 @@ use std::{
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "graphfusion-cli {} % # [data] * ? [ {}",
+            "graphfusion-cli {} % # [data] * ? [ {}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         let nodes = Self::batch(
@@ -248,4 +250,42 @@ fn cli_usage_and_in_memory_program() {
         .status
         .success());
     assert!(!Path::new(&fixture.0.join("db")).exists());
+}
+
+#[test]
+fn cli_executes_persistent_gql_mutations_without_an_external_import() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("write.gql"), "CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (a:Person {name: 'Alice', age: 30})-[:Knows]->(b:Person {name: 'Bob', age: 40}); MATCH (a {name: 'Alice'}) SET a.age = a.age + 1;").unwrap();
+    assert!(fixture
+        .run("run", &["--create", "--file", "write.gql"])
+        .contains("affected_elements=3"));
+    let result = fixture.run(
+        "run",
+        &[
+            "--query",
+            "USE GRAPH g MATCH (a {name: 'Alice'}) RETURN a.age AS age",
+            "--explain",
+        ],
+    );
+    assert!(result.contains("31"));
+    assert!(result.contains("file_type=parquet"));
+    let result = fixture.invoke(
+        "run",
+        &["--query", "USE GRAPH g MATCH (a {name: 'Alice'}) DELETE a"],
+    );
+    assert!(!result.status.success());
+    fixture.run(
+        "run",
+        &[
+            "--query",
+            "USE GRAPH g MATCH (a {name: 'Alice'}) DETACH DELETE a",
+        ],
+    );
+    fixture.run("checkpoint", &[]);
+    let result = fixture.run(
+        "run",
+        &["--query", "USE GRAPH g MATCH (n) RETURN n.name AS name"],
+    );
+    assert!(result.contains("Bob"));
+    assert!(!result.contains("Alice"));
 }

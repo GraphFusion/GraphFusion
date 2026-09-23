@@ -17,6 +17,7 @@ pub(crate) struct Generation {
     pub rows: BTreeMap<String, Row>,
     #[serde(default)]
     pub graph_version: CommitSeq,
+    pub next_element_id: Option<u64>,
     #[serde(default)]
     pub parquet: Option<Arc<crate::parquet::GraphManifest>>,
     #[serde(
@@ -34,6 +35,10 @@ pub(crate) struct Row {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum StorageChange {
+    AdvanceElementId {
+        generation: ObjectId,
+        next: Option<u64>,
+    },
     #[serde(skip)]
     ReplaceGraph {
         generation: ObjectId,
@@ -55,6 +60,20 @@ pub(crate) enum StorageChange {
 impl StorageSnapshot {
     pub fn apply(&mut self, change: &StorageChange, seq: CommitSeq) -> Result<()> {
         match change {
+            StorageChange::AdvanceElementId { generation, next } => {
+                let target = self
+                    .generations
+                    .get_mut(generation)
+                    .ok_or_else(|| Error::Corrupt("missing graph identity counter".into()))?;
+                if target.retired_at.is_some() {
+                    return Err(Error::Conflict("graph generation was retired".into()));
+                }
+                target.next_element_id = match (target.next_element_id, *next) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+                target.graph_version = seq;
+            }
             StorageChange::ReplaceGraph { generation, data } => {
                 let target = self
                     .generations
@@ -94,6 +113,7 @@ impl StorageSnapshot {
                         graph: None,
                         parquet: None,
                         graph_version: 0,
+                        next_element_id: Some(0),
                     },
                 );
             }

@@ -117,12 +117,20 @@ async fn run() -> CliResult<()> {
                     result.commit_seq, result.affected_objects
                 ),
                 StatementOutput::Query(result) => {
+                    if result.schema.fields().is_empty() {
+                        println!(
+                            "OK commit={} affected_elements={}",
+                            result.commit_seq, result.affected_elements
+                        );
+                    }
                     let batches = if result.batches.is_empty() {
                         vec![RecordBatch::new_empty(result.schema)]
                     } else {
                         result.batches
                     };
-                    println!("{}", pretty_format_batches(&batches)?);
+                    if !batches[0].schema().fields().is_empty() {
+                        println!("{}", pretty_format_batches(&batches)?);
+                    }
                     if options.contains_key("--explain") {
                         println!(
                             "Logical plan:\n{}\nPhysical plan:\n{}",

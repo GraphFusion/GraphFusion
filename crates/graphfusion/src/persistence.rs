@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 const MAGIC: &[u8; 8] = b"GFLOG001";
 const END: &[u8; 8] = b"GFCOMMIT";
 const HEADER: usize = 24;

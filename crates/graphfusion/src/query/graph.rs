@@ -79,7 +79,7 @@ impl ElementBinding {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Bindings {
     pub scalars: BTreeMap<String, Column>,
     pub elements: BTreeMap<String, ElementBinding>,
@@ -87,6 +87,11 @@ pub(super) struct Bindings {
     next: usize,
 }
 impl Bindings {
+    pub fn fresh(&mut self, prefix: &str) -> String {
+        let name = format!("__gf_{prefix}_{}", self.next);
+        self.next += 1;
+        name
+    }
     pub fn contains(&self, name: &str) -> bool {
         self.scalars.contains_key(name) || self.elements.contains_key(name)
     }
@@ -229,7 +234,7 @@ fn check_binding(binding: &ElementBinding, graph: ObjectId, kind: ElementKind) -
     }
     Ok(())
 }
-fn declare(scope: &mut Bindings, name: &str, binding: &ElementBinding) -> Result<()> {
+pub(super) fn declare(scope: &mut Bindings, name: &str, binding: &ElementBinding) -> Result<()> {
     if scope.contains(name) {
         return Err(Error::InvalidQuery(format!(
             "variable {name} is already bound"
@@ -314,7 +319,7 @@ fn predicates_for(
     Ok(plan)
 }
 
-fn scan(
+pub(super) fn scan(
     scope: &mut Bindings,
     graph_id: ObjectId,
     graph: &GraphData,

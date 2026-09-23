@@ -27,7 +27,8 @@ of `StatementOutput::{Command, Query}`. Top-level statements commit individually
 An execution error leaves earlier successful statements committed and returns an
 error rather than their buffered results. Explicit transactions are rejected
 before execution. Catalog `NEXT` groups remain atomic; query continuations,
-procedures, and GQL mutations are unsupported. A single query can use `AT SCHEMA`;
+and procedures are unsupported. [GQL mutations](mutations.md) execute atomically
+per statement. A single query can use `AT SCHEMA`;
 program-level schema context for mixed commands remains unsupported.
 
 ## Import existing Parquet tables
@@ -108,7 +109,7 @@ Database files must be managed exclusively by GraphFusion. The storage contract
 requires local Linux/macOS filesystems with working locks, fsync, and atomic
 rename; cloud object stores and Windows are not yet supported by the coordinator.
 
-This task introduces database format version 2. Older formats are rejected and
+The current database format is version 3, including graph identity watermarks. Older formats are rejected and
 there is no migration command. Metadata documents retain their 64 MiB bound;
 graph rows are separate Parquet files. Imports currently write one file per table
 without compaction or partitioning. Recovery replays the full WAL and checks
@@ -127,4 +128,5 @@ checkpoint, and reopen, including paths with spaces, URL-special characters,
 and literal glob characters. Unscannable paths are rejected before import.
 
 These checks establish the implemented storage and CLI behavior. Full GQL
-conformance, graph mutations, and explicit transactions remain separate tasks.
+conformance and explicit transactions remain separate tasks. Graph mutations
+and their validation are documented [separately](mutations.md).
