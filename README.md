@@ -11,7 +11,8 @@ provides parsing; runtime features are delivered in separate reviewed PRs.
 
 ## Development and CI
 
-The minimum supported Rust version is 1.89. `rust-toolchain.toml` pins the
+The minimum supported Rust version is 1.94 (required by DataFusion 55.1).
+`rust-toolchain.toml` pins the
 development toolchain and format/lint versions; CI additionally tests stable Rust
 on Linux and macOS and the minimum version on Linux. All Cargo checks use the
 committed lockfile.
@@ -25,6 +26,15 @@ cargo test --workspace --locked
 The [CI workflow](.github/workflows/ci.yml) runs on pull requests, main pushes,
 development branch pushes (`codex/**`), and manual dispatch. It uses read-only
 permissions and never merges PRs. Maintainer approval is required for merging.
+
+## DataFusion Queries
+
+`Session::query(...).await` executes scalar GQL queries through DataFusion and
+returns Arrow batches, their schema, and logical/physical plans. It supports
+parameters, LET, FILTER, RETURN/SELECT, scalar operators and pagination. Run
+`cargo run -p graphfusion --example scalar --locked` for an executable example.
+See [query execution and current limits](docs/query.md); graph MATCH and mutations
+are subsequent implementation tasks.
 
 ## Catalog and Sessions
 

@@ -25,7 +25,8 @@ open a database directory. The default options open an existing database.
 Persistent mode supports Linux and macOS on local filesystems providing file
 locks, atomic rename and fsync. Other processes must use the same protocol.
 Network filesystems and reusing inherited database handles after `fork` are not
-supported. Rust 1.89 or later is required for standard-library file locks.
+supported. The standard-library file locks require Rust 1.89; the workspace now
+requires Rust 1.94 to integrate DataFusion 55.1.
 
 `Database::with_catalog` inspects a statement snapshot. `create_directory` is an
 administrative operation for provisioning directory paths. `checkpoint` attempts
