@@ -148,7 +148,13 @@ impl<'a> Binder<'a> {
                 };
                 self.element(&name.value)?.property(&key.value)
             }
-            E::ElementId { variable } => self.element(&variable.value)?.identity(),
+            E::ElementId { variable } => {
+                if let Some(column) = self.bindings.and_then(|b| b.scalars.get(&variable.value)) {
+                    super::path_values::identity(Expr::Column(column.clone()), self.schema)?
+                } else {
+                    self.element(&variable.value)?.identity()
+                }
+            }
             E::PropertyExists { variable, property } => self
                 .element(&variable.value)?
                 .property_exists(&property.value),
@@ -367,6 +373,18 @@ impl<'a> Binder<'a> {
                     datafusion::functions::core::expr_fn::nullif(left, right)
                 }
             }
+            E::NumericFunction {
+                function: ast::NumericFunctionKind::PathLength,
+                args,
+            } => {
+                if args.len() != 1 {
+                    return Err(Error::InvalidQuery(
+                        "PATH_LENGTH requires one argument".into(),
+                    ));
+                }
+                super::paths::length(self.bind(&args[0])?, self.schema)?
+            }
+            E::Elements { path } => super::paths::elements(self.bind(path)?, self.schema)?,
             E::List(values) => {
                 let values = values
                     .iter()

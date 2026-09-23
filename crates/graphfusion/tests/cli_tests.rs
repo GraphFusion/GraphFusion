@@ -90,6 +90,36 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn cli_recursive_paths_use_parquet_after_independent_process_reopen() {
+    let fixture = Fixture::new();
+    fixture.run(
+        "run",
+        &[
+            "--create",
+            "--query",
+            include_str!("../../../examples/paths.gql"),
+        ],
+    );
+    fixture.run("checkpoint", &[]);
+    let query = "USE GRAPH routes MATCH p = ALL SHORTEST (a {name:'A'})-[:Link]->{1,4}(b {name:'D'}) RETURN COUNT(*) AS ties, MIN(PATH_LENGTH(p)) AS hops";
+    let output = fixture.run("run", &["--query", query, "--explain"]);
+    assert!(output.contains("RecursiveQueryExec"), "{output}");
+    assert!(output.contains("WorkTableExec"), "{output}");
+    assert!(output.contains("file_type=parquet"), "{output}");
+    let compact: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("|2|2|"), "{output}");
+    let output = fixture.run(
+        "run",
+        &[
+            "--query",
+            "USE GRAPH routes MATCH p = (a {name:'A'})-[:Link]->{0,2}(b) RETURN COUNT(*) AS paths",
+        ],
+    );
+    let compact: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("|5|"), "{output}");
+}
+
+#[test]
 fn cli_import_query_and_checkpoint_survive_independent_processes() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("setup.gql"), "CREATE GRAPH social ANY GRAPH; SESSION SET GRAPH social; RETURN 'text;--still text' AS value;").unwrap();

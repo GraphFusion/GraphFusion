@@ -44,6 +44,7 @@ runtime or block on an asynchronous query from its synchronous DDL method.
   `column_1`, `column_2`, etc.; a variable retains its name.
 
 Graph selection and fixed-length MATCH are described in [Arrow graph queries](graphs.md).
+[Path queries](paths.md) add quantified edges, modes, selectors and path values.
 Graph mutations use [the async program API](mutations.md).
 [Relational queries](relational.md) add OPTIONAL MATCH, FOR, grouping/aggregates,
 SELECT sources and composite queries, including independent nested queries.

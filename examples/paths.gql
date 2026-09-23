@@ -1,0 +1,13 @@
+CREATE GRAPH routes ANY;
+SESSION SET GRAPH routes;
+INSERT (a:Station {name: 'A'}), (b:Station {name: 'B'}),
+       (c:Station {name: 'C'}), (d:Station {name: 'D'}),
+       (a)-[:Link]->(b), (a)-[:Link]->(c),
+       (b)-[:Link]->(d), (c)-[:Link]->(d), (d)-[:Link]->(a);
+MATCH p = ALL SHORTEST (a {name: 'A'})-[:Link]->{0,4}(b)
+RETURN b.name AS destination, PATH_LENGTH(p) AS hops
+ORDER BY destination, hops;
+MATCH p = (a {name: 'A'})-[edges:Link]->{1,2}(b {name: 'D'})
+FOR edge IN edges
+RETURN ELEMENT_ID(edge) AS edge_id, PATH_LENGTH(p) AS hops
+ORDER BY edge_id;

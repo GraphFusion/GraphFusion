@@ -41,7 +41,7 @@ pub(super) async fn optional(
             ))
             .await?
         } else {
-            graph::matches(matches, scope, session, id, data, clause)?
+            graph::matches(matches, scope, session, id, data, clause, ctx, trace).await?
         };
     }
     let right_row = scope.fresh("optional_key");
@@ -53,7 +53,11 @@ pub(super) async fn optional(
         .collect();
     let mut right_columns: Vec<_> = extra.iter().cloned().map(Expr::Column).collect();
     right_columns.push(Expr::Column(Column::new_unqualified(&row)).alias(&right_row));
-    let right = matches.project(right_columns)?.build()?;
+    // A materialization boundary also keeps outer-join projection pruning from
+    // rewriting recursive work-table schemas (DataFusion 55 cannot safely do so).
+    let right = execution::freeze(matches.project(right_columns)?, ctx, trace, None)
+        .await?
+        .build()?;
     let output = input_columns
         .into_iter()
         .filter(|c| c.name != row)

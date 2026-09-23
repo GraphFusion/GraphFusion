@@ -30,8 +30,24 @@ pub struct Parameter {
     pub value: Value,
     pub declared_type: Option<ValueType>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryLimits {
+    /// Maximum finite path length accepted by the planner. Excess is an error.
+    pub max_path_hops: u64,
+    /// DataFusion's tracked operator memory budget per statement (not process RSS).
+    pub memory_limit_bytes: usize,
+}
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            max_path_hops: 256,
+            memory_limit_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionState {
+    pub query_limits: QueryLimits,
     pub current_schema: ObjectId,
     pub home_schema: ObjectId,
     pub current_graph: Option<ObjectId>,
@@ -43,6 +59,7 @@ pub struct SessionState {
 impl Default for SessionState {
     fn default() -> Self {
         Self {
+            query_limits: QueryLimits::default(),
             current_schema: MAIN_SCHEMA,
             home_schema: MAIN_SCHEMA,
             current_graph: None,
@@ -90,6 +107,22 @@ impl Session {
     }
     pub fn state(&self) -> &SessionState {
         &self.state
+    }
+    /// Session-local execution limits, effective for the next statement.
+    pub fn set_query_limits(&mut self, limits: QueryLimits) -> Result<()> {
+        if self.state.closed {
+            return Err(Error::SessionClosed);
+        }
+        if matches!(self.transaction_status(), TransactionStatus::Failed { .. }) {
+            return Err(Error::TransactionFailed);
+        }
+        if limits.max_path_hops > i64::MAX as u64 || limits.memory_limit_bytes == 0 {
+            return Err(Error::InvalidQuery(
+                "query limits require a signed hop bound and a nonzero memory budget".into(),
+            ));
+        }
+        self.state.query_limits = limits;
+        Ok(())
     }
     /// Executes one read-only GQL query through DataFusion and materializes Arrow results.
     /// Catalog/session commands continue to use `execute`.
