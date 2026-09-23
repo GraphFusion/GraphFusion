@@ -68,8 +68,9 @@ for the import manifest, transaction boundaries, crash recovery, and limits.
 
 The main crate implements in-memory and persistent catalogs for directories,
 schemas, graph types, and graphs. Independent sessions support catalog DDL and
-`SESSION SET`, `SESSION RESET`, and `SESSION CLOSE`. Statements auto-commit;
-explicit multi-statement transactions are not implemented yet. INSERT, SET,
+`SESSION SET`, `SESSION RESET`, and `SESSION CLOSE`. Statements auto-commit unless
+`START TRANSACTION` opens an [explicit transaction](docs/transactions.md).
+READ ONLY/READ WRITE, COMMIT and ROLLBACK work across API calls. INSERT, SET,
 REMOVE, DELETE and DETACH DELETE execute on open graphs through the async API.
 
 ```rust
@@ -87,7 +88,7 @@ database directory. Linux/macOS processes can share it through OS file locks.
 Catalog and data snapshots publish together after a checksummed logical log is
 durable. Optimistic validation permits independent writes while detecting name,
 object, and dependency conflicts. DROP retires storage; checkpoint reclaims it
-only when no active statement can use an older snapshot.
+only when no active statement or transaction can use an older snapshot.
 
 See [the catalog design and implementation notes](docs/catalog.md) for the
 format, APIs, crash recovery, supported session expressions, and current limits.

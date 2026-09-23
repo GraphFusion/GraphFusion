@@ -92,7 +92,7 @@ graph was dropped or replaced.
 
 Readers keep the old Arrow buffers or Parquet files and catalog snapshot through physical planning
 and materialization. DROP retires the storage generation; checkpoint cannot
-reclaim it until all statement leases are released. The import API has no direct
+reclaim it until all statement/transaction leases are released. The import API has no direct
 path that can independently publish a provider outside the coordinator.
 
 Both `Database::new()` and `Database::open(...)` support open graph imports.

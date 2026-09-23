@@ -1,0 +1,19 @@
+CREATE GRAPH ledger ANY GRAPH;
+SESSION SET GRAPH ledger;
+
+START TRANSACTION READ WRITE;
+INSERT (:Account {name: 'Alice', balance: 100}),
+       (:Account {name: 'Bob', balance: 50});
+MATCH (a:Account {name: 'Alice'}) SET a.balance = a.balance - 25;
+MATCH (b:Account {name: 'Bob'}) SET b.balance = b.balance + 25;
+MATCH (a:Account) RETURN a.name AS name, a.balance AS balance ORDER BY name;
+COMMIT;
+
+START TRANSACTION;
+MATCH (a:Account {name: 'Alice'}) SET a.balance = 0;
+ROLLBACK;
+
+START TRANSACTION READ ONLY;
+MATCH (a:Account) RETURN a.name AS name, a.balance AS balance ORDER BY name;
+MATCH (a:Account) RETURN SUM(a.balance) AS total;
+COMMIT;

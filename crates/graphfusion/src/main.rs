@@ -2,7 +2,7 @@ use graphfusion::{
     arrow::{record_batch::RecordBatch, util::pretty::pretty_format_batches},
     gql,
     graph::{EdgeTable, GraphData, NodeTable},
-    Database, OpenOptions, StatementOutput,
+    Database, OpenOptions, StatementOutput, TransactionAction, TransactionStatus,
 };
 use serde::Deserialize;
 use std::{
@@ -20,7 +20,8 @@ Usage:
 run uses an in-memory database if --database is omitted.
 --create permits creating a database directory; otherwise it must already exist.
 import replaces an existing open graph with validated external Parquet tables.
-Statements auto-commit; earlier successful statements survive a later error.
+Statements auto-commit unless enclosed in START TRANSACTION and COMMIT/ROLLBACK.
+An explicit transaction must end before this one-shot run finishes.
 ";
 
 #[derive(Deserialize)]
@@ -110,17 +111,50 @@ async fn run() -> CliResult<()> {
             )?,
             None => Database::new(),
         };
-        for output in db.session().run(&input).await? {
+        let mut session = db.session();
+        let outputs = session.run(&input).await?;
+        if session.transaction_status() != TransactionStatus::Idle {
+            return Err("unfinished explicit transaction rolled back; end the file/query with COMMIT or ROLLBACK".into());
+        }
+        for output in outputs {
             match output {
-                StatementOutput::Command(result) => println!(
-                    "OK commit={} affected_objects={}",
-                    result.commit_seq, result.affected_objects
-                ),
+                StatementOutput::Command(result) => match result.transaction_action {
+                    Some(action) => println!(
+                        "OK transaction={} {}={}",
+                        match action {
+                            TransactionAction::Started => "started",
+                            TransactionAction::Committed => "committed",
+                            TransactionAction::RolledBack => "rolled_back",
+                        },
+                        if action == TransactionAction::Committed {
+                            "commit"
+                        } else {
+                            "snapshot"
+                        },
+                        result.commit_seq
+                    ),
+                    None => println!(
+                        "OK {}={} affected_objects={}",
+                        if result.transaction_pending {
+                            "pending_snapshot"
+                        } else {
+                            "commit"
+                        },
+                        result.commit_seq,
+                        result.affected_objects
+                    ),
+                },
                 StatementOutput::Query(result) => {
-                    if result.schema.fields().is_empty() {
+                    if result.schema.fields().is_empty() || result.transaction_pending {
                         println!(
-                            "OK commit={} affected_elements={}",
-                            result.commit_seq, result.affected_elements
+                            "OK {}={} affected_elements={}",
+                            if result.transaction_pending {
+                                "pending_snapshot"
+                            } else {
+                                "commit"
+                            },
+                            result.commit_seq,
+                            result.affected_elements,
                         );
                     }
                     let batches = if result.batches.is_empty() {

@@ -203,7 +203,7 @@ fn cli_errors_do_not_replace_graphs_or_hide_partial_commit_semantics() {
             "run",
             &[
                 "--query",
-                "CREATE GRAPH rejected ANY GRAPH; START TRANSACTION"
+                "START TRANSACTION; CREATE GRAPH rejected ANY GRAPH"
             ]
         )
         .status
@@ -316,4 +316,34 @@ fn cli_relational_queries_and_rollback_survive_parquet_reopen() {
         ],
     );
     assert!(result.contains("| 3 |"), "{result}");
+}
+
+#[test]
+fn cli_explicit_transactions_publish_once_and_survive_reopen() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("transactions.gql"),
+        include_str!("../../../examples/transactions.gql"),
+    )
+    .unwrap();
+    let result = fixture.run("run", &["--create", "--file", "transactions.gql"]);
+    assert!(
+        result.contains("transaction=committed commit=2"),
+        "{result}"
+    );
+    assert!(result.contains("pending_snapshot=1"), "{result}");
+    assert!(result.contains("transaction=rolled_back"), "{result}");
+    assert!(result.contains("| Alice | 75"), "{result}");
+    assert!(result.contains("| Bob   | 75"), "{result}");
+    fixture.run("checkpoint", &[]);
+    let result = fixture.run("run", &["--query", "START TRANSACTION READ ONLY; USE GRAPH ledger MATCH (a:Account) RETURN SUM(a.balance) AS total; COMMIT", "--explain"]);
+    assert!(result.contains("150"), "{result}");
+    assert!(result.contains("file_type=parquet"), "{result}");
+    for sql in [
+        "START TRANSACTION; USE GRAPH ledger INSERT (:Account {name: 'Failed', balance: 5}); RETURN 1 / 0 AS bad; COMMIT",
+        "START TRANSACTION; USE GRAPH ledger INSERT (:Account {name: 'Unfinished', balance: 6})",
+        "START TRANSACTION READ ONLY; DROP GRAPH ledger; COMMIT",
+    ] { assert!(!fixture.invoke("run", &["--query", sql]).status.success(), "{sql}"); }
+    let result = fixture.run("run", &["--query", "USE GRAPH ledger MATCH (a:Account) RETURN COUNT(*) AS accounts, SUM(a.balance) AS total"]);
+    assert!(result.contains("| 2        | 150"), "{result}");
 }

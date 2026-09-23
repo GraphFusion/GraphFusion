@@ -337,13 +337,11 @@ fn nested_definitions_are_rejected_before_commit_or_remain_recoverable() {
 }
 
 #[test]
-fn batches_next_and_transaction_preflight() {
+fn batches_next_and_explicit_transactions() {
     let db = Database::new();
     let mut s = db.session();
-    assert!(matches!(
-        s.execute("CREATE GRAPH a ANY GRAPH; START TRANSACTION; COMMIT"),
-        Err(Error::UnsupportedFeature(_))
-    ));
+    s.execute("START TRANSACTION; CREATE GRAPH a ANY GRAPH; ROLLBACK")
+        .unwrap();
     assert!(graph_id(&db, "a").is_none());
     assert!(matches!(
         s.execute("CREATE GRAPH a ANY GRAPH; CREATE GRAPH a ANY GRAPH"),
@@ -1197,6 +1195,91 @@ fn child_worker() {
                 .unwrap();
             tx.commit().unwrap();
         }
+        "explicit_writer" => {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut s = db.session();
+            s.execute("SESSION SET GRAPH g; START TRANSACTION").unwrap();
+            let value = std::env::var("GF_NAME").unwrap().parse::<i64>().unwrap();
+            s.set_parameter("v", Value::Integer(value)).unwrap();
+            runtime.block_on(s.run("INSERT (:N {v: $v})")).unwrap();
+            s.execute(&format!("CREATE GRAPH marker{value} ANY GRAPH"))
+                .unwrap();
+            child_barrier();
+            match s.execute("COMMIT") {
+                Ok(_) => println!("GF_COMMITTED"),
+                Err(Error::Conflict(_)) => {
+                    assert!(matches!(
+                        s.transaction_status(),
+                        TransactionStatus::Failed { .. }
+                    ));
+                    s.execute("ROLLBACK").unwrap();
+                    println!("GF_CONFLICT");
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        "explicit_reader" => {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut s = db.session();
+            s.execute("SESSION SET GRAPH g; START TRANSACTION READ ONLY")
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .block_on(s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id"))
+                    .unwrap()
+                    .row_count(),
+                1
+            );
+            child_barrier();
+            assert_eq!(
+                runtime
+                    .block_on(s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id"))
+                    .unwrap()
+                    .row_count(),
+                1
+            );
+            s.execute("COMMIT").unwrap();
+            assert_eq!(
+                runtime
+                    .block_on(s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id"))
+                    .unwrap()
+                    .row_count(),
+                2
+            );
+            println!("GF_OLD_OK");
+        }
+        "explicit_crash" | "explicit_io" => {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut s = db.session();
+            s.execute("SESSION SET GRAPH g; START TRANSACTION").unwrap();
+            runtime.block_on(s.run("INSERT (:N {v: 2}); CREATE GRAPH atomic_marker ANY GRAPH; INSERT (:N {v: 3}); DROP GRAPH doomed; CREATE GRAPH second ANY GRAPH; USE GRAPH second INSERT (:N {v: 9})")).unwrap();
+            if mode == "explicit_io" {
+                let mut reader = db.session();
+                reader.execute("START TRANSACTION READ ONLY").unwrap();
+                assert!(matches!(s.execute("COMMIT"), Err(Error::CommitUnknown(_))));
+                assert!(matches!(
+                    s.transaction_status(),
+                    TransactionStatus::Failed { .. }
+                ));
+                assert!(matches!(db.with_catalog(|_| ()), Err(Error::Poisoned)));
+                assert!(matches!(
+                    runtime.block_on(reader.query("RETURN 1 AS n")),
+                    Err(Error::Poisoned)
+                ));
+                assert!(matches!(
+                    reader.transaction_status(),
+                    TransactionStatus::Failed { .. }
+                ));
+                reader.execute("ROLLBACK").unwrap();
+                s.execute("ROLLBACK").unwrap();
+                assert!(matches!(
+                    s.execute("START TRANSACTION"),
+                    Err(Error::Poisoned)
+                ));
+            } else {
+                s.execute("COMMIT").unwrap();
+            }
+        }
         "gql_write" => {
             let mut s = db.session();
             s.execute("SESSION SET GRAPH g").unwrap();
@@ -1561,6 +1644,226 @@ async fn gql_write_crashes_recover_graph_and_identity_counter_together() {
             .unwrap();
         let StatementOutput::Query(result) = &outputs[0] else {
             panic!("query output")
+        };
+        let id = result.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+        assert!(
+            id.ends_with(if committed { ":4" } else { ":2" }),
+            "{point}: {id}"
+        );
+        db.checkpoint().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cancelling_pending_datafusion_scan_aborts_explicit_transaction() {
+    use datafusion::{
+        catalog::{Session as DfSession, TableProvider},
+        logical_expr::{Expr, TableType},
+        physical_plan::ExecutionPlan,
+    };
+    #[derive(Debug)]
+    struct PausedScan {
+        schema: arrow::datatypes::SchemaRef,
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+    #[async_trait::async_trait]
+    impl TableProvider for PausedScan {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.schema.clone()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn DfSession,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            self.entered
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            std::future::pending().await
+        }
+    }
+    let db = Database::new();
+    let mut s = db.session();
+    s.execute("CREATE GRAPH paused ANY GRAPH; CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH paused")
+        .unwrap();
+    let (signal, entered) = tokio::sync::oneshot::channel();
+    let mut graph = arrow_graph(vec![1]);
+    graph.nodes[0].0.provider = Arc::new(PausedScan {
+        schema: graph.nodes[0].0.schema.clone(),
+        entered: Mutex::new(Some(signal)),
+    });
+    s.replace_graph_data(graph).unwrap();
+    s.run("SESSION SET GRAPH g; START TRANSACTION; INSERT (:N {v: 2}); CREATE GRAPH cancelled ANY GRAPH").await.unwrap();
+    let mut query = Box::pin(s.query("USE GRAPH paused MATCH (n) RETURN ELEMENT_ID(n) AS id"));
+    tokio::select! {
+        _ = entered => (),
+        result = &mut query => panic!("paused scan returned: {result:?}"),
+    }
+    drop(query);
+    assert!(matches!(
+        s.transaction_status(),
+        TransactionStatus::Failed { .. }
+    ));
+    assert!(graph_id(&db, "cancelled").is_none());
+    db.checkpoint().unwrap();
+    assert!(matches!(s.execute("COMMIT"), Err(Error::TransactionFailed)));
+    s.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id")
+            .await
+            .unwrap()
+            .row_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn explicit_transactions_isolate_and_conflict_across_processes() {
+    let dir = TestDir::new();
+    let db = dir.open();
+    let mut s = db.session();
+    s.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {v: 1})")
+        .await
+        .unwrap();
+    let mut a = Worker::start(&dir, "explicit_writer", "2");
+    let mut b = Worker::start(&dir, "explicit_writer", "3");
+    assert_eq!(
+        s.query("MATCH (n) RETURN n.v AS v")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+    assert!(graph_id(&db, "marker2").is_none());
+    assert!(graph_id(&db, "marker3").is_none());
+    assert!(matches!(db.checkpoint(), Err(Error::Busy)));
+    a.release();
+    assert!(a.finish().contains("GF_COMMITTED"));
+    b.release();
+    assert!(b.finish().contains("GF_CONFLICT"));
+    assert!(graph_id(&db, "marker2").is_some());
+    assert!(graph_id(&db, "marker3").is_none());
+    assert_eq!(
+        s.query("MATCH (n) RETURN n.v AS v")
+            .await
+            .unwrap()
+            .row_count(),
+        2
+    );
+    db.checkpoint().unwrap();
+    let mut abandoned = Worker::start(&dir, "explicit_writer", "4");
+    abandoned.child.kill().unwrap();
+    abandoned.child.wait().unwrap();
+    assert!(graph_id(&db, "marker4").is_none());
+    assert_eq!(
+        s.query("MATCH (n) RETURN n.v AS v")
+            .await
+            .unwrap()
+            .row_count(),
+        2
+    );
+    db.checkpoint().unwrap();
+}
+
+#[test]
+fn explicit_reader_pins_old_parquet_files_across_process_replacement() {
+    let dir = TestDir::new();
+    let db = dir.open();
+    let mut s = db.session();
+    s.execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    s.replace_graph_data(arrow_graph(vec![1])).unwrap();
+    db.checkpoint().unwrap();
+    let mut reader = Worker::start(&dir, "explicit_reader", "");
+    s.replace_graph_data(arrow_graph(vec![2, 3])).unwrap();
+    assert!(matches!(db.checkpoint(), Err(Error::Busy)));
+    reader.release();
+    assert!(reader.finish().contains("GF_OLD_OK"));
+    db.checkpoint().unwrap();
+}
+
+#[tokio::test]
+async fn explicit_transaction_crashes_never_split_statements_or_graphs() {
+    for (point, committed) in [
+        ("parquet_directory", false),
+        ("parquet_wal_header", false),
+        ("parquet_wal_payload", false),
+        ("parquet_wal_commit", true),
+        ("parquet_wal_sync", true),
+        ("before_publish", true),
+        ("io", true),
+    ] {
+        let dir = TestDir::new();
+        let db = dir.open();
+        let mut s = db.session();
+        s.execute("CREATE GRAPH g ANY GRAPH; CREATE GRAPH doomed ANY GRAPH; SESSION SET GRAPH g")
+            .unwrap();
+        s.replace_graph_data(arrow_graph(vec![1])).unwrap();
+        db.checkpoint().unwrap();
+        let mut command = child_command(
+            &dir,
+            if point == "io" {
+                "explicit_io"
+            } else {
+                "explicit_crash"
+            },
+        );
+        if point == "io" {
+            command.env("GRAPHFUSION_TEST_IO", "parquet_wal_sync");
+        } else {
+            command.env("GRAPHFUSION_TEST_CRASH", point);
+        }
+        let child = command.output().unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(if point == "io" { 0 } else { 86 }),
+            "{point}: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            graph_id(&db, "atomic_marker").is_some(),
+            committed,
+            "{point}"
+        );
+        assert_eq!(graph_id(&db, "doomed").is_none(), committed, "{point}");
+        assert_eq!(graph_id(&db, "second").is_some(), committed, "{point}");
+        assert_eq!(
+            s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id")
+                .await
+                .unwrap()
+                .row_count(),
+            if committed { 3 } else { 1 },
+            "{point}"
+        );
+        if committed {
+            assert_eq!(
+                s.query("USE GRAPH second MATCH (n) RETURN n.v AS v")
+                    .await
+                    .unwrap()
+                    .row_count(),
+                1
+            );
+        }
+        let outputs = s
+            .run("INSERT (n:N) RETURN ELEMENT_ID(n) AS id")
+            .await
+            .unwrap();
+        let StatementOutput::Query(result) = &outputs[0] else {
+            panic!()
         };
         let id = result.batches[0]
             .column(0)

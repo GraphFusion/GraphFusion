@@ -8,8 +8,7 @@ mod mutations;
 mod relational;
 
 use crate::{
-    catalog::CommitSeq, gql as ast, transaction::StatementTxn, Database, Error, Result,
-    SessionState, Value,
+    catalog::CommitSeq, gql as ast, transaction::StatementTxn, Error, Result, SessionState, Value,
 };
 use datafusion::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
@@ -62,6 +61,9 @@ pub struct QueryResult {
     pub physical_plan: String,
     /// Inserted/deleted elements plus distinct targets per SET/REMOVE item.
     pub affected_elements: usize,
+    /// Produced inside an open explicit transaction. commit_seq is its base snapshot.
+    /// This flag does not change later; the COMMIT result acknowledges durability.
+    pub transaction_pending: bool,
 }
 
 impl QueryResult {
@@ -70,38 +72,17 @@ impl QueryResult {
     }
 }
 
-pub(crate) async fn execute(
-    db: &Database,
-    session: &SessionState,
-    input: &str,
-) -> Result<QueryResult> {
-    if session.closed {
-        return Err(Error::SessionClosed);
-    }
-    let program = ast::parse(input)?;
-    if !program.definitions.is_empty() {
-        return Err(unsupported(
-            "query schema context and procedure definitions",
-        ));
-    }
-    let [ast::Statement::Query(query)] = program.statements.as_slice() else {
-        return Err(unsupported("query() requires exactly one read-only query"));
-    };
-    execute_statement(db, session, query, program.at_schema.as_ref(), false).await
-}
-
 pub(crate) async fn execute_statement(
-    db: &Database,
     session: &SessionState,
+    tx: &mut StatementTxn,
     query: &ast::QueryStatement,
     at_schema: Option<&ast::SchemaReference>,
     allow_writes: bool,
 ) -> Result<QueryResult> {
-    // The lease is held through planning AND materialization, including every await.
-    let mut tx = StatementTxn::begin(db)?;
+    // The caller owns the transaction lease across planning and materialization.
     let mut context = session.clone();
     if let Some(schema) = at_schema {
-        context.current_schema = crate::session::schema_reference(&mut tx, session, schema)?;
+        context.current_schema = crate::session::schema_reference(tx, session, schema)?;
     }
     let ctx = SessionContext::new();
     let mut writes = mutations::Writes::default();
@@ -109,7 +90,7 @@ pub(crate) async fn execute_statement(
     let plan = plan(
         query,
         &context,
-        &mut tx,
+        tx,
         &ctx,
         &mut writes,
         &mut trace,
@@ -120,7 +101,7 @@ pub(crate) async fn execute_statement(
     for (graph, data) in writes.graphs {
         tx.replace_graph_data(graph, data)?;
     }
-    let commit_seq = tx.commit()?;
+    let commit_seq = tx.base.commit_seq;
     Ok(QueryResult {
         schema,
         batches,
@@ -128,6 +109,7 @@ pub(crate) async fn execute_statement(
         logical_plan: trace.logical.join("\n"),
         physical_plan: trace.physical.join("\n"),
         affected_elements: writes.affected,
+        transaction_pending: true,
     })
 }
 
@@ -217,7 +199,7 @@ async fn plan(
     Ok(result)
 }
 
-fn has_mutations(query: &ast::QueryStatement) -> bool {
+pub(crate) fn has_mutations(query: &ast::QueryStatement) -> bool {
     std::iter::once(&query.body)
         .chain(query.set_operations.iter().map(|op| &op.body))
         .any(|body| {
