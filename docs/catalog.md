@@ -1,7 +1,8 @@
 # Catalog, sessions, and commit protocol
 
 GraphFusion implements a persistent catalog and a session executor for catalog
-DDL. It does not yet execute graph queries or graph data modifications. The
+DDL. It also coordinates [in-memory Arrow graph snapshots](graphs.md) for MATCH;
+GQL graph data modifications remain unimplemented. The
 internal storage participant stores versioned test rows to verify that catalog
 and data changes share one transaction; it is not a graph storage engine.
 

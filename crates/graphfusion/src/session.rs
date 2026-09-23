@@ -83,6 +83,20 @@ impl Session {
     pub async fn query(&mut self, input: &str) -> Result<crate::QueryResult> {
         crate::query::execute(&self.db, &self.state, input).await
     }
+    /// Atomically replaces the current open graph with validated Arrow tables.
+    /// Currently available for in-memory databases; durable imports require Parquet.
+    pub fn replace_graph_data(&mut self, data: crate::graph::GraphData) -> Result<CommitSeq> {
+        if self.state.closed {
+            return Err(Error::SessionClosed);
+        }
+        let graph = self
+            .state
+            .current_graph
+            .ok_or_else(|| Error::InvalidReference("current graph is unset".into()))?;
+        let mut tx = StatementTxn::begin(&self.db)?;
+        tx.replace_graph_data(graph, data)?;
+        tx.commit()
+    }
     /// Sets a driver-provided value. References are checked in the snapshot of each use.
     pub fn set_parameter(&mut self, name: impl Into<String>, value: Value) -> Result<()> {
         if self.state.closed {
@@ -469,7 +483,7 @@ fn target(
     Ok((directory, last.value.clone()))
 }
 
-fn schema_reference(
+pub(crate) fn schema_reference(
     tx: &mut StatementTxn,
     session: &SessionState,
     reference: &ast::SchemaReference,
@@ -526,7 +540,7 @@ fn require_kind(tx: &mut StatementTxn, id: ObjectId, kind: ObjectKind) -> Result
     }
     Ok(entry)
 }
-fn resolve_graph(
+pub(crate) fn resolve_graph(
     tx: &mut StatementTxn,
     session: &SessionState,
     expression: &ast::GraphExpression,

@@ -83,6 +83,7 @@ impl PublishedState {
             if *id >= self.next_id
                 || (generation.retired_at.is_none() && !owners.contains(id))
                 || generation.retired_at.is_some_and(|s| s > self.commit_seq)
+                || generation.graph_version > self.commit_seq
                 || generation
                     .rows
                     .values()
@@ -110,6 +111,7 @@ pub(crate) struct StatementTxn {
     members_read: BTreeMap<ObjectId, CommitSeq>,
     references_read: BTreeMap<ObjectId, CommitSeq>,
     rows_written: BTreeMap<(ObjectId, String), Option<CommitSeq>>,
+    graphs_written: BTreeMap<ObjectId, CommitSeq>,
     ids: std::ops::Range<ObjectId>,
 }
 impl Drop for StatementTxn {
@@ -155,11 +157,67 @@ impl StatementTxn {
             members_read: BTreeMap::new(),
             references_read: BTreeMap::new(),
             rows_written: BTreeMap::new(),
+            graphs_written: BTreeMap::new(),
             ids: 0..0,
         })
     }
     pub fn catalog(&self) -> &CatalogSnapshot {
         &self.view
+    }
+    pub fn graph_data(&mut self, graph: ObjectId) -> Result<Arc<crate::graph::GraphData>> {
+        let ObjectDefinition::Graph { storage, shape } = self.get(graph)?.definition else {
+            return Err(Error::InvalidReference("graph required".into()));
+        };
+        if shape != GraphShape::Open {
+            return Err(Error::UnsupportedFeature(
+                "typed graph scan schema binding".into(),
+            ));
+        }
+        for change in self.storage_changes.iter().rev() {
+            if let StorageChange::ReplaceGraph { generation, data } = change {
+                if *generation == storage {
+                    return Ok(data.clone());
+                }
+            }
+        }
+        Ok(self
+            .base
+            .storage
+            .generations
+            .get(&storage)
+            .and_then(|generation| generation.graph.clone())
+            .unwrap_or_default())
+    }
+    pub fn replace_graph_data(
+        &mut self,
+        graph: ObjectId,
+        data: crate::graph::GraphData,
+    ) -> Result<()> {
+        if self.db.inner.disk.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "durable graph import requires the Parquet provider".into(),
+            ));
+        }
+        let ObjectDefinition::Graph { storage, shape } = self.get(graph)?.definition else {
+            return Err(Error::InvalidReference("graph required".into()));
+        };
+        if shape != GraphShape::Open {
+            return Err(Error::UnsupportedFeature(
+                "typed graph import validation".into(),
+            ));
+        }
+        self.graphs_written.entry(storage).or_insert_with(|| {
+            self.base
+                .storage
+                .generations
+                .get(&storage)
+                .map_or(0, |g| g.graph_version)
+        });
+        self.storage_changes.push(StorageChange::ReplaceGraph {
+            generation: storage,
+            data: Arc::new(data),
+        });
+        Ok(())
     }
     pub fn get(&mut self, id: ObjectId) -> Result<CatalogEntry> {
         self.objects_read
@@ -337,6 +395,17 @@ impl StatementTxn {
         Ok(seq)
     }
     fn validate(&self, current: &PublishedState) -> Result<()> {
+        for (generation, version) in &self.graphs_written {
+            if current
+                .storage
+                .generations
+                .get(generation)
+                .map_or(0, |g| g.graph_version)
+                != *version
+            {
+                return Err(Error::Conflict("graph data changed".into()));
+            }
+        }
         for (id, version) in &self.objects_read {
             if current.catalog.get(*id).map(|e| e.version) != *version {
                 return Err(Error::Conflict(format!("catalog object {id} changed")));

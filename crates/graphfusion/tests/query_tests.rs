@@ -313,7 +313,6 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         "SESSION SET VALUE $n INTEGER = 1; RETURN $n AS n",
         "START TRANSACTION; RETURN 1 AS n; COMMIT",
         "RETURN 1 AS n; RETURN 2 AS n",
-        "MATCH (n) RETURN n",
         "INSERT (:Person)",
         "RETURN 1 AS n UNION RETURN 2 AS n",
         "RETURN COUNT(*) AS n",

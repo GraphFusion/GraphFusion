@@ -43,7 +43,8 @@ runtime or block on an asynchronous query from its synchronous DDL method.
   ordering treats null as greatest. Unaliased scalar expressions receive names
   `column_1`, `column_2`, etc.; a variable retains its name.
 
-Graph selection, MATCH and graph values, graph mutations, aggregation, composite
+Graph selection and fixed-length MATCH are described in [Arrow graph queries](graphs.md).
+Whole graph element values, graph mutations, aggregation, composite
 queries, nested/procedure queries, typed LET, temporal expressions, casts and
 remaining expressions are not yet executed. Unsupported features produce an
 error; they are not discarded or interpreted as SQL. The query API rejects mixed
@@ -75,5 +76,5 @@ for the underlying query engine.
 Arrow values/types, plan presence, null/unknown truth tables, parameter isolation,
 delimited identifiers, empty-result schemas, pagination, type errors, overflow,
 division by zero, closed sessions and unsupported programs without side effects.
-This foundation is not yet an executable property-graph database; provider scans
-and graph-pattern lowering are the next dependency in the delivery plan.
+Arrow graph scans and joins are now implemented. Durable graph storage, GQL
+mutations and the remaining language semantics still need implementation.
