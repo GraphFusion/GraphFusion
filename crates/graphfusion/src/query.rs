@@ -1,8 +1,11 @@
 //! GQL binding and direct DataFusion logical/physical planning.
+mod aggregates;
 mod arithmetic;
+mod execution;
 mod expressions;
 mod graph;
 mod mutations;
+mod relational;
 
 use crate::{
     catalog::CommitSeq, gql as ast, transaction::StatementTxn, Database, Error, Result,
@@ -14,7 +17,6 @@ use datafusion::{
     logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder},
 };
 use expressions::Binder;
-use std::collections::BTreeSet;
 
 pub(crate) fn write_query(statement: &ast::Statement) -> Option<ast::QueryStatement> {
     let clause = match statement {
@@ -103,7 +105,7 @@ pub(crate) async fn execute_statement(
     }
     let ctx = SessionContext::new();
     let mut writes = mutations::Writes::default();
-    let mut trace = mutations::Trace::default();
+    let mut trace = execution::Trace::default();
     let plan = plan(
         query,
         &context,
@@ -140,35 +142,105 @@ async fn plan(
     tx: &mut StatementTxn,
     ctx: &SessionContext,
     writes: &mut mutations::Writes,
-    trace: &mut mutations::Trace,
+    trace: &mut execution::Trace,
     allow_writes: bool,
 ) -> Result<LogicalPlan> {
     let mut context = initial.clone();
     if let Some(schema) = &query.at_schema {
         context.current_schema = crate::session::schema_reference(tx, initial, schema)?;
     }
-    let session = &context;
-    let mut current_graph = if let Some(graph) = &query.use_graph {
-        Some(crate::session::resolve_graph(tx, session, graph)?)
-    } else {
-        session.current_graph
-    };
-    let mut scope = graph::Bindings::default();
-    if !query.set_operations.is_empty() {
-        return Err(unsupported("composite queries"));
-    }
-    let body = &query.body;
-    if !body.select_from.is_empty() || body.select_query.is_some() {
-        return Err(unsupported("SELECT FROM graph queries"));
-    }
-    if !body.group_by.is_empty() || body.empty_grouping_set || body.having.is_some() {
-        return Err(unsupported("grouping and HAVING"));
-    }
-    if !allow_writes && body.clauses.iter().any(mutations::is_mutation) {
+    if !allow_writes && has_mutations(query) {
         return Err(unsupported(
             "query() is read-only; use run() for graph mutations",
         ));
     }
+    if !query.set_operations.is_empty() && has_mutations(query) {
+        return Err(unsupported("mutations in composite queries"));
+    }
+    let mut first_context = context.clone();
+    if let Some(graph) = &query.use_graph {
+        first_context.current_graph = Some(crate::session::resolve_graph(tx, &context, graph)?);
+    }
+    let otherwise = query
+        .set_operations
+        .iter()
+        .any(|op| op.operator == ast::QuerySetOperator::Otherwise);
+    if otherwise {
+        // Bind every branch before execution. Empty barrier results retain their schema,
+        // so a cold branch is checked without evaluating any of its expressions.
+        let mut validation = execution::Trace {
+            validate_only: true,
+            ..Default::default()
+        };
+        let mut checked = plan_body(
+            &query.body,
+            &first_context,
+            tx,
+            ctx,
+            writes,
+            &mut validation,
+        )
+        .await?;
+        for op in &query.set_operations {
+            let right = plan_body(&op.body, &context, tx, ctx, writes, &mut validation).await?;
+            checked =
+                relational::set_operation(checked, right, ast::QuerySetOperator::Union, true)?;
+        }
+        let schema = checked.schema().clone();
+        if trace.validate_only {
+            return Ok(checked);
+        }
+        for (body, context) in std::iter::once((&query.body, &first_context))
+            .chain(query.set_operations.iter().map(|op| (&op.body, &context)))
+        {
+            let branch = plan_body(body, context, tx, ctx, writes, trace).await?;
+            let branch = relational::coerce(branch, &schema)?;
+            let (schema, batches) = trace.collect(ctx, &branch).await?;
+            if batches.iter().any(|b| b.num_rows() > 0) {
+                return Ok(execution::memory(schema, batches)?.build()?);
+            }
+        }
+        return Ok(
+            execution::memory(std::sync::Arc::new(schema.as_arrow().clone()), vec![])?.build()?,
+        );
+    }
+    let mut result = plan_body(&query.body, &first_context, tx, ctx, writes, trace).await?;
+    for op in &query.set_operations {
+        let right = plan_body(&op.body, &context, tx, ctx, writes, trace).await?;
+        result = relational::set_operation(
+            result,
+            right,
+            op.operator,
+            op.quantifier == Some(ast::SetQuantifier::All),
+        )?;
+    }
+    Ok(result)
+}
+
+fn has_mutations(query: &ast::QueryStatement) -> bool {
+    std::iter::once(&query.body)
+        .chain(query.set_operations.iter().map(|op| &op.body))
+        .any(|body| {
+            body.clauses.iter().any(|clause| {
+                mutations::is_mutation(clause)
+                    || matches!(clause, ast::QueryClause::NestedQuery(q) if has_mutations(q))
+            }) || body
+                .select_query
+                .as_ref()
+                .is_some_and(|s| has_mutations(&s.query))
+        })
+}
+
+async fn plan_body(
+    body: &ast::QueryBody,
+    session: &SessionState,
+    tx: &mut StatementTxn,
+    ctx: &SessionContext,
+    writes: &mut mutations::Writes,
+    trace: &mut execution::Trace,
+) -> Result<LogicalPlan> {
+    let mut current_graph = session.current_graph;
+    let mut scope = graph::Bindings::default();
     let mut plan = LogicalPlanBuilder::empty(true);
     for clause in &body.clauses {
         match clause {
@@ -179,7 +251,52 @@ async fn plan(
                 let id = current_graph
                     .ok_or_else(|| Error::InvalidReference("current graph is unset".into()))?;
                 let data = writes.data(tx, id)?;
-                plan = graph::matches(plan, &mut scope, session, id, &data, clause)?;
+                plan = if clause.optional {
+                    let mut mandatory = clause.clone();
+                    mandatory.optional = false;
+                    relational::optional(
+                        plan,
+                        &mut scope,
+                        session,
+                        id,
+                        &data,
+                        std::slice::from_ref(&mandatory),
+                        ctx,
+                        trace,
+                    )
+                    .await?
+                } else {
+                    graph::matches(plan, &mut scope, session, id, &data, clause)?
+                };
+            }
+            ast::QueryClause::OptionalMatchBlock(clauses) => {
+                let id = current_graph
+                    .ok_or_else(|| Error::InvalidReference("current graph is unset".into()))?;
+                let data = writes.data(tx, id)?;
+                plan =
+                    relational::optional(plan, &mut scope, session, id, &data, clauses, ctx, trace)
+                        .await?;
+            }
+            ast::QueryClause::NestedQuery(query) => {
+                if !scope.order.is_empty() {
+                    return Err(unsupported("correlated nested queries"));
+                }
+                let mut nested_context = session.clone();
+                nested_context.current_graph = current_graph;
+                let nested = Box::pin(self::plan(
+                    query,
+                    &nested_context,
+                    tx,
+                    ctx,
+                    writes,
+                    trace,
+                    false,
+                ))
+                .await?;
+                plan = relational::derived(plan, &mut scope, nested)?;
+            }
+            ast::QueryClause::For(clause) => {
+                plan = relational::for_clause(plan, &mut scope, session, clause)?;
             }
             ast::QueryClause::Let(clause) => {
                 for item in &clause.items {
@@ -235,6 +352,46 @@ async fn plan(
             }
         }
     }
+    for from in &body.select_from {
+        let id = crate::session::resolve_graph(tx, session, &from.graph)?;
+        let data = writes.data(tx, id)?;
+        plan = if from.match_clause.optional {
+            let mut mandatory = from.match_clause.clone();
+            mandatory.optional = false;
+            relational::optional(
+                plan,
+                &mut scope,
+                session,
+                id,
+                &data,
+                std::slice::from_ref(&mandatory),
+                ctx,
+                trace,
+            )
+            .await?
+        } else {
+            graph::matches(plan, &mut scope, session, id, &data, &from.match_clause)?
+        };
+    }
+    if let Some(from) = &body.select_query {
+        let mut nested_context = session.clone();
+        nested_context.current_graph = if let Some(graph) = &from.graph {
+            Some(crate::session::resolve_graph(tx, session, graph)?)
+        } else {
+            current_graph
+        };
+        let nested = Box::pin(self::plan(
+            &from.query,
+            &nested_context,
+            tx,
+            ctx,
+            writes,
+            trace,
+            false,
+        ))
+        .await?;
+        plan = relational::derived(plan, &mut scope, nested)?;
+    }
     if body.result_clause.kind == ast::ResultKind::Finish {
         trace.collect(ctx, &plan.build()?).await?;
         return Ok(LogicalPlanBuilder::empty(false).build()?);
@@ -243,57 +400,7 @@ async fn plan(
         let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
         plan = plan.filter(expr)?;
     }
-    let binder = Binder::with_bindings(session, plan.schema(), &scope);
-    let mut projections = Vec::new();
-    let mut output_names = BTreeSet::new();
-    for (index, item) in body.result_clause.items.iter().enumerate() {
-        if matches!(item.expr, ast::Expr::Wildcard) {
-            if item.alias.is_some() {
-                return Err(Error::InvalidQuery("wildcard cannot have an alias".into()));
-            }
-            for name in &scope.order {
-                if !output_names.insert(name.clone()) {
-                    return Err(Error::InvalidQuery("duplicate result column".into()));
-                }
-                projections.push(
-                    binder
-                        .bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?
-                        .alias(name),
-                );
-            }
-            continue;
-        }
-        let name = item
-            .alias
-            .as_ref()
-            .map(|name| name.value.clone())
-            .unwrap_or_else(|| match &item.expr {
-                ast::Expr::Identifier(name) => name.value.clone(),
-                _ => format!("column_{}", index + 1),
-            });
-        if !output_names.insert(name.clone()) {
-            return Err(Error::InvalidQuery(format!(
-                "duplicate result column {name}"
-            )));
-        }
-        projections.push(binder.bind(&item.expr)?.alias(name));
-    }
-    if projections.is_empty() {
-        return Err(Error::InvalidQuery("result has no bound columns".into()));
-    }
-    plan = plan.project(projections)?;
-    if body.result_clause.distinct {
-        plan = plan.distinct()?;
-    }
-    Ok(order_and_page(
-        plan,
-        session,
-        &body.order_by,
-        body.offset.as_ref(),
-        body.limit.as_ref(),
-        None,
-    )?
-    .build()?)
+    Ok(aggregates::result(plan, session, &scope, body)?.build()?)
 }
 
 fn order_and_page(

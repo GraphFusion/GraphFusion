@@ -43,13 +43,13 @@ impl ElementBinding {
         }
     }
     pub fn property_exists(&self, name: &str) -> Expr {
-        self.present.get(name).map_or_else(
+        self.nullable_predicate(self.present.get(name).map_or_else(
             || lit(false),
             |column| self.column(column).and(self.property(name).is_not_null()),
-        )
+        ))
     }
     pub fn label(&self, label: &ast::LabelExpression) -> Expr {
-        match label {
+        self.nullable_predicate(match label {
             ast::LabelExpression::Label(name) => self
                 .labels
                 .get(&name.value)
@@ -64,7 +64,17 @@ impl ElementBinding {
             ast::LabelExpression::Or(a, b) => self.label(a).or(self.label(b)),
             ast::LabelExpression::Not(a) => Expr::Not(Box::new(self.label(a))),
             ast::LabelExpression::Parenthesized(a) => self.label(a),
-        }
+        })
+    }
+    pub fn nullable_predicate(&self, value: Expr) -> Expr {
+        Expr::Case(datafusion::logical_expr::expr::Case::new(
+            None,
+            vec![(
+                Box::new(self.column(graph::ID).is_null()),
+                Box::new(lit(ScalarValue::Boolean(None))),
+            )],
+            Some(Box::new(value)),
+        ))
     }
     pub fn identity(&self) -> Expr {
         let kind = if self.kind == ElementKind::Node {
@@ -72,10 +82,18 @@ impl ElementBinding {
         } else {
             "e"
         };
-        datafusion::functions::string::expr_fn::concat(vec![
+        let value = datafusion::functions::string::expr_fn::concat(vec![
             lit(format!("g{}:{kind}:", self.graph)),
             cast(self.column(graph::ID), DataType::Utf8),
-        ])
+        ]);
+        Expr::Case(datafusion::logical_expr::expr::Case::new(
+            None,
+            vec![(
+                Box::new(self.column(graph::ID).is_null()),
+                Box::new(lit(ScalarValue::Utf8(None))),
+            )],
+            Some(Box::new(value)),
+        ))
     }
 }
 
@@ -262,6 +280,7 @@ fn node(
         .cloned();
     let binding = if let Some(binding) = previous {
         check_binding(&binding, graph_id, ElementKind::Node)?;
+        plan = plan.filter(binding.column(graph::ID).is_not_null())?;
         if let Some(endpoint) = endpoint {
             plan = plan.filter(binding.column(graph::ID).eq(endpoint))?;
         }

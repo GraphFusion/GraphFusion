@@ -289,3 +289,31 @@ fn cli_executes_persistent_gql_mutations_without_an_external_import() {
     assert!(result.contains("Bob"));
     assert!(!result.contains("Alice"));
 }
+
+#[test]
+fn cli_relational_queries_and_rollback_survive_parquet_reopen() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("analytics.gql"),
+        include_str!("../../../examples/analytics.gql"),
+    )
+    .unwrap();
+    let result = fixture.run("run", &["--create", "--file", "analytics.gql"]);
+    assert!(result.contains("median_age"));
+    assert!(result.contains("| Cara  | 0"), "{result}");
+    fixture.run("checkpoint", &[]);
+    let result = fixture.run("run", &["--query", "USE GRAPH analytics MATCH (p:Person) OPTIONAL MATCH (p)-[:Knows]->(f) RETURN p.name AS name, COUNT(f) AS friends GROUP BY name ORDER BY name", "--explain"]);
+    assert!(result.contains("| Alice | 1"), "{result}");
+    assert!(result.contains("| Bob   | 0"), "{result}");
+    assert!(result.contains("| Cara  | 0"), "{result}");
+    assert!(result.contains("file_type=parquet"), "{result}");
+    assert!(!fixture.invoke("run", &["--query", "USE GRAPH analytics INSERT (:Person {name: 'Rolled back'}) FOR x IN [9223372036854775807, 1] RETURN SUM(x) AS n"]).status.success());
+    let result = fixture.run(
+        "run",
+        &[
+            "--query",
+            "USE GRAPH analytics MATCH (p:Person) RETURN COUNT(*) AS n",
+        ],
+    );
+    assert!(result.contains("| 3 |"), "{result}");
+}

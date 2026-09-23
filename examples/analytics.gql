@@ -1,0 +1,17 @@
+CREATE GRAPH analytics ANY GRAPH;
+SESSION SET GRAPH analytics;
+INSERT (a:Person {name: 'Alice', age: 31})-[:Knows]->(b:Person {name: 'Bob', age: 40}),
+       (:Person {name: 'Cara', age: 25});
+
+MATCH (p:Person)
+OPTIONAL MATCH (p)-[:Knows]->(friend)
+RETURN p.name AS name, COUNT(friend) AS outgoing
+GROUP BY name ORDER BY name;
+
+MATCH (p:Person)
+RETURN COUNT(*) AS people, AVG(p.age) AS average_age,
+       PERCENTILE_CONT(p.age, 0.5) AS median_age;
+
+SELECT score, COUNT(*) AS frequency
+FROM { FOR score IN [10, 10, 20] RETURN score UNION ALL RETURN 20 AS score }
+GROUP BY score ORDER BY score;

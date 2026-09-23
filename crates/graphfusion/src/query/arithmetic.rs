@@ -7,6 +7,31 @@ use datafusion::{
 };
 use std::sync::Arc;
 
+pub(super) fn finite(value: Expr) -> Expr {
+    create_udf(
+        "gql_finite_float",
+        vec![DataType::Float64],
+        DataType::Float64,
+        Volatility::Immutable,
+        Arc::new(|args| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let values = arrays[0]
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("expected Float64 aggregate result".into())
+                })?;
+            if values.iter().flatten().any(|n| !n.is_finite()) {
+                return Err(DataFusionError::Execution(
+                    "non-finite aggregate result".into(),
+                ));
+            }
+            Ok(args[0].clone())
+        }),
+    )
+    .call(vec![value])
+}
+
 pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType) -> Expr {
     let name = format!("gql_checked_{op:?}_{data_type:?}").to_lowercase();
     create_udf(

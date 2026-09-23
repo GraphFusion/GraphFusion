@@ -44,17 +44,20 @@ runtime or block on an asynchronous query from its synchronous DDL method.
   `column_1`, `column_2`, etc.; a variable retains its name.
 
 Graph selection and fixed-length MATCH are described in [Arrow graph queries](graphs.md).
-Graph mutations use [the async program API](mutations.md). Whole graph element values, aggregation, composite
-queries, nested/procedure queries, typed LET, temporal expressions, casts and
-remaining expressions are not yet executed. Unsupported features produce an
+Graph mutations use [the async program API](mutations.md).
+[Relational queries](relational.md) add OPTIONAL MATCH, FOR, grouping/aggregates,
+SELECT sources and composite queries, including independent nested queries.
+Whole graph element values, correlated/procedure queries, typed LET, temporal
+expressions, casts and remaining expressions are not yet executed. Unsupported features produce an
 error; they are not discarded or interpreted as SQL. The query API rejects mixed
 programs and multiple top-level statements before any command can execute.
 
 ## Results and snapshots
 
 `QueryResult` includes the Arrow schema even for empty results, batches, snapshot
-commit sequence, affected-element count, logical plans and physical plans. Write
-results include the plans executed at each materialization barrier.
+commit sequence, affected-element count, logical plans and physical plans. Results
+include the plans executed at each materialization barrier, including optional
+input buffers and selected OTHERWISE branches.
 Plan text is diagnostic rather than a stable serialization format and can contain
 bound parameter values; it is returned to the caller and is not logged.
 `graphfusion::arrow` re-exports the matching Arrow version for consumers.

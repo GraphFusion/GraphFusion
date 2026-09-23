@@ -9340,3 +9340,20 @@ fn preserves_expression_precedence() {
         }
     ));
 }
+
+#[test]
+fn nested_query_primary_inherits_results_but_explicit_finish_does_not() {
+    let program = parse("{ RETURN 1 AS x }; { RETURN 1 AS x } FINISH").unwrap();
+    let Statement::Query(inherited) = &program.statements[0] else {
+        panic!()
+    };
+    assert_eq!(inherited.body.result_clause.kind, ResultKind::Return);
+    assert!(matches!(
+        inherited.body.result_clause.items[0].expr,
+        Expr::Wildcard
+    ));
+    let Statement::Query(finished) = &program.statements[1] else {
+        panic!()
+    };
+    assert_eq!(finished.body.result_clause.kind, ResultKind::Finish);
+}
