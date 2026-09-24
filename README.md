@@ -4,6 +4,23 @@ GraphFusion is a Rust graph database project. The repository is organized as a
 Cargo workspace so database components can evolve independently while sharing a
 single build and test surface.
 
+## Development and CI
+
+The minimum supported Rust version is 1.89. `rust-toolchain.toml` pins the
+development toolchain and format/lint versions; CI additionally tests stable Rust
+on Linux and macOS and the minimum version on Linux. All Cargo checks use the
+committed lockfile.
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+The [CI workflow](.github/workflows/ci.yml) runs on pull requests, main pushes,
+development branch pushes (`codex/**`), and manual dispatch. It uses read-only
+permissions and never merges PRs. Maintainer approval is required for merging.
+
 ## Layout
 
 - `crates/graphfusion`: main database crate and public facade.

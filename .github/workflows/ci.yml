@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  quality:
+    name: Format and Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned quality toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +1.98.0 fmt --all -- --check
+      - name: Check all targets with Clippy
+        run: cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Tests (${{ matrix.os }}, Rust ${{ matrix.rust }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust: stable
+          - os: macos-latest
+            rust: stable
+          - os: ubuntu-latest
+            rust: '1.89.0'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        env:
+          RUST_VERSION: ${{ matrix.rust }}
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - name: Cache Cargo downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Test workspace and documentation
+        env:
+          RUST_VERSION: ${{ matrix.rust }}
+        run: cargo +"$RUST_VERSION" test --workspace --locked
+      - name: Check all targets
+        env:
+          RUST_VERSION: ${{ matrix.rust }}
+        run: cargo +"$RUST_VERSION" check --workspace --all-targets --locked
