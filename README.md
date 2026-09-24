@@ -40,6 +40,8 @@ See [query execution](docs/query.md), [graph import and MATCH](docs/graphs.md), 
 shows optional aggregation, percentiles and UNION ALL. [Path queries](docs/paths.md)
 describe native DataFusion recursion, path values, group lists and resource limits;
 the [path example](examples/paths.gql) finds all tied shortest routes.
+[Complex patterns](docs/path-patterns.md) support parenthesized filters, repeated
+groups, union/multiset alternatives and questioned paths.
 `cargo run -p graphfusion --example social --locked` runs a two-hop social graph
 query. Pass a new database directory after `--` to persist the example in Parquet.
 `Session::run(...).await` also executes [GQL graph mutations](docs/mutations.md).

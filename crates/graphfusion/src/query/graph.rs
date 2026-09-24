@@ -102,9 +102,14 @@ pub(super) struct Bindings {
     pub scalars: BTreeMap<String, Column>,
     pub elements: BTreeMap<String, ElementBinding>,
     pub order: Vec<String>,
+    pub conditional: BTreeSet<String>,
+    pub groups: BTreeSet<String>,
     next: usize,
 }
 impl Bindings {
+    pub fn advance(&mut self, other: &Self) {
+        self.next = self.next.max(other.next);
+    }
     pub fn fresh(&mut self, prefix: &str) -> String {
         let name = format!("__gf_{prefix}_{}", self.next);
         self.next += 1;
@@ -138,130 +143,37 @@ pub(super) async fn matches(
     ctx: &datafusion::execution::context::SessionContext,
     trace: &mut super::execution::Trace,
 ) -> Result<LogicalPlanBuilder> {
-    use super::paths::{self, Selection, State};
     if clause.optional || clause.keep.is_some() || clause.yield_clause.is_some() {
         return Err(super::unsupported("OPTIONAL MATCH, KEEP, or graph YIELD"));
     }
+    scope.conditional.clear();
     let different = !matches!(clause.mode, Some(ast::MatchMode::RepeatableElements { .. }));
-    let mut edge_lists: Vec<Expr> = Vec::new();
-    // Unselected patterns bind every element before resolving their predicates.
-    let mut element_predicates = Vec::new();
-    for path in &clause.patterns {
-        if path.parenthesized.is_some()
-            || path.alternation.is_some()
-            || !path.alternatives.is_empty()
-            || path.factors.iter().any(|factor| {
-                !matches!(
-                    factor,
-                    ast::PathPatternFactor::Node(_) | ast::PathPatternFactor::Relationship(_)
-                )
-            })
-            || path.factors.len() != path.chains.len() * 2 + 1
-        {
-            return Err(super::unsupported(
-                "parenthesized or alternative path pattern",
-            ));
-        }
-        let (mode, selection) = paths::prefix(path.prefix.as_ref(), session)?;
-        let row = if matches!(selection, Selection::All) {
-            None
-        } else {
-            let name = scope.fresh("path_row");
-            plan = super::execution::ordinal(plan, ctx, trace, &name).await?;
-            Some(Expr::Column(Column::new_unqualified(name)))
-        };
-        let mut max_hops = 0_u64;
-        for chain in &path.chains {
-            max_hops = max_hops.saturating_add(match &chain.relationship.quantifier {
-                Some(q) => {
-                    paths::bounds(
-                        q,
-                        mode,
-                        different,
-                        graph,
-                        session.query_limits.max_path_hops,
-                    )?
-                    .1
-                }
-                None => 1,
-            });
-            if max_hops > session.query_limits.max_path_hops {
-                return Err(Error::InvalidQuery(format!(
-                    "path exceeds the {}-hop implementation limit",
-                    session.query_limits.max_path_hops
-                )));
-            }
-        }
-        let (next, start_node) = node(plan, scope, graph_id, graph, &path.start, None)?;
-        plan = next;
-        let mut path_predicates = vec![(
-            start_node.clone(),
-            &path.start.labels,
-            path.start.label_expression.as_ref(),
-            path.start.properties.as_ref(),
-            path.start.where_clause.as_ref(),
-        )];
-        let mut state = State::new(start_node.column(graph::ID));
-        for chain in &path.chains {
-            let edge = &chain.relationship;
-            if edge.temporary {
-                return Err(super::unsupported("temporary edge pattern"));
-            }
-            let endpoint = if edge.quantifier.is_some() {
-                (plan, state) = paths::expand(
-                    plan, scope, session, graph_id, graph, edge, &state, mode, different,
-                )?;
-                state.end()
-            } else {
-                let (edge_plan, binding) = scan(
-                    scope,
-                    graph_id,
-                    graph,
-                    ElementKind::Edge,
-                    Some(edge.direction),
-                )?;
-                let mut predicates = vec![state.end().eq(binding.column(graph::FROM))];
-                if let Some(name) = &edge.variable {
-                    if let Some(previous) = scope.elements.get(&name.value) {
-                        check_binding(previous, graph_id, ElementKind::Edge)?;
-                        predicates.push(previous.column(graph::ID).eq(binding.column(graph::ID)));
-                    } else {
-                        declare(scope, &name.value, &binding)?;
-                    }
-                }
-                plan = plan.join_on(edge_plan, JoinType::Inner, predicates)?;
-                path_predicates.push((
-                    binding.clone(),
-                    &edge.labels,
-                    edge.label_expression.as_ref(),
-                    edge.properties.as_ref(),
-                    edge.where_clause.as_ref(),
+    if different && clause.patterns.len() > 1 {
+        for path in &clause.patterns {
+            let (_, selection) = super::paths::prefix(path.prefix.as_ref(), session)?;
+            if !matches!(selection, super::paths::Selection::All) {
+                return Err(super::unsupported(
+                    "selective paths in a multi-path DIFFERENT EDGES MATCH",
                 ));
-                state = state.append(binding.column(graph::ID), binding.column(graph::TO));
-                binding.column(graph::TO)
-            };
-            let (next, next_node) =
-                node(plan, scope, graph_id, graph, &chain.node, Some(endpoint))?;
-            plan = next;
-            path_predicates.push((
-                next_node,
-                &chain.node.labels,
-                chain.node.label_expression.as_ref(),
-                chain.node.properties.as_ref(),
-                chain.node.where_clause.as_ref(),
-            ));
-        }
-        if matches!(selection, Selection::All) {
-            element_predicates.extend(path_predicates);
-        } else {
-            // Inline predicates constrain candidates before shortest/ANY selection.
-            for (binding, labels, expression, properties, predicate) in path_predicates {
-                plan = predicates_for(
-                    plan, scope, session, &binding, labels, expression, properties, predicate,
-                )?;
             }
         }
-        plan = plan.filter(state.valid(mode, different))?;
+    }
+    let mut compiler = super::patterns::Compiler {
+        session,
+        graph_id,
+        data: graph,
+        ctx,
+        trace,
+        different,
+        predicates: Vec::new(),
+    };
+    let mut edge_lists: Vec<Expr> = Vec::new();
+    for path in &clause.patterns {
+        compiler.validate(path, None)?;
+        let (next, state) = compiler
+            .pattern(plan, scope, path, None, None, true)
+            .await?;
+        plan = next;
         if different {
             for previous in &edge_lists {
                 plan = plan.filter(Expr::Not(Box::new(
@@ -272,31 +184,9 @@ pub(super) async fn matches(
                 )))?;
             }
         }
-        plan = paths::select(plan, scope, &state, selection, row)?;
-        if let Some(name) = &path.variable {
-            if scope.contains(&name.value) {
-                return Err(Error::InvalidQuery(format!(
-                    "variable {} is already bound",
-                    name.value
-                )));
-            }
-            let column = scope.scalar(&name.value);
-            let mut projection: Vec<_> = plan
-                .schema()
-                .columns()
-                .into_iter()
-                .map(Expr::Column)
-                .collect();
-            projection.push(state.value(graph_id).alias(column.name));
-            plan = plan.project(projection)?;
-        }
         edge_lists.push(state.edges);
     }
-    for (binding, labels, expression, properties, predicate) in element_predicates {
-        plan = predicates_for(
-            plan, scope, session, &binding, labels, expression, properties, predicate,
-        )?;
-    }
+    plan = compiler.apply_predicates(plan, scope, 0)?;
     if let Some(predicate) = &clause.where_clause {
         let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
         plan = plan.filter(expr)?;
@@ -304,7 +194,11 @@ pub(super) async fn matches(
     Ok(plan)
 }
 
-fn check_binding(binding: &ElementBinding, graph: ObjectId, kind: ElementKind) -> Result<()> {
+pub(super) fn check_binding(
+    binding: &ElementBinding,
+    graph: ObjectId,
+    kind: ElementKind,
+) -> Result<()> {
     if binding.graph != graph || binding.kind != kind {
         return Err(Error::InvalidQuery(
             "element variable reused with a different graph or kind".into(),
@@ -322,7 +216,7 @@ pub(super) fn declare(scope: &mut Bindings, name: &str, binding: &ElementBinding
     scope.order.push(name.into());
     Ok(())
 }
-fn node(
+pub(super) fn node(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     graph_id: ObjectId,
@@ -332,6 +226,15 @@ fn node(
 ) -> Result<(LogicalPlanBuilder, ElementBinding)> {
     if pattern.temporary || pattern.quantifier.is_some() {
         return Err(super::unsupported("temporary or quantified node pattern"));
+    }
+    if pattern
+        .variable
+        .as_ref()
+        .is_some_and(|name| scope.conditional.contains(&name.value))
+    {
+        return Err(Error::InvalidQuery(
+            "implicit reuse of a conditional path variable".into(),
+        ));
     }
     let previous = pattern
         .variable

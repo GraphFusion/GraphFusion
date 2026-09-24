@@ -148,8 +148,26 @@ pub(super) fn references(graph: Expr, nodes: Option<Expr>, edges: Option<Expr>) 
                     ));
                 }
                 for (index, id) in values.iter().enumerate() {
-                    let id =
-                        id.ok_or_else(|| DataFusionError::Internal("null element ID".into()))?;
+                    let Some(id) = id else {
+                        if path {
+                            return Err(DataFusionError::Internal("null path element ID".into()));
+                        }
+                        let value = builder.values();
+                        value
+                            .field_builder::<UInt64Builder>(0)
+                            .expect("graph builder")
+                            .append_null();
+                        value
+                            .field_builder::<StringBuilder>(1)
+                            .expect("kind builder")
+                            .append_null();
+                        value
+                            .field_builder::<UInt64Builder>(2)
+                            .expect("id builder")
+                            .append_null();
+                        value.append(false);
+                        continue;
+                    };
                     append(
                         builder.values(),
                         graphs.value(row),

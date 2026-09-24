@@ -7,6 +7,7 @@ mod graph;
 mod mutations;
 mod path_values;
 mod paths;
+mod patterns;
 mod relational;
 
 use crate::{

@@ -1,0 +1,14 @@
+CREATE GRAPH routes ANY;
+SESSION SET GRAPH routes;
+INSERT (a:Station {name:'A'}), (b:Station {name:'B'}),
+       (c:Station {name:'C'}), (d:Station {name:'D'}),
+       (a)-[:Link]->(b), (a)-[:Link]->(c),
+       (b)-[:Link]->(d), (c)-[:Link]->(d), (d)-[:Link]->(a);
+MATCH p = (a {name:'A'})((x)-[edges:Link]->(y)){0,2}(b)
+RETURN b.name AS destination, PATH_LENGTH(p) AS hops
+ORDER BY hops, destination;
+MATCH p = (a {name:'A'})(-[edge:Link]->(maybe))?(destination)
+RETURN maybe.name AS optional_stop, destination.name AS destination
+ORDER BY destination;
+MATCH REPEATABLE ELEMENTS p = ALL SHORTEST (a {name:'A'})-[:Link]->+(b {name:'D'})
+RETURN COUNT(*) AS ties, MIN(PATH_LENGTH(p)) AS hops;

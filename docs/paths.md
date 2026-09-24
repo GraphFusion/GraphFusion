@@ -1,9 +1,10 @@
 # Path planning and execution
 
-This task supplies the recursive execution foundation for roadmap item 10. It
-does not complete every path-pattern production in ISO GQL. Parenthesized path
-expressions, quantified groups, alternation, KEEP and the remaining unbounded
-selective WALK cases are the next path task.
+Roadmap tasks 10a/10b provide recursive edges and compositional path patterns.
+[Complex path patterns](path-patterns.md) include parenthesized expressions,
+quantified groups, alternation and questioned paths. KEEP, graph YIELD and the
+remaining history-dependent unbounded selective WALK cases still need work;
+this is not a complete ISO GQL conformance claim.
 
 ## Implemented queries
 
@@ -60,7 +61,7 @@ integer parameters. SHORTEST k retains up to k paths ordered by edge count;
 GROUP(S) retains all ties in the first k distinct lengths. ANY is free to choose
 the shortest candidates. Ties that must be broken have no promised ordering.
 Final MATCH WHERE filters the selected results; it does not restart selection
-to find a longer path. Parenthesized pre-selection predicates are not yet bound.
+to find a longer path. Parenthesized predicates filter their subpath before an enclosing selector.
 
 ## Arrow values
 
@@ -98,16 +99,18 @@ the optional block's semantics, this prevents DataFusion 55 projection pruning
 from producing invalid recursive work-table schemas. These barriers appear in
 the returned logical/physical plan trace.
 
-Finite upper bounds are required for repeatable WALK, including shortest WALK
-at this stage. Other unbounded modes have a provable finite maximum: graph edge
-count for TRAIL/DIFFERENT EDGES, node count minus one for ACYCLIC, and node count
-for SIMPLE. These are completeness bounds, not arbitrary search cutoffs.
+Unbounded homogeneous edge WALK now supports selective prefixes when predicates
+are independent of the path history. Its finite completeness proofs and limits
+are detailed in [complex path patterns](path-patterns.md). Other unbounded modes
+use graph edge count for TRAIL/DIFFERENT EDGES, node count minus one for ACYCLIC,
+and node count for SIMPLE. Remaining repeatable unbounded patterns require a
+finite upper bound. No arbitrary search cutoff is presented as a complete result.
 
 `Session::set_query_limits(QueryLimits { .. })` configures a default maximum of
 256 path hops and a 256 MiB DataFusion tracked operator memory budget per
 statement. Bounds above the hop limit fail during planning; candidates are never
-silently truncated. For multiple segments the planner conservatively sums their
-upper bounds. The memory pool applies to DataFusion operators, including
+silently truncated. The planner combines concatenation, alternative and repetition
+bounds, then applies any whole-path mode bound. The memory pool applies to DataFusion operators, including
 recursive work tables; it is not an RSS limit and does not account for every
 imported graph buffer or final materialized result. Memory exhaustion is an
 execution error. Errors follow normal statement/explicit-transaction rollback
@@ -115,8 +118,8 @@ rules. Limits are session-local and can be changed for subsequent statements.
 
 The implementation currently enumerates all eligible finite candidates before
 ranking, so selective queries on dense graphs can still be expensive. Native
-frontier pruning for unbounded shortest walks, richer path patterns, cancellation
-and full resource accounting remain explicit follow-up tasks.
+frontier pruning, the remaining path grammar and scopes, cancellation and full
+resource accounting remain follow-up tasks.
 
 ## Evidence and semantic references
 

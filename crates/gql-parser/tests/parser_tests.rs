@@ -9357,3 +9357,30 @@ fn nested_query_primary_inherits_results_but_explicit_finish_does_not() {
     };
     assert_eq!(finished.body.result_clause.kind, ResultKind::Finish);
 }
+
+#[test]
+fn leading_parenthesized_paths_allow_following_factors_and_alternatives() {
+    let program = parse("MATCH p = ((a)->(b)){1,2}->(c) | ((x)->(y)) RETURN p").unwrap();
+    let Statement::Query(query) = &program.statements[0] else {
+        panic!("query");
+    };
+    let pattern = &first_match(query).patterns[0];
+    assert!(pattern.parenthesized.is_none());
+    assert_eq!(pattern.factors.len(), 3);
+    assert!(matches!(
+        pattern.factors[0],
+        PathPatternFactor::Parenthesized(_)
+    ));
+    assert_eq!(pattern.alternation, Some(PathPatternAlternation::Union));
+    assert_eq!(pattern.alternatives.len(), 1);
+    assert!(matches!(
+        pattern.alternatives[0].factors[0],
+        PathPatternFactor::Parenthesized(_)
+    ));
+    for invalid in [
+        "MATCH (TRAIL ANY SHORTEST (a)->(b)) RETURN a",
+        "MATCH (p = q = (a)->(b)) RETURN p",
+    ] {
+        assert!(parse(invalid).is_err(), "{invalid}");
+    }
+}
