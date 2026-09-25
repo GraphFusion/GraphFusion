@@ -4682,8 +4682,8 @@ fn parses_reference_value_types() {
         ValueType::EdgeReference {
             definition: Some(ref definition),
         } if definition.name == ident("")
-            && definition.source == None
-            && definition.destination == None
+            && definition.source.is_none()
+            && definition.destination.is_none()
             && definition.properties.len() == 1
     ));
     assert!(matches!(
@@ -4699,8 +4699,8 @@ fn parses_reference_value_types() {
         ValueType::EdgeReference {
             definition: Some(ref definition),
         } if definition.name == ident("")
-            && definition.source == None
-            && definition.destination == None
+            && definition.source.is_none()
+            && definition.destination.is_none()
     ));
 
     let Statement::Query(cast_query) = &program.statements[1] else {

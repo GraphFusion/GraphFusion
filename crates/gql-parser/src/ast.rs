@@ -39,6 +39,8 @@ pub struct ValueVariableDefinition {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+// Keep the public AST's owned variants stable. Boxing is a separate API change.
+#[allow(clippy::large_enum_variant)]
 pub enum Statement {
     LinearCatalog(Vec<Statement>),
     Query(QueryStatement),
@@ -305,6 +307,8 @@ pub struct SetStatement {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+// Keep the public AST's owned variants stable. Boxing is a separate API change.
+#[allow(clippy::large_enum_variant)]
 pub enum SetItem {
     Property {
         target: Expr,

@@ -261,7 +261,7 @@ impl<'a> Lexer<'a> {
             break;
         }
 
-        if value.len() % 2 != 0 {
+        if !value.len().is_multiple_of(2) {
             return Err(Error::Message {
                 offset: start,
                 message: format!(

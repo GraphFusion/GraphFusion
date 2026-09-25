@@ -3,6 +3,27 @@ use crate::error::{Error, Result};
 use crate::lexer::Lexer;
 use crate::token::{Token, TokenKind};
 
+type EdgeTypeTail = (
+    Direction,
+    Option<Identifier>,
+    Option<Identifier>,
+    Vec<PropertyTypeDefinition>,
+);
+type PatternElementBody = (
+    Option<Identifier>,
+    bool,
+    Vec<Identifier>,
+    Option<LabelExpression>,
+    Option<MapLiteral>,
+    Option<Expr>,
+);
+type InsertElementBody = (
+    Option<Identifier>,
+    Vec<Identifier>,
+    Option<LabelExpression>,
+    Option<MapLiteral>,
+);
+
 pub fn parse(input: &str) -> Result<Program> {
     Parser::new(input).parse_program()
 }
@@ -496,9 +517,8 @@ impl Parser {
 
         let quantifier = if self.eat(TokenKind::All).is_some() {
             Some(SetQuantifier::All)
-        } else if self.eat(TokenKind::Distinct).is_some() {
-            Some(SetQuantifier::Distinct)
         } else {
+            self.eat(TokenKind::Distinct);
             Some(SetQuantifier::Distinct)
         };
 
@@ -1347,9 +1367,8 @@ impl Parser {
         }
         let quantifier = if self.eat(TokenKind::Distinct).is_some() {
             Some(SetQuantifier::Distinct)
-        } else if self.eat(TokenKind::All).is_some() {
-            Some(SetQuantifier::All)
         } else {
+            self.eat(TokenKind::All);
             Some(SetQuantifier::All)
         };
         let distinct = quantifier == Some(SetQuantifier::Distinct);
@@ -1655,10 +1674,8 @@ impl Parser {
         let detach = if self.eat(TokenKind::Detach).is_some() {
             self.expect(TokenKind::Delete)?;
             true
-        } else if self.eat(TokenKind::Nodetach).is_some() {
-            self.expect(TokenKind::Delete)?;
-            false
         } else {
+            self.eat(TokenKind::Nodetach);
             self.expect(TokenKind::Delete)?;
             false
         };
@@ -2533,12 +2550,7 @@ impl Parser {
         &mut self,
         default_direction: Direction,
         explicit_edge_kind: Option<Direction>,
-    ) -> Result<(
-        Direction,
-        Option<Identifier>,
-        Option<Identifier>,
-        Vec<PropertyTypeDefinition>,
-    )> {
+    ) -> Result<EdgeTypeTail> {
         let mut properties = self.parse_optional_property_type_set()?;
         let (direction, source, destination) = if self.eat(TokenKind::Connecting).is_some() {
             let (direction, source, destination) =
@@ -4054,9 +4066,7 @@ impl Parser {
     }
 
     fn parse_optional_path_mode_prefix(&mut self) -> Option<PathPatternPrefix> {
-        let Some(mode) = self.parse_optional_path_mode() else {
-            return None;
-        };
+        let mode = self.parse_optional_path_mode()?;
 
         let path_or_paths = self.parse_optional_path_or_paths();
 
@@ -4494,17 +4504,7 @@ impl Parser {
         })
     }
 
-    fn parse_pattern_element_body(
-        &mut self,
-        terminator: TokenKind,
-    ) -> Result<(
-        Option<Identifier>,
-        bool,
-        Vec<Identifier>,
-        Option<LabelExpression>,
-        Option<MapLiteral>,
-        Option<Expr>,
-    )> {
+    fn parse_pattern_element_body(&mut self, terminator: TokenKind) -> Result<PatternElementBody> {
         let temporary =
             self.at(TokenKind::Temp) && self.peek_n_kind(1).is_some_and(is_identifier_like);
         if temporary {
@@ -4557,12 +4557,7 @@ impl Parser {
     fn parse_insert_element_pattern_body(
         &mut self,
         terminator: TokenKind,
-    ) -> Result<(
-        Option<Identifier>,
-        Vec<Identifier>,
-        Option<LabelExpression>,
-        Option<MapLiteral>,
-    )> {
+    ) -> Result<InsertElementBody> {
         let variable = if self.starts_element_variable()
             && !matches!(self.peek_n_kind(1), Some(TokenKind::Ampersand) | None)
         {
@@ -5279,7 +5274,7 @@ impl Parser {
 
     fn parse_byte_string_literal(&self, token: Token) -> Result<Expr> {
         let mut value = Vec::with_capacity(token.text.len() / 2);
-        for pair in token.text.as_bytes().chunks_exact(2) {
+        for pair in token.text.as_bytes().as_chunks::<2>().0 {
             let pair = std::str::from_utf8(pair).map_err(|_| Error::Message {
                 offset: token.offset,
                 message: "invalid byte string literal".to_owned(),
@@ -5855,16 +5850,16 @@ impl Parser {
                     });
                 }
             }
-            "PERCENTILE_CONT" | "PERCENTILE_DISC" => {
-                if args.len() != 2 || args.iter().any(|arg| matches!(arg, Expr::Wildcard)) {
-                    return Err(Error::Message {
-                        offset,
-                        message: format!(
-                            "aggregate function {} requires two numeric value expressions",
-                            name.value
-                        ),
-                    });
-                }
+            "PERCENTILE_CONT" | "PERCENTILE_DISC"
+                if args.len() != 2 || args.iter().any(|arg| matches!(arg, Expr::Wildcard)) =>
+            {
+                return Err(Error::Message {
+                    offset,
+                    message: format!(
+                        "aggregate function {} requires two numeric value expressions",
+                        name.value
+                    ),
+                });
             }
             _ => {}
         }
