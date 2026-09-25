@@ -48,7 +48,9 @@ Graph selection and fixed-length MATCH are described in [Arrow graph queries](gr
 Graph mutations use [the async program API](mutations.md).
 [Relational queries](relational.md) add OPTIONAL MATCH, FOR, grouping/aggregates,
 SELECT sources and composite queries, including independent nested queries.
-Whole graph element values, correlated/procedure queries, typed LET, temporal
+[Element values and references](element-references.md) support whole-element
+results, aliases, lists and graph property/predicate access.
+Correlated/procedure queries, typed LET, temporal
 expressions, casts and remaining expressions are not yet executed. Unsupported features produce an
 error; they are not discarded or interpreted as SQL. The query API rejects mixed
 programs and multiple top-level statements before any command can execute.

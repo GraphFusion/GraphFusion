@@ -42,6 +42,8 @@ describe native DataFusion recursion, path values, group lists and resource limi
 the [path example](examples/paths.gql) finds all tied shortest routes.
 [Complex patterns](docs/path-patterns.md) support parenthesized filters, repeated
 groups, union/multiset alternatives and questioned paths.
+[Element references](docs/element-references.md) support whole-element results,
+path/group property access, identity-preserving aliases and subsequent matches.
 `cargo run -p graphfusion --example social --locked` runs a two-hop social graph
 query. Pass a new database directory after `--` to persist the example in Parquet.
 `Session::run(...).await` also executes [GQL graph mutations](docs/mutations.md).

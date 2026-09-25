@@ -261,6 +261,26 @@ pub(super) fn result(
         for expr in &body.group_by {
             if let ast::Expr::Identifier(name) = expr {
                 if !aliases.contains_key(&name.value) {
+                    if let Some(reference) = scope.references.get(&name.value) {
+                        let scalar = scope.scalars.get(&name.value).expect("scalar reference");
+                        groups.push(Expr::Column(scalar.clone()));
+                        groups.extend(
+                            plan.schema()
+                                .columns()
+                                .into_iter()
+                                .filter(|c| {
+                                    c.relation.as_ref().is_some_and(|r| {
+                                        reference.parts.iter().any(|p| r.table() == p.alias)
+                                            || scope
+                                                .elements
+                                                .get(&name.value)
+                                                .is_some_and(|p| r.table() == p.alias)
+                                    })
+                                })
+                                .map(Expr::Column),
+                        );
+                        continue;
+                    }
                     if let Some(binding) = scope.elements.get(&name.value) {
                         groups.extend(
                             plan.schema()

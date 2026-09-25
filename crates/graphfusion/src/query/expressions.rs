@@ -49,6 +49,28 @@ impl<'a> Binder<'a> {
             .ok_or_else(|| Error::InvalidQuery(format!("unbound element variable {name}")))?
             .element(name)
     }
+    fn reference(&self, name: &str) -> Result<Expr> {
+        let value = self.bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?;
+        match value.get_type(self.schema)? {
+            DataType::Null => Ok(datafusion::logical_expr::cast(
+                value,
+                super::path_values::data_type(),
+            )),
+            ty if ty == super::path_values::data_type() => Ok(value),
+            _ => Err(Error::InvalidQuery(format!(
+                "{name} is not an element reference"
+            ))),
+        }
+    }
+    fn null_reference_predicate(&self, name: &str) -> Result<Expr> {
+        let value = self.bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?;
+        if value.get_type(self.schema)? != DataType::Null {
+            return Err(Error::InvalidQuery(format!(
+                "{name} is not a resolved element reference"
+            )));
+        }
+        Ok(datafusion::logical_expr::lit(ScalarValue::Boolean(None)))
+    }
     pub fn equals(&self, left: Expr, right: Expr) -> Result<Expr> {
         let a = left.get_type(self.schema)?;
         let b = right.get_type(self.schema)?;
@@ -123,9 +145,15 @@ impl<'a> Binder<'a> {
                     if let Some(column) = bindings.scalars.get(&name.value) {
                         return Ok(Expr::Column(column.clone()));
                     }
-                    if bindings.elements.contains_key(&name.value) {
-                        return Err(super::unsupported(
-                            "whole element values in results or scalar expressions",
+                    if let Some(element) = bindings.elements.get(&name.value) {
+                        return Ok(super::path_values::reference(
+                            datafusion::logical_expr::lit(element.graph),
+                            if element.kind == super::graph::ElementKind::Node {
+                                "n"
+                            } else {
+                                "e"
+                            },
+                            element.column(crate::graph::ID),
                         ));
                     }
                     return Err(Error::InvalidQuery(format!(
@@ -146,7 +174,20 @@ impl<'a> Binder<'a> {
                 let E::Identifier(name) = base.as_ref() else {
                     return Err(super::unsupported("nested property access"));
                 };
-                self.element(&name.value)?.property(&key.value)
+                if let Some(element) = self.bindings.and_then(|b| b.elements.get(&name.value)) {
+                    element.property(&key.value)
+                } else if let Some(reference) =
+                    self.bindings.and_then(|b| b.references.get(&name.value))
+                {
+                    reference.property(self.reference(&name.value)?, &key.value, self.schema)?
+                } else if self.bind(base)?.get_type(self.schema)? == DataType::Null {
+                    datafusion::logical_expr::lit(ScalarValue::Null)
+                } else {
+                    return Err(Error::InvalidQuery(format!(
+                        "{} is not a resolved element reference",
+                        name.value
+                    )));
+                }
             }
             E::ElementId { variable } => {
                 if let Some(column) = self.bindings.and_then(|b| b.scalars.get(&variable.value)) {
@@ -155,15 +196,35 @@ impl<'a> Binder<'a> {
                     self.element(&variable.value)?.identity()
                 }
             }
-            E::PropertyExists { variable, property } => self
-                .element(&variable.value)?
-                .property_exists(&property.value),
+            E::PropertyExists { variable, property } => {
+                if let Some(element) = self.bindings.and_then(|b| b.elements.get(&variable.value)) {
+                    element.property_exists(&property.value)
+                } else if let Some(reference) = self
+                    .bindings
+                    .and_then(|b| b.references.get(&variable.value))
+                {
+                    reference.property_exists(self.reference(&variable.value)?, &property.value)
+                } else {
+                    self.null_reference_predicate(&variable.value)?
+                }
+            }
             E::IsLabeled {
                 variable,
                 negated,
                 label_expression,
             } => {
-                let expression = self.element(&variable.value)?.label(label_expression);
+                let expression = if let Some(element) =
+                    self.bindings.and_then(|b| b.elements.get(&variable.value))
+                {
+                    element.label(label_expression)
+                } else if let Some(reference) = self
+                    .bindings
+                    .and_then(|b| b.references.get(&variable.value))
+                {
+                    reference.label(self.reference(&variable.value)?, label_expression)
+                } else {
+                    self.null_reference_predicate(&variable.value)?
+                };
                 if *negated {
                     Expr::Not(Box::new(expression))
                 } else {
@@ -171,11 +232,21 @@ impl<'a> Binder<'a> {
                 }
             }
             E::IsDirected { variable, negated } => {
-                let element = self.element(&variable.value)?;
-                if element.kind != super::graph::ElementKind::Edge {
-                    return Err(Error::InvalidQuery("IS DIRECTED requires an edge".into()));
-                }
-                let expression = element.column("__gf_directed");
+                let expression = if let Some(element) =
+                    self.bindings.and_then(|b| b.elements.get(&variable.value))
+                {
+                    if element.kind != super::graph::ElementKind::Edge {
+                        return Err(Error::InvalidQuery("IS DIRECTED requires an edge".into()));
+                    }
+                    element.column("__gf_directed")
+                } else if let Some(reference) = self
+                    .bindings
+                    .and_then(|b| b.references.get(&variable.value))
+                {
+                    reference.directed(self.reference(&variable.value)?)
+                } else {
+                    self.null_reference_predicate(&variable.value)?
+                };
                 if *negated {
                     Expr::Not(Box::new(expression))
                 } else {
@@ -185,19 +256,12 @@ impl<'a> Binder<'a> {
             E::Same { variables } | E::AllDifferent { variables } => {
                 let elements = variables
                     .iter()
-                    .map(|name| self.element(&name.value))
+                    .map(|name| self.reference(&name.value))
                     .collect::<Result<Vec<_>>>()?;
                 let mut result = datafusion::logical_expr::lit(true);
                 for (i, left) in elements.iter().enumerate() {
                     for right in &elements[i + 1..] {
-                        let same = if left.graph == right.graph && left.kind == right.kind {
-                            left.column(crate::graph::ID)
-                                .eq(right.column(crate::graph::ID))
-                        } else {
-                            left.nullable_predicate(
-                                right.nullable_predicate(datafusion::logical_expr::lit(false)),
-                            )
-                        };
+                        let same = left.clone().eq(right.clone());
                         result = result.and(if matches!(expr, E::AllDifferent { .. }) {
                             Expr::Not(Box::new(same))
                         } else {

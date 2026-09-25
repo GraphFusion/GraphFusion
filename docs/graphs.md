@@ -79,8 +79,9 @@ returns null.
   identity; applications should not depend on their textual encoding.
 
 [Relational queries](relational.md) implement optional matches, aggregate results
-and SELECT FROM graph forms. Whole directly matched element values,
-graph YIELD/KEEP remain unimplemented. [Complex paths](path-patterns.md) cover
+and SELECT FROM graph forms. [Element references](element-references.md) add
+whole-element values and scalar reference lookups. Graph YIELD/KEEP remain
+unimplemented. [Complex paths](path-patterns.md) cover
 parenthesized expressions, repetition, alternatives and conditional variables. Reusing one variable as a different kind or across different
 graphs is rejected. These limits are explicit errors, not partial query results.
 

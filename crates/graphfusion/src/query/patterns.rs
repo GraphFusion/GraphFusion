@@ -347,6 +347,14 @@ impl Compiler<'_> {
             )));
         }
         let column = scope.scalar(name);
+        scope.domains.insert(
+            name.into(),
+            [
+                (self.graph_id, ElementKind::Node),
+                (self.graph_id, ElementKind::Edge),
+            ]
+            .into(),
+        );
         let mut projection: Vec<_> = plan
             .schema()
             .columns()
@@ -430,6 +438,11 @@ impl Compiler<'_> {
                             if let Some(previous) = scope.elements.get(&name.value) {
                                 graph::check_binding(previous, self.graph_id, ElementKind::Edge)?;
                                 predicates.push(previous.column(ID).eq(binding.column(ID)));
+                            } else if let Some(reference) =
+                                super::references::scalar(scope, &name.value, plan.schema())?
+                            {
+                                predicates.push(super::references::constraint(reference, &binding));
+                                scope.elements.insert(name.value.clone(), binding.clone());
                             } else {
                                 graph::declare(scope, &name.value, &binding)?;
                             }

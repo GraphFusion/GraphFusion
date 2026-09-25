@@ -73,11 +73,13 @@ pub(super) async fn optional(
         .project(output)?)
 }
 
-pub(super) fn for_clause(
+pub(super) async fn for_clause(
     plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     session: &SessionState,
     clause: &ast::ForClause,
+    ctx: &SessionContext,
+    trace: &mut Trace,
 ) -> Result<LogicalPlanBuilder> {
     use datafusion::{
         arrow::datatypes::DataType,
@@ -103,6 +105,9 @@ pub(super) fn for_clause(
         return Err(Error::InvalidQuery("FOR requires a list value".into()));
     }
     let variable = scope.scalar(&clause.variable.value);
+    if let Some(domain) = super::references::domain(&clause.source, scope) {
+        scope.domains.insert(clause.variable.value.clone(), domain);
+    }
     let mut output: Vec<_> = plan
         .schema()
         .columns()
@@ -127,9 +132,10 @@ pub(super) fn for_clause(
         output.push(indices.alias(&column.name));
         unnest.push(column);
     }
-    Ok(plan
+    let plan = plan
         .project(output)?
-        .unnest_columns_with_options(unnest, UnnestOptions::new().with_preserve_nulls(false))?)
+        .unnest_columns_with_options(unnest, UnnestOptions::new().with_preserve_nulls(false))?;
+    super::references::prepare(plan, scope, ctx, trace).await
 }
 
 pub(super) fn derived(

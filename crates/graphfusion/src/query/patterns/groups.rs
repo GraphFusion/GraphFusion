@@ -192,6 +192,9 @@ impl Compiler<'_> {
         for (name, (_, acc, _)) in new_names.iter().zip(&values) {
             let column = scope.scalar(name);
             scope.groups.insert(name.clone());
+            if let Some(domain) = super::super::references::domain_for_name(name, &local) {
+                scope.domains.insert(name.clone(), domain);
+            }
             output.push(col(acc).alias(column.name));
         }
         Ok((plan.project(output)?, current))

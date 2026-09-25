@@ -16,9 +16,9 @@ use datafusion::{
 };
 use std::sync::Arc;
 
-const GRAPH: &str = "__gql_element_graph";
-const KIND: &str = "__gql_element_kind";
-const ID: &str = "__gql_element_id";
+pub(super) const GRAPH: &str = "__gql_element_graph";
+pub(super) const KIND: &str = "__gql_element_kind";
+pub(super) const ID: &str = "__gql_element_id";
 fn fields() -> Fields {
     vec![
         Field::new(GRAPH, DataType::UInt64, false),
@@ -27,8 +27,17 @@ fn fields() -> Fields {
     ]
     .into()
 }
-fn data_type() -> DataType {
+pub(super) fn data_type() -> DataType {
     DataType::Struct(fields())
+}
+pub(super) fn reference(graph: Expr, kind: &str, id: Expr) -> Expr {
+    let ids = datafusion::functions_nested::expr_fn::make_array(vec![id]);
+    let values = references(
+        graph,
+        (kind == "n").then_some(ids.clone()),
+        (kind == "e").then_some(ids),
+    );
+    datafusion::functions_nested::expr_fn::array_element(values, lit(1_i64))
 }
 pub(super) fn null_list() -> Expr {
     lit(ScalarValue::new_null_list(data_type(), true, 1))

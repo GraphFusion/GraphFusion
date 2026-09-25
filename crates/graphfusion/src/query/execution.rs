@@ -18,6 +18,8 @@ pub(super) struct Trace {
     pub logical: Vec<String>,
     pub physical: Vec<String>,
     pub validate_only: bool,
+    pub sources: std::collections::BTreeMap<crate::catalog::ObjectId, Arc<crate::graph::GraphData>>,
+    pub output_domains: std::collections::BTreeMap<String, super::references::Domain>,
 }
 impl Trace {
     pub async fn collect(

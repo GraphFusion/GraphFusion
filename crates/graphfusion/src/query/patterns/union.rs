@@ -31,6 +31,21 @@ impl Compiler<'_> {
             .collect::<Result<Vec<_>>>()?;
         let mut element_targets = BTreeMap::new();
         for name in &names {
+            let mut domain = super::super::references::Domain::new();
+            let mut known = true;
+            for (_, branch, _) in &branches {
+                if !branch.contains(name) {
+                    continue;
+                }
+                if let Some(source) = super::super::references::domain_for_name(name, branch) {
+                    domain.extend(source);
+                } else {
+                    known = false;
+                }
+            }
+            if known {
+                scope.domains.insert(name.clone(), domain);
+            }
             let (source_plan, source_scope, _) = branches
                 .iter()
                 .find(|(_, b, _)| b.contains(name))

@@ -13,7 +13,7 @@ use datafusion::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ElementKind {
     Node,
     Edge,
@@ -104,6 +104,9 @@ pub(super) struct Bindings {
     pub order: Vec<String>,
     pub conditional: BTreeSet<String>,
     pub groups: BTreeSet<String>,
+    pub references: BTreeMap<String, super::references::ReferenceBinding>,
+    pub sources: BTreeMap<ObjectId, std::sync::Arc<GraphData>>,
+    pub domains: BTreeMap<String, super::references::Domain>,
     next: usize,
 }
 impl Bindings {
@@ -147,6 +150,9 @@ pub(super) async fn matches(
         return Err(super::unsupported("OPTIONAL MATCH, KEEP, or graph YIELD"));
     }
     scope.conditional.clear();
+    let source = std::sync::Arc::new(graph.clone());
+    scope.sources.insert(graph_id, source.clone());
+    trace.sources.insert(graph_id, source);
     let different = !matches!(clause.mode, Some(ast::MatchMode::RepeatableElements { .. }));
     if different && clause.patterns.len() > 1 {
         for path in &clause.patterns {
@@ -260,7 +266,12 @@ pub(super) fn node(
             plan.cross_join(scan)?
         };
         if let Some(name) = &pattern.variable {
-            declare(scope, &name.value, &binding)?;
+            if let Some(reference) = super::references::scalar(scope, &name.value, plan.schema())? {
+                plan = plan.filter(super::references::constraint(reference, &binding))?;
+                scope.elements.insert(name.value.clone(), binding.clone());
+            } else {
+                declare(scope, &name.value, &binding)?;
+            }
         }
         binding
     };

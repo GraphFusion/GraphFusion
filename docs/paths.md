@@ -78,8 +78,8 @@ of one kind. Each reference is a struct with `__gql_element_graph: UInt64`,
 FOR can unnest these lists and ELEMENT_ID produces the same opaque identity as
 for a directly matched element. Reference values can be returned, counted and
 collected. These field names are the current driver encoding, not additional
-GQL property names. Property/label dereference and rebinding of these scalar
-references, and whole directly matched element values, remain follow-up work.
+GQL property names. [Element references](element-references.md) support property/
+label dereference, rebinding and whole directly matched element values.
 PATH_LENGTH and ELEMENTS reject ordinary scalar/list values.
 
 ## DataFusion execution and limits
