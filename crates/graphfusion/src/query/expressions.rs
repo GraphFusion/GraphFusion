@@ -112,8 +112,8 @@ impl<'a> Binder<'a> {
                 }
             }
             E::Binary { left, op, right } => {
-                let left = self.bind(left)?;
-                let right = self.bind(right)?;
+                let mut left = self.bind(left)?;
+                let mut right = self.bind(right)?;
                 use ast::BinaryOp as B;
                 let operator = match op {
                     B::And | B::Or | B::Xor => {
@@ -138,6 +138,13 @@ impl<'a> Binder<'a> {
                     B::Concat => {
                         self.require(&left, string, "string operand")?;
                         self.require(&right, string, "string operand")?;
+                        // Supply the string context even when neither operand has a type.
+                        if left.get_type(self.schema)? == DataType::Null {
+                            left = left.cast_to(&DataType::Utf8, self.schema)?;
+                        }
+                        if right.get_type(self.schema)? == DataType::Null {
+                            right = right.cast_to(&DataType::Utf8, self.schema)?;
+                        }
                         Operator::StringConcat
                     }
                     B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge => {
@@ -222,7 +229,14 @@ impl<'a> Binder<'a> {
                 let left = self.bind(left)?;
                 let right = self.bind(right)?;
                 self.compatible(&[left.clone(), right.clone()])?;
-                datafusion::functions::core::expr_fn::nullif(left, right)
+                if left.get_type(self.schema)? == DataType::Null
+                    && right.get_type(self.schema)? == DataType::Null
+                {
+                    // Both values are null; avoid DataFusion's fallback to a string type.
+                    left
+                } else {
+                    datafusion::functions::core::expr_fn::nullif(left, right)
+                }
             }
             _ => return Err(super::unsupported("query expression")),
         })

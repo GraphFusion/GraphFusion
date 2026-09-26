@@ -105,6 +105,77 @@ async fn three_valued_logic_and_null_predicates() {
 }
 
 #[tokio::test]
+async fn untyped_null_concatenation_infers_string_type() {
+    let mut session = Database::new().session();
+    session.set_parameter("a", Value::Null).unwrap();
+    session.set_parameter("b", Value::Null).unwrap();
+    let result = session
+        .query(
+            "LET n = NULL RETURN NULL || NULL AS literal_null, \
+             $a || $b AS parameter_null, n || n AS bound_null, \
+             (NULL || NULL) || 'x' AS nested_null, \
+             COALESCE($a || $b, 'fallback') AS fallback",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Utf8(None),
+            ScalarValue::Utf8(None),
+            ScalarValue::Utf8(None),
+            ScalarValue::Utf8(None),
+            ScalarValue::Utf8(Some("fallback".into())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn nullif_preserves_untyped_nulls_in_outer_expressions() {
+    let mut session = Database::new().session();
+    session.set_parameter("a", Value::Null).unwrap();
+    session.set_parameter("b", Value::Null).unwrap();
+    let result = session
+        .query(
+            "LET n = NULLIF($a, $b) \
+             RETURN n, COALESCE(NULLIF(NULL, NULL), 1) AS i, \
+             COALESCE(n, TRUE) AS b, COALESCE(n, 'fallback') AS s, \
+             NOT n AS unknown, n + 1 AS number_null",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Null,
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Utf8(Some("fallback".into())),
+            ScalarValue::Boolean(None),
+            ScalarValue::Int64(None),
+        ]
+    );
+
+    session
+        .execute("SESSION SET VALUE $n INTEGER = NULL")
+        .unwrap();
+    let typed = session
+        .query("RETURN NULLIF($n, $n) AS n, NULLIF(1, 2) AS value")
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&typed),
+        vec![ScalarValue::Int64(None), ScalarValue::Int64(Some(1))]
+    );
+    assert!(matches!(
+        session
+            .query("RETURN COALESCE(NULLIF($n, $n), TRUE) AS value")
+            .await,
+        Err(Error::InvalidQuery(_))
+    ));
+}
+
+#[tokio::test]
 async fn typed_parameter_nulls_and_numeric_initializers_keep_their_type_family() {
     let mut session = Database::new().session();
     session.execute("SESSION SET VALUE $flag BOOLEAN = UNKNOWN; SESSION SET VALUE $n INTEGER = NULL; SESSION SET VALUE $f FLOAT = 1").unwrap();
@@ -197,6 +268,8 @@ async fn gql_type_checks_reject_implicit_string_and_boolean_numeric_coercion() {
         "RETURN '1' = 1 AS n",
         "RETURN COALESCE(1, '1') AS n",
         "RETURN 1 IS UNKNOWN AS n",
+        "RETURN NULL || 1 AS n",
+        "RETURN TRUE || NULL AS n",
     ] {
         assert!(
             matches!(session.query(query).await, Err(Error::InvalidQuery(_))),
