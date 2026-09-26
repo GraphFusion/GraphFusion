@@ -9,10 +9,12 @@ test('homepage leads to a readable quickstart and copied GQL', async ({ page, co
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Graph queries. Columnar execution.');
   await page.getByRole('link', { name: 'Run your first graph query' }).click();
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Your first graph');
+  await page.waitForLoadState('load');
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   const block = page.locator('.expressive-code').first();
   await block.hover();
   await block.getByRole('button').click();
+  await expect(block.locator('.feedback')).toHaveText('Copied!');
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain('CREATE GRAPH social ANY GRAPH;');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
   expect(errors).toEqual([]);
