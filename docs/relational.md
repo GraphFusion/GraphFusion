@@ -48,7 +48,8 @@ those barriers or share them through an executor cache.
 null list entries produce rows containing null. `WITH ORDINALITY i` starts at 1,
 and `WITH OFFSET i` starts at 0, for each incoming row. Scalars, typed/untyped
 session lists, and nested homogeneous lists are supported. Numeric list elements
-can share a common numeric type; incompatible families are rejected instead of
+can share a common numeric type, including nested lists containing empty or
+all-null sublists; incompatible families are rejected instead of
 silently converting text or booleans to numbers. Heterogeneous GQL union-valued
 lists need additional value-type representation and are not implemented.
 

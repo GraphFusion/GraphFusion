@@ -414,21 +414,30 @@ impl<'a> Binder<'a> {
     fn compatible(&self, expressions: &[Expr]) -> Result<()> {
         let mut previous = DataType::Null;
         for expr in expressions {
-            let next = expr.get_type(self.schema)?;
-            if previous != DataType::Null
-                && next != DataType::Null
-                && previous != next
-                && !(numeric(&previous) && numeric(&next))
-            {
-                return Err(Error::InvalidQuery(format!(
-                    "incompatible value types {previous} and {next}"
-                )));
-            }
-            if next != DataType::Null {
-                previous = next;
-            }
+            previous = common_value_type(&previous, &expr.get_type(self.schema)?)?;
         }
         Ok(())
+    }
+}
+
+fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
+    if left == right || *right == DataType::Null {
+        return Ok(left.clone());
+    }
+    if *left == DataType::Null {
+        return Ok(right.clone());
+    }
+    let incompatible =
+        || Error::InvalidQuery(format!("incompatible value types {left} and {right}"));
+    match (left, right) {
+        (DataType::List(a), DataType::List(b)) => Ok(DataType::new_list(
+            common_value_type(a.data_type(), b.data_type())?,
+            a.is_nullable() || b.is_nullable(),
+        )),
+        (a, b) if numeric(a) && numeric(b) => {
+            datafusion::logical_expr::binary::binary_numeric_coercion(a, b).ok_or_else(incompatible)
+        }
+        _ => Err(incompatible()),
     }
 }
 

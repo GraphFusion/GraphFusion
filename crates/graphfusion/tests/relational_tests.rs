@@ -153,6 +153,57 @@ async fn for_lists_indices_nulls_and_parameters() {
 }
 
 #[tokio::test]
+async fn nested_lists_unify_empty_null_and_numeric_elements() {
+    let mut s = Database::new().session();
+    for source in [
+        "[[1], [], [NULL], [2.5]]",
+        "[[], [1], [2.5], [NULL]]",
+        "[NULL, [1], [2.5], [], [NULL]]",
+    ] {
+        let result = query(
+            &mut s,
+            &format!("FOR xs IN {source} FOR x IN xs RETURN x ORDER BY x"),
+        )
+        .await;
+        assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+        assert_eq!(rows(&result), vec![vec!["1"], vec!["2.5"], vec!["NULL"]]);
+    }
+    check(
+        &mut s,
+        "FOR xs IN [[[1]], [[]], [[NULL]]] FOR ys IN xs FOR x IN ys RETURN x ORDER BY x",
+        &[&["1"], &["NULL"]],
+    )
+    .await;
+    s.set_parameter(
+        "nested",
+        Value::List(vec![
+            Value::List(vec![Value::Integer(1)]),
+            Value::List(vec![]),
+            Value::List(vec![Value::Null]),
+            Value::List(vec![Value::Float(2.5)]),
+        ]),
+    )
+    .unwrap();
+    check(
+        &mut s,
+        "FOR xs IN $nested FOR x IN xs RETURN x ORDER BY x",
+        &[&["1"], &["2.5"], &["NULL"]],
+    )
+    .await;
+    s.execute("SESSION SET VALUE $typed LIST<LIST<FLOAT>> = [[1], [], [NULL], [2.5]]")
+        .unwrap();
+    check(
+        &mut s,
+        "FOR xs IN $typed FOR x IN xs RETURN x ORDER BY x",
+        &[&["1"], &["2.5"], &["NULL"]],
+    )
+    .await;
+    for source in ["[[1], [], ['2']]", "[[TRUE], [NULL], [1]]", "[[1], [] , 2]"] {
+        assert!(s.query(&format!("RETURN {source} AS xs")).await.is_err());
+    }
+}
+
+#[tokio::test]
 async fn aggregate_grouping_aliases_having_and_order() {
     let mut s = fixture().await;
     check(&mut s, "MATCH (n:N) RETURN n.k AS k, COUNT(*) AS c, SUM(n.v) AS sum, AVG(n.v) AS avg, MIN(n.v) AS min, MAX(n.v) AS max ORDER BY k",
