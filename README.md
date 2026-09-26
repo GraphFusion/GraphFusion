@@ -29,19 +29,21 @@ permissions and never merges PRs. Maintainer approval is required for merging.
 
 ## DataFusion Queries
 
-`Session::query(...).await` executes scalar GQL queries through DataFusion and
+`Session::query(...).await` executes GQL queries through DataFusion and
 returns Arrow batches, their schema, and logical/physical plans. It supports
-parameters, LET, FILTER, RETURN/SELECT, scalar operators and pagination. Run
+parameters, LET, FILTER, RETURN/SELECT, scalar operators, pagination and fixed-length
+MATCH over validated Arrow graph tables. Run
 `cargo run -p graphfusion --example scalar --locked` for an executable example.
-See [query execution and current limits](docs/query.md); graph MATCH and mutations
-are subsequent implementation tasks.
+See [query execution](docs/query.md) and [graph import and MATCH](docs/graphs.md).
+`cargo run -p graphfusion --example social --locked` runs a two-hop social graph
+query. Persistent graph storage and GQL mutations are subsequent tasks.
 
 ## Catalog and Sessions
 
 The main crate implements in-memory and persistent catalogs for directories,
 schemas, graph types, and graphs. Independent sessions support catalog DDL and
 `SESSION SET`, `SESSION RESET`, and `SESSION CLOSE`. Statements auto-commit;
-explicit multi-statement transactions and graph query/data execution are not
+explicit multi-statement transactions and GQL graph data modifications are not
 implemented yet.
 
 ```rust

@@ -13,6 +13,135 @@ use std::{
 };
 
 struct TestDir(PathBuf);
+
+fn arrow_graph(ids: Vec<u64>) -> graph::GraphData {
+    use arrow::{
+        array::UInt64Array,
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        graph::ID,
+        DataType::UInt64,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(ids))]).unwrap();
+    graph::GraphData::try_new(
+        vec![graph::NodeTable::try_new(vec!["N".into()], schema, vec![batch]).unwrap()],
+        vec![],
+    )
+    .unwrap()
+}
+
+#[test]
+fn arrow_graph_snapshots_conflicts_and_drop_reclamation() {
+    let db = Database::new();
+    let id = create_graph(&db, "g");
+    let mut initial = StatementTxn::begin(&db).unwrap();
+    initial
+        .replace_graph_data(id, arrow_graph(vec![1]))
+        .unwrap();
+    initial.commit().unwrap();
+    let mut old = StatementTxn::begin(&db).unwrap();
+    let mut first = StatementTxn::begin(&db).unwrap();
+    let mut second = StatementTxn::begin(&db).unwrap();
+    first
+        .replace_graph_data(id, arrow_graph(vec![2, 3]))
+        .unwrap();
+    second
+        .replace_graph_data(id, arrow_graph(vec![4, 5, 6]))
+        .unwrap();
+    assert_eq!(first.graph_data(id).unwrap().node_count(), 2);
+    first.commit().unwrap();
+    assert!(matches!(second.commit(), Err(Error::Conflict(_))));
+    assert_eq!(old.graph_data(id).unwrap().node_count(), 1);
+    assert!(serde_json::to_vec(old.base.storage.as_ref()).is_err());
+    let mut latest = StatementTxn::begin(&db).unwrap();
+    assert_eq!(latest.graph_data(id).unwrap().node_count(), 2);
+    latest.commit().unwrap();
+    db.session().execute("DROP GRAPH g").unwrap();
+    assert_eq!(old.graph_data(id).unwrap().node_count(), 1);
+    assert!(matches!(db.checkpoint(), Err(Error::Busy)));
+    old.commit().unwrap();
+    db.checkpoint().unwrap();
+    assert!(db
+        .inner
+        .state
+        .lock()
+        .unwrap()
+        .storage
+        .generations
+        .is_empty());
+}
+
+#[test]
+fn disjoint_arrow_imports_merge_and_dropped_graphs_reject_stale_writers() {
+    let db = Database::new();
+    let a = create_graph(&db, "a");
+    let b = create_graph(&db, "b");
+    let mut first = StatementTxn::begin(&db).unwrap();
+    let mut second = StatementTxn::begin(&db).unwrap();
+    first.replace_graph_data(a, arrow_graph(vec![1])).unwrap();
+    second
+        .replace_graph_data(b, arrow_graph(vec![2, 3]))
+        .unwrap();
+    first.commit().unwrap();
+    second.commit().unwrap();
+    let mut read = StatementTxn::begin(&db).unwrap();
+    assert_eq!(read.graph_data(a).unwrap().node_count(), 1);
+    assert_eq!(read.graph_data(b).unwrap().node_count(), 2);
+    read.commit().unwrap();
+    let mut stale = StatementTxn::begin(&db).unwrap();
+    stale.replace_graph_data(a, arrow_graph(vec![9])).unwrap();
+    db.session()
+        .execute("DROP GRAPH a; CREATE GRAPH a ANY GRAPH")
+        .unwrap();
+    assert!(matches!(stale.commit(), Err(Error::Conflict(_))));
+}
+
+#[test]
+fn memory_graph_import_fails_closed_for_durable_and_typed_graphs() {
+    let dir = TestDir::new();
+    {
+        let db = dir.open();
+        let mut session = db.session();
+        session
+            .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+            .unwrap();
+        let seq = db.inner.state.lock().unwrap().commit_seq;
+        assert!(matches!(
+            session.replace_graph_data(arrow_graph(vec![1])),
+            Err(Error::UnsupportedFeature(_))
+        ));
+        assert_eq!(db.inner.state.lock().unwrap().commit_seq, seq);
+        db.checkpoint().unwrap();
+    }
+    let db = dir.open();
+    let id = graph_id(&db, "g").unwrap();
+    assert_eq!(
+        StatementTxn::begin(&db)
+            .unwrap()
+            .graph_data(id)
+            .unwrap()
+            .node_count(),
+        0
+    );
+    let db = Database::new();
+    let mut session = db.session();
+    session
+        .execute("CREATE GRAPH TYPE t AS { NODE N }; CREATE GRAPH g TYPED t; SESSION SET GRAPH g")
+        .unwrap();
+    assert!(matches!(
+        session.replace_graph_data(arrow_graph(vec![1])),
+        Err(Error::UnsupportedFeature(_))
+    ));
+    session.execute("SESSION CLOSE").unwrap();
+    assert!(matches!(
+        session.replace_graph_data(arrow_graph(vec![1])),
+        Err(Error::SessionClosed)
+    ));
+}
 impl TestDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);

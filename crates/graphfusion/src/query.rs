@@ -1,6 +1,7 @@
 //! GQL binding and direct DataFusion logical/physical planning.
 mod arithmetic;
 mod expressions;
+mod graph;
 
 use crate::{
     catalog::CommitSeq, gql as ast, transaction::StatementTxn, Database, Error, Result,
@@ -8,7 +9,6 @@ use crate::{
 };
 use datafusion::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
-    common::Column,
     execution::context::SessionContext,
     logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder},
     physical_plan::{collect, displayable},
@@ -41,7 +41,7 @@ pub(crate) async fn execute(
         return Err(Error::SessionClosed);
     }
     let program = ast::parse(input)?;
-    if program.at_schema.is_some() || !program.definitions.is_empty() {
+    if !program.definitions.is_empty() {
         return Err(unsupported(
             "query schema context and procedure definitions",
         ));
@@ -50,8 +50,12 @@ pub(crate) async fn execute(
         return Err(unsupported("query() requires exactly one read-only query"));
     };
     // The lease is held through planning AND materialization, including every await.
-    let tx = StatementTxn::begin(db)?;
-    let plan = plan(query, session)?;
+    let mut tx = StatementTxn::begin(db)?;
+    let mut context = session.clone();
+    if let Some(schema) = &program.at_schema {
+        context.current_schema = crate::session::schema_reference(&mut tx, session, schema)?;
+    }
+    let plan = plan(query, &context, &mut tx)?;
     let logical_plan = plan.display_indent().to_string();
     let ctx = SessionContext::new();
     let physical = ctx.state().create_physical_plan(&plan).await?;
@@ -72,10 +76,22 @@ fn unsupported(feature: &str) -> Error {
     Error::UnsupportedFeature(feature.into())
 }
 
-fn plan(query: &ast::QueryStatement, session: &SessionState) -> Result<LogicalPlan> {
-    if query.at_schema.is_some() || query.use_graph.is_some() {
-        return Err(unsupported("graph/schema selection in query planning"));
+fn plan(
+    query: &ast::QueryStatement,
+    initial: &SessionState,
+    tx: &mut StatementTxn,
+) -> Result<LogicalPlan> {
+    let mut context = initial.clone();
+    if let Some(schema) = &query.at_schema {
+        context.current_schema = crate::session::schema_reference(tx, initial, schema)?;
     }
+    let session = &context;
+    let mut current_graph = if let Some(graph) = &query.use_graph {
+        Some(crate::session::resolve_graph(tx, session, graph)?)
+    } else {
+        session.current_graph
+    };
+    let mut scope = graph::Bindings::default();
     if !query.set_operations.is_empty() {
         return Err(unsupported("composite queries"));
     }
@@ -92,16 +108,22 @@ fn plan(query: &ast::QueryStatement, session: &SessionState) -> Result<LogicalPl
     let mut plan = LogicalPlanBuilder::empty(true);
     for clause in &body.clauses {
         match clause {
+            ast::QueryClause::UseGraph(expression) => {
+                current_graph = Some(crate::session::resolve_graph(tx, session, expression)?);
+            }
+            ast::QueryClause::Match(clause) => {
+                let id = current_graph
+                    .ok_or_else(|| Error::InvalidReference("current graph is unset".into()))?;
+                let data = tx.graph_data(id)?;
+                plan = graph::matches(plan, &mut scope, session, id, &data, clause)?;
+            }
             ast::QueryClause::Let(clause) => {
                 for item in &clause.items {
                     if item.typed || item.value_type.is_some() {
                         return Err(unsupported("typed LET definitions"));
                     }
-                    let binder = Binder::new(session, plan.schema());
-                    if plan
-                        .schema()
-                        .has_column_with_unqualified_name(&item.name.value)
-                    {
+                    let binder = Binder::with_bindings(session, plan.schema(), &scope);
+                    if scope.contains(&item.name.value) {
                         return Err(Error::InvalidQuery(format!(
                             "variable {} is already bound",
                             item.name.value
@@ -113,12 +135,15 @@ fn plan(query: &ast::QueryStatement, session: &SessionState) -> Result<LogicalPl
                         .into_iter()
                         .map(Expr::Column)
                         .collect();
-                    expressions.push(binder.bind(&item.value)?.alias(&item.name.value));
+                    let expression = binder.bind(&item.value)?;
+                    let column = scope.scalar(&item.name.value);
+                    expressions.push(expression.alias(column.name));
                     plan = plan.project(expressions)?;
                 }
             }
             ast::QueryClause::Filter(clause) => {
-                let expr = Binder::new(session, plan.schema()).predicate(&clause.predicate)?;
+                let expr = Binder::with_bindings(session, plan.schema(), &scope)
+                    .predicate(&clause.predicate)?;
                 plan = plan.filter(expr)?;
             }
             ast::QueryClause::OrderByPage(clause) => {
@@ -128,6 +153,7 @@ fn plan(query: &ast::QueryStatement, session: &SessionState) -> Result<LogicalPl
                     &clause.order_by,
                     clause.offset.as_ref(),
                     clause.limit.as_ref(),
+                    Some(&scope),
                 )?;
             }
             _ => {
@@ -138,10 +164,10 @@ fn plan(query: &ast::QueryStatement, session: &SessionState) -> Result<LogicalPl
         }
     }
     if let Some(predicate) = &body.select_where {
-        let expr = Binder::new(session, plan.schema()).predicate(predicate)?;
+        let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
         plan = plan.filter(expr)?;
     }
-    let binder = Binder::new(session, plan.schema());
+    let binder = Binder::with_bindings(session, plan.schema(), &scope);
     let mut projections = Vec::new();
     let mut output_names = BTreeSet::new();
     for (index, item) in body.result_clause.items.iter().enumerate() {
@@ -149,11 +175,15 @@ fn plan(query: &ast::QueryStatement, session: &SessionState) -> Result<LogicalPl
             if item.alias.is_some() {
                 return Err(Error::InvalidQuery("wildcard cannot have an alias".into()));
             }
-            for field in plan.schema().fields() {
-                if !output_names.insert(field.name().clone()) {
+            for name in &scope.order {
+                if !output_names.insert(name.clone()) {
                     return Err(Error::InvalidQuery("duplicate result column".into()));
                 }
-                projections.push(Expr::Column(Column::new_unqualified(field.name())));
+                projections.push(
+                    binder
+                        .bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?
+                        .alias(name),
+                );
             }
             continue;
         }
@@ -185,6 +215,7 @@ fn plan(query: &ast::QueryStatement, session: &SessionState) -> Result<LogicalPl
         &body.order_by,
         body.offset.as_ref(),
         body.limit.as_ref(),
+        None,
     )?
     .build()?)
 }
@@ -195,9 +226,13 @@ fn order_and_page(
     ordering: &[ast::OrderByItem],
     offset: Option<&ast::UnsignedIntegerSpecification>,
     limit: Option<&ast::UnsignedIntegerSpecification>,
+    scope: Option<&graph::Bindings>,
 ) -> Result<LogicalPlanBuilder> {
     if !ordering.is_empty() {
-        let binder = Binder::new(session, plan.schema());
+        let binder = match scope {
+            Some(scope) => Binder::with_bindings(session, plan.schema(), scope),
+            None => Binder::new(session, plan.schema()),
+        };
         let sorts = ordering
             .iter()
             .map(|item| {

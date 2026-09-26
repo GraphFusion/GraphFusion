@@ -8,11 +8,42 @@ use datafusion::{
 pub(super) struct Binder<'a> {
     session: &'a SessionState,
     schema: &'a DFSchema,
+    bindings: Option<&'a super::graph::Bindings>,
 }
 
 impl<'a> Binder<'a> {
     pub fn new(session: &'a SessionState, schema: &'a DFSchema) -> Self {
-        Self { session, schema }
+        Self {
+            session,
+            schema,
+            bindings: None,
+        }
+    }
+    pub fn with_bindings(
+        session: &'a SessionState,
+        schema: &'a DFSchema,
+        bindings: &'a super::graph::Bindings,
+    ) -> Self {
+        Self {
+            session,
+            schema,
+            bindings: Some(bindings),
+        }
+    }
+    fn element(&self, name: &str) -> Result<&super::graph::ElementBinding> {
+        self.bindings
+            .ok_or_else(|| Error::InvalidQuery(format!("unbound element variable {name}")))?
+            .element(name)
+    }
+    pub fn equals(&self, left: Expr, right: Expr) -> Result<Expr> {
+        let a = left.get_type(self.schema)?;
+        let b = right.get_type(self.schema)?;
+        if a != b && a != DataType::Null && b != DataType::Null && !(numeric(&a) && numeric(&b)) {
+            return Err(Error::InvalidQuery(format!(
+                "incomparable types {a} and {b}"
+            )));
+        }
+        Ok(left.eq(right))
     }
 
     pub fn predicate(&self, expr: &ast::Expr) -> Result<Expr> {
@@ -75,6 +106,20 @@ impl<'a> Binder<'a> {
                 datafusion::logical_expr::lit(value)
             }
             E::Identifier(name) => {
+                if let Some(bindings) = self.bindings {
+                    if let Some(column) = bindings.scalars.get(&name.value) {
+                        return Ok(Expr::Column(column.clone()));
+                    }
+                    if bindings.elements.contains_key(&name.value) {
+                        return Err(super::unsupported(
+                            "whole element values in results or scalar expressions",
+                        ));
+                    }
+                    return Err(Error::InvalidQuery(format!(
+                        "unbound variable {}",
+                        name.value
+                    )));
+                }
                 if !self.schema.has_column_with_unqualified_name(&name.value) {
                     return Err(Error::InvalidQuery(format!(
                         "unbound variable {}",
@@ -83,6 +128,63 @@ impl<'a> Binder<'a> {
                 }
                 // Do not parse dots or quotes in an already-decoded GQL identifier as SQL.
                 Expr::Column(Column::new_unqualified(&name.value))
+            }
+            E::Property { base, key } => {
+                let E::Identifier(name) = base.as_ref() else {
+                    return Err(super::unsupported("nested property access"));
+                };
+                self.element(&name.value)?.property(&key.value)
+            }
+            E::ElementId { variable } => self.element(&variable.value)?.identity(),
+            E::PropertyExists { variable, property } => self
+                .element(&variable.value)?
+                .property_exists(&property.value),
+            E::IsLabeled {
+                variable,
+                negated,
+                label_expression,
+            } => {
+                let expression = self.element(&variable.value)?.label(label_expression);
+                if *negated {
+                    Expr::Not(Box::new(expression))
+                } else {
+                    expression
+                }
+            }
+            E::IsDirected { variable, negated } => {
+                let element = self.element(&variable.value)?;
+                if element.kind != super::graph::ElementKind::Edge {
+                    return Err(Error::InvalidQuery("IS DIRECTED requires an edge".into()));
+                }
+                let expression = element.column("__gf_directed");
+                if *negated {
+                    Expr::Not(Box::new(expression))
+                } else {
+                    expression
+                }
+            }
+            E::Same { variables } | E::AllDifferent { variables } => {
+                let elements = variables
+                    .iter()
+                    .map(|name| self.element(&name.value))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut result = datafusion::logical_expr::lit(true);
+                for (i, left) in elements.iter().enumerate() {
+                    for right in &elements[i + 1..] {
+                        let same = if left.graph == right.graph && left.kind == right.kind {
+                            left.column(crate::graph::ID)
+                                .eq(right.column(crate::graph::ID))
+                        } else {
+                            datafusion::logical_expr::lit(false)
+                        };
+                        result = result.and(if matches!(expr, E::AllDifferent { .. }) {
+                            Expr::Not(Box::new(same))
+                        } else {
+                            same
+                        });
+                    }
+                }
+                result
             }
             E::Unary { op, expr } => {
                 let expr = self.bind(expr)?;

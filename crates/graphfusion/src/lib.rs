@@ -4,6 +4,7 @@ pub mod gql {
 }
 pub mod catalog;
 mod error;
+pub mod graph;
 mod persistence;
 mod query;
 mod session;
