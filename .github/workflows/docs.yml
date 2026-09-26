@@ -2,7 +2,7 @@ name: Documentation
 
 on:
   push:
-    branches: [main, codex/documentation-site]
+    branches: [main]
     paths: ['website/**', 'README.md', 'docs/**', 'crates/**', 'Cargo.*', 'rust-toolchain.toml', '.github/workflows/docs.yml']
   pull_request:
     paths: ['website/**', 'README.md', 'docs/**', 'crates/**', 'Cargo.*', 'rust-toolchain.toml', '.github/workflows/docs.yml']
@@ -60,7 +60,7 @@ jobs:
       - run: python3 website/scripts/check-examples.py
 
   deploy:
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/documentation-site')
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: [build, examples]
     runs-on: ubuntu-latest
     permissions:
