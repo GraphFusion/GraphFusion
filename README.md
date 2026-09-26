@@ -26,6 +26,36 @@ The [CI workflow](.github/workflows/ci.yml) runs on pull requests, main pushes,
 development branch pushes (`codex/**`), and manual dispatch. It uses read-only
 permissions and never merges PRs. Maintainer approval is required for merging.
 
+## Catalog and Sessions
+
+The main crate implements in-memory and persistent catalogs for directories,
+schemas, graph types, and graphs. Independent sessions support catalog DDL and
+`SESSION SET`, `SESSION RESET`, and `SESSION CLOSE`. Statements auto-commit;
+explicit multi-statement transactions and graph query/data execution are not
+implemented yet.
+
+```rust
+use graphfusion::Database;
+
+let db = Database::new();
+let mut session = db.session();
+session.execute("CREATE GRAPH social ANY GRAPH")?;
+session.execute("SESSION SET GRAPH social")?;
+session.execute("SESSION SET VALUE $limit INTEGER = 10")?;
+```
+
+Use `Database::open(path, OpenOptions { create_if_missing: true })` for a durable
+database directory. Linux/macOS processes can share it through OS file locks.
+Catalog and data snapshots publish together after a checksummed logical log is
+durable. Optimistic validation permits independent writes while detecting name,
+object, and dependency conflicts. DROP retires storage; checkpoint reclaims it
+only when no active statement can use an older snapshot.
+
+See [the catalog design and implementation notes](docs/catalog.md) for the
+format, APIs, crash recovery, supported session expressions, and current limits.
+The internal row store verifies joint catalog/data commits and is not a graph
+storage engine.
+
 ## Layout
 
 - `crates/graphfusion`: main database crate and public facade.
