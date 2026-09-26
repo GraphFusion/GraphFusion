@@ -101,7 +101,7 @@ fn disjoint_arrow_imports_merge_and_dropped_graphs_reject_stale_writers() {
 }
 
 #[test]
-fn memory_graph_import_fails_closed_for_durable_and_typed_graphs() {
+fn graph_import_persists_and_rejects_unvalidated_typed_graphs() {
     let dir = TestDir::new();
     {
         let db = dir.open();
@@ -110,11 +110,10 @@ fn memory_graph_import_fails_closed_for_durable_and_typed_graphs() {
             .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
             .unwrap();
         let seq = db.inner.state.lock().unwrap().commit_seq;
-        assert!(matches!(
-            session.replace_graph_data(arrow_graph(vec![1])),
-            Err(Error::UnsupportedFeature(_))
-        ));
-        assert_eq!(db.inner.state.lock().unwrap().commit_seq, seq);
+        assert_eq!(
+            session.replace_graph_data(arrow_graph(vec![1])).unwrap(),
+            seq + 1
+        );
         db.checkpoint().unwrap();
     }
     let db = dir.open();
@@ -125,7 +124,7 @@ fn memory_graph_import_fails_closed_for_durable_and_typed_graphs() {
             .graph_data(id)
             .unwrap()
             .node_count(),
-        0
+        1
     );
     let db = Database::new();
     let mut session = db.session();
@@ -1186,6 +1185,48 @@ fn child_worker() {
             );
             println!("GF_OLD_OK");
         }
+        "parquet_import" => {
+            let mut tx = StatementTxn::begin(&db).unwrap();
+            let graph = tx.lookup(MAIN_SCHEMA, ObjectKind::Graph, "g").unwrap().id;
+            let doomed = tx
+                .lookup(MAIN_SCHEMA, ObjectKind::Graph, "doomed")
+                .unwrap()
+                .id;
+            tx.drop_object(doomed).unwrap();
+            tx.replace_graph_data(graph, arrow_graph(vec![2, 3]))
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        "parquet_reader" => {
+            let mut tx = StatementTxn::begin(&db).unwrap();
+            let graph = tx.lookup(MAIN_SCHEMA, ObjectKind::Graph, "g").unwrap().id;
+            let data = tx.graph_data(graph).unwrap();
+            child_barrier();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let batches = runtime.block_on(async {
+                datafusion::prelude::SessionContext::new()
+                    .read_table(data.nodes[0].0.provider.clone())
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap()
+            });
+            let ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ids, [1]);
+            println!("GF_OLD_OK");
+        }
         "drop_and_write" | "io_error" => {
             let mut tx = StatementTxn::begin(&db).unwrap();
             let doomed = tx
@@ -1215,6 +1256,185 @@ fn child_worker() {
         _ => panic!("unknown worker mode"),
     }
 }
+fn parquet_files(dir: &TestDir) -> Vec<PathBuf> {
+    fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|s| s == "parquet"))
+        .collect()
+}
+
+#[test]
+fn parquet_import_rejects_unscannable_paths_before_staging_files() {
+    let root = TestDir::new();
+    let dir = TestDir(root.0.join("control\n"));
+    let db = dir.open();
+    let mut session = db.session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    assert!(matches!(
+        session.replace_graph_data(arrow_graph(vec![1])),
+        Err(Error::UnsupportedFeature(_))
+    ));
+    assert!(parquet_files(&dir).is_empty());
+    let id = graph_id(&db, "g").unwrap();
+    assert_eq!(
+        StatementTxn::begin(&db)
+            .unwrap()
+            .graph_data(id)
+            .unwrap()
+            .node_count(),
+        0
+    );
+    db.checkpoint().unwrap();
+}
+
+#[tokio::test]
+async fn parquet_crash_matrix_atomically_publishes_catalog_and_graph() {
+    for (point, committed) in [
+        ("parquet_write", false),
+        ("parquet_sync", false),
+        ("parquet_directory", false),
+        ("parquet_wal_header", false),
+        ("parquet_wal_payload", false),
+        ("parquet_wal_commit", true),
+        ("parquet_wal_sync", true),
+        ("before_publish", true),
+    ] {
+        let dir = TestDir::new();
+        let db = dir.open();
+        let mut session = db.session();
+        session
+            .execute("CREATE GRAPH g ANY GRAPH; CREATE GRAPH doomed ANY GRAPH; SESSION SET GRAPH g")
+            .unwrap();
+        session.replace_graph_data(arrow_graph(vec![1])).unwrap();
+        db.checkpoint().unwrap();
+        let result = child_command(&dir, "parquet_import")
+            .env("GRAPHFUSION_TEST_CRASH", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(86),
+            "{point}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(graph_id(&db, "doomed").is_none(), committed, "{point}");
+        let result = session
+            .query("MATCH (n:N) RETURN ELEMENT_ID(n) AS id ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(result.row_count(), if committed { 2 } else { 1 }, "{point}");
+        assert!(
+            result.physical_plan.contains("file_type=parquet"),
+            "{}",
+            result.physical_plan
+        );
+        db.checkpoint().unwrap();
+        assert_eq!(parquet_files(&dir).len(), 1);
+    }
+}
+
+#[test]
+fn parquet_reader_in_another_process_pins_replaced_and_dropped_files() {
+    let dir = TestDir::new();
+    let db = dir.open();
+    let mut session = db.session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session.replace_graph_data(arrow_graph(vec![1])).unwrap();
+    let mut reader = Worker::start(&dir, "parquet_reader", "");
+    session.replace_graph_data(arrow_graph(vec![2, 3])).unwrap();
+    session.execute("DROP GRAPH g").unwrap();
+    assert_eq!(parquet_files(&dir).len(), 2);
+    assert!(matches!(db.checkpoint(), Err(Error::Busy)));
+    reader.release();
+    assert!(reader.finish().contains("GF_OLD_OK"));
+    db.checkpoint().unwrap();
+    assert!(parquet_files(&dir).is_empty());
+}
+
+#[tokio::test]
+async fn parquet_checkpoint_crash_matrix_and_conflict_orphan_reclamation() {
+    for point in [
+        "checkpoint_catalog",
+        "checkpoint_data",
+        "manifest_rename",
+        "manifest_sync",
+        "cleanup",
+        "parquet_cleanup",
+    ] {
+        let dir = TestDir::new();
+        let db = dir.open();
+        let id = create_graph(&db, "g");
+        let mut a = StatementTxn::begin(&db).unwrap();
+        let mut b = StatementTxn::begin(&db).unwrap();
+        a.replace_graph_data(id, arrow_graph(vec![1])).unwrap();
+        b.replace_graph_data(id, arrow_graph(vec![2, 3])).unwrap();
+        a.commit().unwrap();
+        assert!(matches!(b.commit(), Err(Error::Conflict(_))));
+        assert_eq!(parquet_files(&dir).len(), 2);
+        let result = child_command(&dir, "checkpoint")
+            .env("GRAPHFUSION_TEST_CRASH", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(86),
+            "{point}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = db
+            .session()
+            .query("USE GRAPH g MATCH (n) RETURN ELEMENT_ID(n) AS id")
+            .await
+            .unwrap();
+        assert_eq!(result.row_count(), 1);
+        db.checkpoint().unwrap();
+        assert_eq!(parquet_files(&dir).len(), 1);
+    }
+}
+
+#[test]
+fn missing_truncated_and_substituted_parquet_files_fail_closed() {
+    for change in ["missing", "truncated", "schema"] {
+        let dir = TestDir::new();
+        {
+            let db = dir.open();
+            let id = create_graph(&db, "g");
+            let mut tx = StatementTxn::begin(&db).unwrap();
+            tx.replace_graph_data(id, arrow_graph(vec![1])).unwrap();
+            tx.commit().unwrap();
+            db.checkpoint().unwrap();
+        }
+        let path = &parquet_files(&dir)[0];
+        match change {
+            "missing" => fs::remove_file(path).unwrap(),
+            "truncated" => FileOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(12)
+                .unwrap(),
+            _ => {
+                let mut file = FileOptions::new().write(true).open(path).unwrap();
+                let len = file.metadata().unwrap().len();
+                file.seek(SeekFrom::Start(len - 4)).unwrap();
+                file.write_all(b"BAD!").unwrap();
+            }
+        }
+        assert!(
+            matches!(
+                Database::open(&dir.0, OpenOptions::default()),
+                Err(Error::Corrupt(_))
+            ),
+            "{change}"
+        );
+    }
+}
+
 fn child_barrier() {
     println!("GF_READY");
     std::io::stdout().flush().unwrap();

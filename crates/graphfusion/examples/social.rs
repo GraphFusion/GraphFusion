@@ -6,7 +6,7 @@ use graphfusion::{
         util::pretty::pretty_format_batches,
     },
     graph::{EdgeTable, GraphData, NodeTable, DESTINATION, ID, SOURCE},
-    Database,
+    Database, OpenOptions,
 };
 use std::sync::Arc;
 
@@ -49,7 +49,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             vec![edges],
         )?],
     )?;
-    let db = Database::new();
+    let db = match std::env::args_os().nth(1) {
+        Some(path) => Database::open(
+            path,
+            OpenOptions {
+                create_if_missing: true,
+            },
+        )?,
+        None => Database::new(),
+    };
     let mut session = db.session();
     session.execute("CREATE GRAPH social ANY GRAPH; SESSION SET GRAPH social")?;
     session.replace_graph_data(graph)?;

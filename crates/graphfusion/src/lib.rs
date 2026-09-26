@@ -5,6 +5,7 @@ pub mod gql {
 pub mod catalog;
 mod error;
 pub mod graph;
+mod parquet;
 mod persistence;
 mod query;
 mod session;
@@ -16,7 +17,9 @@ pub use datafusion::arrow;
 pub use error::{Error, Result};
 use persistence::Disk;
 pub use query::QueryResult;
-pub use session::{ExecutionResult, Parameter, Session, SessionState, StatementResult, Value};
+pub use session::{
+    ExecutionResult, Parameter, Session, SessionState, StatementOutput, StatementResult, Value,
+};
 use std::{
     collections::HashMap,
     fs,

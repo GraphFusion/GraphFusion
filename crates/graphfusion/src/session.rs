@@ -60,6 +60,11 @@ pub struct ExecutionResult {
     pub statements: Vec<StatementResult>,
 }
 #[derive(Debug)]
+pub enum StatementOutput {
+    Command(StatementResult),
+    Query(crate::QueryResult),
+}
+#[derive(Debug)]
 pub struct Session {
     db: Database,
     state: SessionState,
@@ -84,7 +89,7 @@ impl Session {
         crate::query::execute(&self.db, &self.state, input).await
     }
     /// Atomically replaces the current open graph with validated Arrow tables.
-    /// Currently available for in-memory databases; durable imports require Parquet.
+    /// Persistent databases stage immutable Parquet files before publishing the manifest.
     pub fn replace_graph_data(&mut self, data: crate::graph::GraphData) -> Result<CommitSeq> {
         if self.state.closed {
             return Err(Error::SessionClosed);
@@ -111,6 +116,63 @@ impl Session {
         );
         Ok(())
     }
+    /// Runs a parsed GQL program containing catalog/session commands and read-only queries.
+    /// Top-level statements auto-commit. A later error does not undo earlier statements.
+    pub async fn run(&mut self, input: &str) -> Result<Vec<StatementOutput>> {
+        if self.state.closed {
+            return Err(Error::SessionClosed);
+        }
+        let program = ast::parse(input)?;
+        if program.statements.iter().any(contains_transaction) {
+            return Err(Error::UnsupportedFeature(
+                "explicit transactions; statements auto-commit".into(),
+            ));
+        }
+        if program.definitions.is_empty() && program.at_schema.is_some() {
+            if let [ast::Statement::Query(query)] = program.statements.as_slice() {
+                return Ok(vec![StatementOutput::Query(
+                    crate::query::execute_statement(
+                        &self.db,
+                        &self.state,
+                        query,
+                        program.at_schema.as_ref(),
+                    )
+                    .await?,
+                )]);
+            }
+        }
+        if !program.definitions.is_empty() || program.at_schema.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "program binding definitions and schema context".into(),
+            ));
+        }
+        let mut outputs = Vec::new();
+        let mut index = 0;
+        while index < program.statements.len() {
+            if self.state.closed {
+                return Err(Error::SessionClosed);
+            }
+            let start = index;
+            index += 1;
+            while index < program.statements.len()
+                && matches!(program.statements[index], ast::Statement::Next(_))
+            {
+                index += 1;
+            }
+            let group = &program.statements[start..index];
+            if let ast::Statement::Query(query) = &group[0] {
+                if group.len() != 1 {
+                    return Err(Error::UnsupportedFeature("NEXT query continuation".into()));
+                }
+                outputs.push(StatementOutput::Query(
+                    crate::query::execute_statement(&self.db, &self.state, query, None).await?,
+                ));
+            } else {
+                outputs.push(StatementOutput::Command(self.execute_group(group)?));
+            }
+        }
+        Ok(outputs)
+    }
     /// Top-level statements commit separately. On an error, earlier statements remain committed.
     /// NEXT continuations and linear catalog statements share one atomic internal transaction.
     pub fn execute(&mut self, input: &str) -> Result<ExecutionResult> {
@@ -134,34 +196,32 @@ impl Session {
             if self.state.closed {
                 return Err(Error::SessionClosed);
             }
-            let mut tx = StatementTxn::begin(&self.db)?;
-            let mut next = self.state.clone();
-            let mut affected = execute_statement(
-                &mut tx,
-                &mut next,
-                &self.initial,
-                &program.statements[index],
-            )?;
+            let start = index;
             index += 1;
             while index < program.statements.len()
                 && matches!(program.statements[index], ast::Statement::Next(_))
             {
-                affected += execute_statement(
-                    &mut tx,
-                    &mut next,
-                    &self.initial,
-                    &program.statements[index],
-                )?;
                 index += 1;
             }
-            let commit_seq = tx.commit()?;
-            self.state = next;
-            results.statements.push(StatementResult {
-                commit_seq,
-                affected_objects: affected,
-            });
+            results
+                .statements
+                .push(self.execute_group(&program.statements[start..index])?);
         }
         Ok(results)
+    }
+    fn execute_group(&mut self, statements: &[ast::Statement]) -> Result<StatementResult> {
+        let mut tx = StatementTxn::begin(&self.db)?;
+        let mut next = self.state.clone();
+        let mut affected = 0;
+        for statement in statements {
+            affected += execute_statement(&mut tx, &mut next, &self.initial, statement)?;
+        }
+        let commit_seq = tx.commit()?;
+        self.state = next;
+        Ok(StatementResult {
+            commit_seq,
+            affected_objects: affected,
+        })
     }
 }
 

@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const MAGIC: &[u8; 8] = b"GFLOG001";
 const END: &[u8; 8] = b"GFCOMMIT";
 const HEADER: usize = 24;
@@ -221,10 +221,12 @@ impl Disk {
         // directory. Persist the selected generation before accepting writes to its WAL.
         inject_io_error("recovery_directory_sync")?;
         sync_directory(&self.directory)?;
+        self.check_graph_files(&state)?;
         Ok((state, manifest.generation))
     }
 
     pub fn append(&self, generation: u64, record: &LogRecord) -> Result<()> {
+        let graph_commit = matches!(record, LogRecord::Commit(commit) if commit.storage.iter().any(|change| matches!(change, crate::storage::StorageChange::ReplaceParquet { .. })));
         let payload = serde_json::to_vec(record)?;
         let bytes = encode_frame(&payload)?;
         // Serialization does not enforce the recovery deserializer's recursion limit.
@@ -238,13 +240,25 @@ impl Disk {
         let write = (|| -> std::io::Result<()> {
             file.write_all(&bytes[..HEADER])?;
             failpoint("wal_header");
+            if graph_commit {
+                failpoint("parquet_wal_header");
+            }
             file.write_all(&bytes[HEADER..bytes.len() - END.len()])?;
             failpoint("wal_payload");
+            if graph_commit {
+                failpoint("parquet_wal_payload");
+            }
             file.write_all(END)?;
             failpoint("wal_commit");
+            if graph_commit {
+                failpoint("parquet_wal_commit");
+            }
             inject_io_error("wal_sync")?;
             file.sync_all()?;
             failpoint("wal_sync");
+            if graph_commit {
+                failpoint("parquet_wal_sync");
+            }
             Ok(())
         })();
         write.map_err(Error::CommitUnknown)
@@ -271,7 +285,9 @@ impl Disk {
         let generation = old_generation
             .checked_add(1)
             .ok_or_else(|| Error::InvalidDefinition("checkpoint generation exhausted".into()))?;
-        self.install_checkpoint(state, old.database_id, generation, obsolete)
+        self.install_checkpoint(state, old.database_id, generation, obsolete)?;
+        self.reclaim_graph_files(state);
+        Ok(())
     }
 
     fn install_checkpoint(
@@ -363,7 +379,7 @@ fn lock_file(path: &Path) -> Result<File> {
         .write(true)
         .open(path)?)
 }
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     Ok(File::open(path)?.sync_all()?)
 }
 fn check_version(version: u32) -> Result<()> {

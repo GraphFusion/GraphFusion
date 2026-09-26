@@ -58,6 +58,12 @@ impl PublishedState {
     pub fn validate(&self) -> Result<()> {
         self.catalog.validate()?;
         let mut owners = std::collections::BTreeSet::new();
+        let mut files = self
+            .catalog
+            .entries()
+            .map(|e| e.id)
+            .chain(self.storage.generations.keys().copied())
+            .collect();
         for entry in self.catalog.entries() {
             if entry.id >= self.next_id || entry.version > self.commit_seq {
                 return Err(Error::Corrupt(
@@ -80,6 +86,12 @@ impl PublishedState {
             }
         }
         for (id, generation) in &self.storage.generations {
+            if generation.graph.is_some() && generation.parquet.is_some() {
+                return Err(Error::Corrupt("graph has two storage providers".into()));
+            }
+            if let Some(manifest) = &generation.parquet {
+                manifest.validate(self.next_id, &mut files)?;
+            }
             if *id >= self.next_id
                 || (generation.retired_at.is_none() && !owners.contains(id))
                 || generation.retired_at.is_some_and(|s| s > self.commit_seq)
@@ -179,6 +191,28 @@ impl StatementTxn {
                     return Ok(data.clone());
                 }
             }
+            if let StorageChange::ReplaceParquet {
+                generation,
+                manifest,
+            } = change
+            {
+                if *generation == storage {
+                    return manifest.open(self.db.inner.disk.as_ref().ok_or_else(|| {
+                        Error::Corrupt("Parquet graph without database directory".into())
+                    })?);
+                }
+            }
+        }
+        if let Some(manifest) = self
+            .base
+            .storage
+            .generations
+            .get(&storage)
+            .and_then(|g| g.parquet.as_ref())
+        {
+            return manifest.open(self.db.inner.disk.as_ref().ok_or_else(|| {
+                Error::Corrupt("Parquet graph without database directory".into())
+            })?);
         }
         Ok(self
             .base
@@ -193,11 +227,6 @@ impl StatementTxn {
         graph: ObjectId,
         data: crate::graph::GraphData,
     ) -> Result<()> {
-        if self.db.inner.disk.is_some() {
-            return Err(Error::UnsupportedFeature(
-                "durable graph import requires the Parquet provider".into(),
-            ));
-        }
         let ObjectDefinition::Graph { storage, shape } = self.get(graph)?.definition else {
             return Err(Error::InvalidReference("graph required".into()));
         };
@@ -213,10 +242,43 @@ impl StatementTxn {
                 .get(&storage)
                 .map_or(0, |g| g.graph_version)
         });
-        self.storage_changes.push(StorageChange::ReplaceGraph {
-            generation: storage,
-            data: Arc::new(data),
-        });
+        if self.db.inner.disk.is_some() {
+            let mut manifest = crate::parquet::GraphManifest::default();
+            for table in &data.nodes {
+                let id = self.allocate_id()?;
+                manifest.nodes.push(
+                    self.db
+                        .inner
+                        .disk
+                        .as_ref()
+                        .unwrap()
+                        .write_graph_table(id, &table.0)?,
+                );
+            }
+            for edge in &data.edges {
+                let id = self.allocate_id()?;
+                manifest.edges.push(crate::parquet::EdgeManifest {
+                    table: self
+                        .db
+                        .inner
+                        .disk
+                        .as_ref()
+                        .unwrap()
+                        .write_graph_table(id, &edge.table)?,
+                    directed: edge.directed,
+                });
+            }
+            self.db.inner.disk.as_ref().unwrap().finish_graph_files()?;
+            self.storage_changes.push(StorageChange::ReplaceParquet {
+                generation: storage,
+                manifest: Arc::new(manifest),
+            });
+        } else {
+            self.storage_changes.push(StorageChange::ReplaceGraph {
+                generation: storage,
+                data: Arc::new(data),
+            });
+        }
         Ok(())
     }
     pub fn get(&mut self, id: ObjectId) -> Result<CatalogEntry> {
