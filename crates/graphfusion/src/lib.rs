@@ -1,17 +1,20 @@
-//! GraphFusion's catalog and session engine. Graph query execution is not implemented yet.
+//! GQL catalog, sessions, and DataFusion query execution.
 pub mod gql {
     pub use gql_parser::*;
 }
 pub mod catalog;
 mod error;
 mod persistence;
+mod query;
 mod session;
 mod storage;
 mod transaction;
 pub mod types;
 
+pub use datafusion::arrow;
 pub use error::{Error, Result};
 use persistence::Disk;
+pub use query::QueryResult;
 pub use session::{ExecutionResult, Parameter, Session, SessionState, StatementResult, Value};
 use std::{
     collections::HashMap,

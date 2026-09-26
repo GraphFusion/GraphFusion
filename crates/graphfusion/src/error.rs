@@ -5,6 +5,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     Parse(gql_parser::Error),
+    DataFusion(Box<datafusion::error::DataFusionError>),
+    InvalidQuery(String),
     Io(io::Error),
     Corrupt(String),
     UnsupportedFeature(String),
@@ -24,6 +26,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(e) => write!(f, "{e}"),
+            Self::DataFusion(e) => write!(f, "query execution error: {e}"),
+            Self::InvalidQuery(s) => write!(f, "invalid query: {s}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Corrupt(s) => write!(f, "corrupt database: {s}"),
             Self::UnsupportedFeature(s) => write!(f, "unsupported feature: {s}"),
@@ -44,6 +48,11 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+impl From<datafusion::error::DataFusionError> for Error {
+    fn from(e: datafusion::error::DataFusionError) -> Self {
+        Self::DataFusion(Box::new(e))
+    }
+}
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Self::Io(e)

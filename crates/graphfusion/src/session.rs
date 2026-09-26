@@ -78,6 +78,11 @@ impl Session {
     pub fn state(&self) -> &SessionState {
         &self.state
     }
+    /// Executes one read-only GQL query through DataFusion and materializes Arrow results.
+    /// Catalog/session commands continue to use `execute`.
+    pub async fn query(&mut self, input: &str) -> Result<crate::QueryResult> {
+        crate::query::execute(&self.db, &self.state, input).await
+    }
     /// Sets a driver-provided value. References are checked in the snapshot of each use.
     pub fn set_parameter(&mut self, name: impl Into<String>, value: Value) -> Result<()> {
         if self.state.closed {
