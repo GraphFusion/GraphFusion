@@ -90,6 +90,40 @@ async fn insert_updates_labels_properties_and_returns_use_datafusion() {
 }
 
 #[tokio::test]
+async fn insert_rejects_nonconcrete_labels_without_publishing_writes() {
+    for durable in [false, true] {
+        let dir = Durable::new();
+        let db = if durable { dir.open() } else { Database::new() };
+        let mut s = session(&db);
+        let result = run(
+            &mut s,
+            "INSERT (a:(A&B))-[e:(R&S)]->(:C) RETURN a IS LABELED A AS a, a IS LABELED B AS b, e IS LABELED R AS r, e IS LABELED S AS s",
+        )
+        .await;
+        assert_eq!(rows(&result), vec![vec!["true", "true", "true", "true"]]);
+        let query = "MATCH (n) RETURN ELEMENT_ID(n) AS id ORDER BY id";
+        let before = s.query(query).await.unwrap();
+        for invalid in [
+            "INSERT (:Created), (:!Forbidden)",
+            "INSERT (:A|B)",
+            "INSERT (:%)",
+            "INSERT (:Created)-[:!Forbidden]->(:Created)",
+            "INSERT (:Created)-[:A|B]->(:Created)",
+            "INSERT (:Created)-[:%]->(:Created)",
+            "MATCH (n:A) INSERT (n:%)",
+        ] {
+            assert!(
+                matches!(s.run(invalid).await, Err(Error::UnsupportedFeature(_))),
+                "{invalid}"
+            );
+            let after = s.query(query).await.unwrap();
+            assert_eq!(after.commit_seq, before.commit_seq, "{invalid}");
+            assert_eq!(rows(&after), rows(&before), "{invalid}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn matched_insert_preserves_bags_and_shared_nodes_and_edge_directions() {
     let db = Database::new();
     let mut s = session(&db);
@@ -289,6 +323,43 @@ async fn empty_matches_do_not_insert_or_update_elements() {
             .row_count(),
         0
     );
+}
+
+#[tokio::test]
+async fn empty_insert_does_not_publish_property_layouts() {
+    for durable in [false, true] {
+        for (prefix, affected) in [
+            ("MATCH (a:Missing)", 0),
+            ("INSERT (:Existing) FILTER FALSE", 1),
+        ] {
+            let dir = Durable::new();
+            let db = if durable { dir.open() } else { Database::new() };
+            let mut s = session(&db);
+            let before = s.query("RETURN 1 AS value").await.unwrap().commit_seq;
+            let result = run(
+                &mut s,
+                &format!("{prefix} INSERT (b:N {{v: 1}}) RETURN b.v AS v"),
+            )
+            .await;
+            assert_eq!(result.row_count(), 0);
+            assert_eq!(result.affected_elements, affected);
+            assert_eq!(result.commit_seq, before + affected as u64);
+            assert_eq!(
+                result.schema.field(0).data_type(),
+                &graphfusion::arrow::datatypes::DataType::Int64
+            );
+            db.checkpoint().unwrap();
+            let result = run(&mut s, "INSERT (n:N {v: 'ok'}) RETURN n.v AS v").await;
+            assert_eq!(rows(&result), vec![vec!["ok"]]);
+            assert_eq!(
+                s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id")
+                    .await
+                    .unwrap()
+                    .row_count(),
+                affected + 1
+            );
+        }
+    }
 }
 
 #[tokio::test]

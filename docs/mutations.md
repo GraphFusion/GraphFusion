@@ -39,7 +39,9 @@ DETACH DELETE n;
 - INSERT supports node/edge paths, multiple labels, properties, shared bound
   nodes, incoming/outgoing directed edges, undirected edges, loops and parallel
   edges. Every input row creates its new elements, preserving input multiplicity.
-  Already bound nodes must appear as bare references. Edge variables are new.
+  Labels must be concrete names joined by `&`; negation, alternatives, and
+  wildcards are rejected. Already bound nodes must appear as bare references.
+  Edge variables are new.
 - SET assigns properties, replaces the entire property set with a map, and adds
   a label. REMOVE removes properties or labels. The implementation evaluates SET
   items in order; subsequent items and clauses see preceding changes. Existing
@@ -59,8 +61,8 @@ DETACH DELETE n;
   than returning stale values. Mixed live/deleted values under one variable
   currently invalidate that entire variable.
 - Empty input produces no inserted elements or updates. Empty INSERT results
-  retain the inferred property types. Open graph layouts still require one
-  consistent scalar type per property name and element kind.
+  retain the inferred property types without persisting new layouts. Open graph
+  layouts still require one consistent scalar type per property name and element kind.
 - `QueryResult::affected_elements` counts inserted/deleted elements and distinct
   targets per update item. Multiple items can count the same element multiple
   times; it is an operation count, not a count of unique elements in the program.

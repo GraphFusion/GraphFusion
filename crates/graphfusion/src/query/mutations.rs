@@ -227,6 +227,20 @@ fn properties(
     Ok(result)
 }
 
+fn validate_insert_labels(expression: Option<&ast::LabelExpression>) -> Result<()> {
+    match expression {
+        None | Some(ast::LabelExpression::Label(_)) => Ok(()),
+        Some(ast::LabelExpression::And(left, right)) => {
+            validate_insert_labels(Some(left))?;
+            validate_insert_labels(Some(right))
+        }
+        Some(ast::LabelExpression::Parenthesized(inner)) => validate_insert_labels(Some(inner)),
+        _ => Err(super::unsupported(
+            "INSERT labels must be concrete names joined by &",
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn apply(
     mut plan: LogicalPlanBuilder,
@@ -239,6 +253,7 @@ pub(super) async fn apply(
     writes: &mut Writes,
     trace: &mut Trace,
 ) -> Result<LogicalPlanBuilder> {
+    let affected_before = writes.affected;
     let mut data = (*writes.data(tx, id)?).clone();
     // Durable providers contain no resident Arrow batches. Materialize their immutable
     // snapshot through DataFusion before validating or rewriting the graph.
@@ -310,6 +325,7 @@ pub(super) async fn apply(
                     .await?;
                     plan = next;
                     let edge = &chain.relationship;
+                    validate_insert_labels(edge.label_expression.as_ref())?;
                     let (from, to, directed) = match edge.direction {
                         ast::Direction::Right => (left.column(ID), right.column(ID), true),
                         ast::Direction::Left => (right.column(ID), left.column(ID), true),
@@ -446,7 +462,9 @@ pub(super) async fn apply(
         }
         _ => unreachable!("mutation dispatch"),
     }
-    writes.graphs.insert(id, data);
+    if writes.affected != affected_before {
+        writes.graphs.insert(id, data);
+    }
     Ok(plan)
 }
 
@@ -463,6 +481,7 @@ async fn insert_node(
     trace: &mut Trace,
     affected: &mut usize,
 ) -> Result<(LogicalPlanBuilder, ElementBinding)> {
+    validate_insert_labels(node.label_expression.as_ref())?;
     if let Some(name) = &node.variable {
         if scope.contains(&name.value) {
             let binding = target(scope, &name.value, graph)?;
@@ -535,6 +554,7 @@ async fn insert_element(
             expressions.push(value.alias(name));
         }
     }
+    let mut next = data.clone();
     if let Some(table) = table_with_empty(
         plan.clone().project(expressions)?,
         labels,
@@ -546,14 +566,18 @@ async fn insert_element(
     .await?
     {
         if kind == ElementKind::Node {
-            data.nodes.push(NodeTable(table));
+            next.nodes.push(NodeTable(table));
         } else {
-            data.edges.push(EdgeTable { table, directed });
+            next.edges.push(EdgeTable { table, directed });
         }
+    }
+    let next = GraphData::try_new(next.nodes, next.edges)?;
+    let (scan, binding) = graph::scan(scope, graph_id, &next, kind, None)?;
+    // Empty input still needs typed bindings, but must not publish a new layout.
+    if rows != 0 {
+        *data = next;
         *affected += rows;
     }
-    *data = GraphData::try_new(data.nodes.clone(), data.edges.clone())?;
-    let (scan, binding) = graph::scan(scope, graph_id, data, kind, None)?;
     plan = plan.join_on(
         scan,
         JoinType::Inner,
