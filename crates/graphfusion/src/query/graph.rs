@@ -117,6 +117,8 @@ pub(super) fn matches(
     }
     let different = !matches!(clause.mode, Some(ast::MatchMode::RepeatableElements { .. }));
     let mut edge_ids: Vec<Expr> = Vec::new();
+    // Every element in this MATCH must be bound before resolving its predicates.
+    let mut element_predicates = Vec::new();
     for path in &clause.patterns {
         if path.variable.is_some()
             || path.parenthesized.is_some()
@@ -142,9 +144,15 @@ pub(super) fn matches(
         {
             return Err(super::unsupported("complex or named path pattern"));
         }
-        let (next, mut current_node) =
-            node(plan, scope, session, graph_id, graph, &path.start, None)?;
+        let (next, mut current_node) = node(plan, scope, graph_id, graph, &path.start, None)?;
         plan = next;
+        element_predicates.push((
+            current_node.clone(),
+            &path.start.labels,
+            path.start.label_expression.as_ref(),
+            path.start.properties.as_ref(),
+            path.start.where_clause.as_ref(),
+        ));
         for chain in &path.chains {
             let edge = &chain.relationship;
             if edge.temporary || edge.quantifier.is_some() {
@@ -175,28 +183,36 @@ pub(super) fn matches(
                 }
             }
             edge_ids.push(binding.column(graph::ID));
-            plan = predicates_for(
-                plan,
-                scope,
-                session,
-                &binding,
+            element_predicates.push((
+                binding.clone(),
                 &edge.labels,
                 edge.label_expression.as_ref(),
                 edge.properties.as_ref(),
                 edge.where_clause.as_ref(),
-            )?;
+            ));
             let (next, next_node) = node(
                 plan,
                 scope,
-                session,
                 graph_id,
                 graph,
                 &chain.node,
                 Some(binding.column(graph::TO)),
             )?;
             plan = next;
+            element_predicates.push((
+                next_node.clone(),
+                &chain.node.labels,
+                chain.node.label_expression.as_ref(),
+                chain.node.properties.as_ref(),
+                chain.node.where_clause.as_ref(),
+            ));
             current_node = next_node;
         }
+    }
+    for (binding, labels, expression, properties, predicate) in element_predicates {
+        plan = predicates_for(
+            plan, scope, session, &binding, labels, expression, properties, predicate,
+        )?;
     }
     if let Some(predicate) = &clause.where_clause {
         let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
@@ -226,7 +242,6 @@ fn declare(scope: &mut Bindings, name: &str, binding: &ElementBinding) -> Result
 fn node(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
-    session: &SessionState,
     graph_id: ObjectId,
     graph: &GraphData,
     pattern: &ast::NodePattern,
@@ -262,16 +277,6 @@ fn node(
         }
         binding
     };
-    plan = predicates_for(
-        plan,
-        scope,
-        session,
-        &binding,
-        &pattern.labels,
-        pattern.label_expression.as_ref(),
-        pattern.properties.as_ref(),
-        pattern.where_clause.as_ref(),
-    )?;
     Ok((plan, binding))
 }
 

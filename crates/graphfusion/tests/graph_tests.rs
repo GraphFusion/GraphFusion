@@ -168,6 +168,49 @@ async fn node_scan_labels_properties_and_real_datafusion_provider() {
 }
 
 #[tokio::test]
+async fn inline_predicates_resolve_all_variables_in_the_match() {
+    let (_, mut session) = database();
+    for query in [
+        "MATCH (a WHERE a.age < b.age)-[:Knows]->(b) RETURN a.name AS a, b.name AS b",
+        "MATCH (b)<-[:Knows]-(a WHERE a.age < b.age) RETURN a.name AS a, b.name AS b",
+        "MATCH (a)-[e:Knows WHERE e.since > b.age]->(b) RETURN a.name AS a, b.name AS b",
+        "MATCH (a WHERE a.age < e.since)-[e:Knows]->(b WHERE b.age > a.age) RETURN a.name AS a, b.name AS b",
+    ] {
+        let result = session.query(query).await.unwrap();
+        assert_eq!(strings(&result), vec![vec!["Alice", "Bob"], vec!["Alice", "Bob"]], "{query}");
+    }
+    let result = session
+        .query("MATCH (a WHERE a.name = b.name), (b:City) RETURN a.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["London"]]);
+    for query in [
+        "MATCH (a WHERE a.name = missing.name) RETURN a.name AS name",
+        "MATCH (a WHERE a.name = b.name) MATCH (b) RETURN a.name AS name",
+    ] {
+        assert!(
+            matches!(session.query(query).await, Err(Error::InvalidQuery(_))),
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn property_patterns_resolve_forward_bindings() {
+    let (_, mut session) = database();
+    let result = session
+        .query("MATCH (a {name: b.name}), (b:City) RETURN a.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["London"]]);
+    let result = session
+        .query("MATCH (a)-[e:Knows {since: b.age + 1979}]->(b) RETURN a.name AS a, b.name AS b, e.since AS since")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["Alice", "Bob", "2019"]]);
+}
+
+#[tokio::test]
 async fn directed_joins_keep_parallel_edges_and_match_incoming_paths() {
     let (_, mut session) = database();
     for query in [

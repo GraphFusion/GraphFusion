@@ -58,7 +58,9 @@ when the property is absent or its value is null.
   references, and AT SCHEMA selection reuse the catalog/session resolver. Query
   context changes do not modify session state.
 - Node/edge labels and AND/OR/NOT/wildcard label expressions, property maps,
-  inline predicates, MATCH WHERE and FILTER.
+  inline predicates, MATCH WHERE and FILTER. Property maps and inline predicates
+  can reference any element bound in the same MATCH, including later patterns;
+  variables introduced by a subsequent MATCH remain out of scope.
 - Fixed-length node/edge chains, multiple MATCH clauses, disconnected patterns,
   and repeated bindings. A repeated node variable constrains identity rather than
   scanning a new independent node.
