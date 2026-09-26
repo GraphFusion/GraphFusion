@@ -44,7 +44,7 @@ runtime or block on an asynchronous query from its synchronous DDL method.
   `column_1`, `column_2`, etc.; a variable retains its name.
 
 Graph selection and fixed-length MATCH are described in [Arrow graph queries](graphs.md).
-Whole graph element values, graph mutations, aggregation, composite
+Graph mutations use [the async program API](mutations.md). Whole graph element values, aggregation, composite
 queries, nested/procedure queries, typed LET, temporal expressions, casts and
 remaining expressions are not yet executed. Unsupported features produce an
 error; they are not discarded or interpreted as SQL. The query API rejects mixed
@@ -53,7 +53,8 @@ programs and multiple top-level statements before any command can execute.
 ## Results and snapshots
 
 `QueryResult` includes the Arrow schema even for empty results, batches, snapshot
-commit sequence, the original logical plan and the optimized physical plan.
+commit sequence, affected-element count, logical plans and physical plans. Write
+results include the plans executed at each materialization barrier.
 Plan text is diagnostic rather than a stable serialization format and can contain
 bound parameter values; it is returned to the caller and is not logged.
 `graphfusion::arrow` re-exports the matching Arrow version for consumers.
@@ -76,5 +77,5 @@ for the underlying query engine.
 Arrow values/types, plan presence, null/unknown truth tables, parameter isolation,
 delimited identifiers, empty-result schemas, pagination, type errors, overflow,
 division by zero, closed sessions and unsupported programs without side effects.
-Arrow graph scans and joins are now implemented. Durable graph storage, GQL
-mutations and the remaining language semantics still need implementation.
+Arrow/Parquet graph scans, joins, and GQL mutations are now implemented. The
+remaining language semantics and full conformance still need implementation.

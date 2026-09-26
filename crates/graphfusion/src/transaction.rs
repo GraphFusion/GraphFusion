@@ -123,7 +123,7 @@ pub(crate) struct StatementTxn {
     members_read: BTreeMap<ObjectId, CommitSeq>,
     references_read: BTreeMap<ObjectId, CommitSeq>,
     rows_written: BTreeMap<(ObjectId, String), Option<CommitSeq>>,
-    graphs_written: BTreeMap<ObjectId, CommitSeq>,
+    graph_versions: BTreeMap<ObjectId, CommitSeq>,
     ids: std::ops::Range<ObjectId>,
 }
 impl Drop for StatementTxn {
@@ -169,7 +169,7 @@ impl StatementTxn {
             members_read: BTreeMap::new(),
             references_read: BTreeMap::new(),
             rows_written: BTreeMap::new(),
-            graphs_written: BTreeMap::new(),
+            graph_versions: BTreeMap::new(),
             ids: 0..0,
         })
     }
@@ -185,6 +185,13 @@ impl StatementTxn {
                 "typed graph scan schema binding".into(),
             ));
         }
+        self.graph_versions.entry(storage).or_insert_with(|| {
+            self.base
+                .storage
+                .generations
+                .get(&storage)
+                .map_or(0, |g| g.graph_version)
+        });
         for change in self.storage_changes.iter().rev() {
             if let StorageChange::ReplaceGraph { generation, data } = change {
                 if *generation == storage {
@@ -235,12 +242,17 @@ impl StatementTxn {
                 "typed graph import validation".into(),
             ));
         }
-        self.graphs_written.entry(storage).or_insert_with(|| {
+        self.graph_versions.entry(storage).or_insert_with(|| {
             self.base
                 .storage
                 .generations
                 .get(&storage)
                 .map_or(0, |g| g.graph_version)
+        });
+        let next_element_id = data.next_element_id();
+        self.storage_changes.push(StorageChange::AdvanceElementId {
+            generation: storage,
+            next: next_element_id,
         });
         if self.db.inner.disk.is_some() {
             let mut manifest = crate::parquet::GraphManifest::default();
@@ -280,6 +292,52 @@ impl StatementTxn {
             });
         }
         Ok(())
+    }
+    pub fn allocate_element_ids(&mut self, graph: ObjectId, count: usize) -> Result<Vec<u64>> {
+        let ObjectDefinition::Graph { storage, .. } = self.get(graph)?.definition else {
+            return Err(Error::InvalidReference("graph required".into()));
+        };
+        let mut next = self
+            .base
+            .storage
+            .generations
+            .get(&storage)
+            .map_or(Some(0), |g| g.next_element_id);
+        for change in &self.storage_changes {
+            if let StorageChange::AdvanceElementId {
+                generation,
+                next: advanced,
+            } = change
+            {
+                if *generation == storage {
+                    next = match (next, *advanced) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id =
+                next.ok_or_else(|| Error::InvalidDefinition("graph element IDs exhausted".into()))?;
+            ids.push(id);
+            next = id.checked_add(1);
+        }
+        if count > 0 {
+            self.graph_versions.entry(storage).or_insert_with(|| {
+                self.base
+                    .storage
+                    .generations
+                    .get(&storage)
+                    .map_or(0, |g| g.graph_version)
+            });
+            self.storage_changes.push(StorageChange::AdvanceElementId {
+                generation: storage,
+                next,
+            });
+        }
+        Ok(ids)
     }
     pub fn get(&mut self, id: ObjectId) -> Result<CatalogEntry> {
         self.objects_read
@@ -457,7 +515,7 @@ impl StatementTxn {
         Ok(seq)
     }
     fn validate(&self, current: &PublishedState) -> Result<()> {
-        for (generation, version) in &self.graphs_written {
+        for (generation, version) in &self.graph_versions {
             if current
                 .storage
                 .generations

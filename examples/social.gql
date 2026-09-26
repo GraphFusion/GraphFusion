@@ -1,0 +1,13 @@
+CREATE GRAPH social ANY GRAPH;
+SESSION SET GRAPH social;
+
+INSERT (alice:Person {name: 'Alice', age: 30})-[:Knows]->
+       (bob:Person {name: 'Bob', age: 40})-[:Knows]->
+       (cara:Person {name: 'Cara', age: 25});
+
+MATCH (person:Person {name: 'Alice'})
+SET person.age = person.age + 1, person IS Admin
+RETURN person.name AS name, person.age AS age;
+
+MATCH (a:Person {name: 'Alice'})-[:Knows]->(b)-[:Knows]->(c)
+RETURN c.name AS friend;

@@ -2,7 +2,7 @@
 
 GraphFusion implements a persistent catalog and a session executor for catalog
 DDL. It also coordinates [Arrow and Parquet graph snapshots](graphs.md) for MATCH;
-GQL graph data modifications remain unimplemented. The
+[GQL graph mutations](mutations.md) publish through the same coordinator. The
 internal storage participant stores versioned test rows to verify that catalog
 and data changes share one transaction; it is not a graph storage engine.
 
@@ -126,7 +126,7 @@ local reference count is used as authority for another process's readers.
 
 ## Durable format and recovery
 
-Format version 2 adds durable graph manifests; earlier format versions are rejected
+Format version 3 adds durable graph manifests and element-ID watermarks; earlier format versions are rejected
 and there is no migration command yet. `MANIFEST` identifies the database, format, checkpoint generation, commit and ID
 watermarks, and obsolete file generations. It names corresponding
 `catalog-N.snapshot`, `data-N.snapshot`, and `wal-N.log` files. Snapshots and the

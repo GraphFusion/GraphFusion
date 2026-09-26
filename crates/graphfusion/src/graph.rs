@@ -182,6 +182,14 @@ pub struct GraphData {
     pub(crate) edges: Vec<EdgeTable>,
 }
 impl GraphData {
+    pub(crate) fn next_element_id(&self) -> Option<u64> {
+        self.nodes
+            .iter()
+            .flat_map(|t| t.0.ids(ID))
+            .chain(self.edges.iter().flat_map(|t| t.table.ids(ID)))
+            .max()
+            .map_or(Some(0), |id| id.checked_add(1))
+    }
     /// Validates identity and endpoints across all tables. Each node is stored once.
     pub fn try_new(nodes: Vec<NodeTable>, edges: Vec<EdgeTable>) -> Result<Self> {
         let mut node_ids = BTreeSet::new();

@@ -116,7 +116,7 @@ impl Session {
         );
         Ok(())
     }
-    /// Runs a parsed GQL program containing catalog/session commands and read-only queries.
+    /// Runs a parsed GQL program containing catalog/session commands, queries and graph writes.
     /// Top-level statements auto-commit. A later error does not undo earlier statements.
     pub async fn run(&mut self, input: &str) -> Result<Vec<StatementOutput>> {
         if self.state.closed {
@@ -136,6 +136,7 @@ impl Session {
                         &self.state,
                         query,
                         program.at_schema.as_ref(),
+                        true,
                     )
                     .await?,
                 )]);
@@ -160,12 +161,13 @@ impl Session {
                 index += 1;
             }
             let group = &program.statements[start..index];
-            if let ast::Statement::Query(query) = &group[0] {
+            if let Some(query) = crate::query::write_query(&group[0]) {
                 if group.len() != 1 {
                     return Err(Error::UnsupportedFeature("NEXT query continuation".into()));
                 }
                 outputs.push(StatementOutput::Query(
-                    crate::query::execute_statement(&self.db, &self.state, query, None).await?,
+                    crate::query::execute_statement(&self.db, &self.state, &query, None, true)
+                        .await?,
                 ));
             } else {
                 outputs.push(StatementOutput::Command(self.execute_group(group)?));

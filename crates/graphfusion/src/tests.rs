@@ -1197,6 +1197,14 @@ fn child_worker() {
                 .unwrap();
             tx.commit().unwrap();
         }
+        "gql_write" => {
+            let mut s = db.session();
+            s.execute("SESSION SET GRAPH g").unwrap();
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(s.run("MATCH (a:N) INSERT (a)-[:E]->(b:N {v: 2}) SET b.v = 3"))
+                .unwrap();
+        }
         "parquet_reader" => {
             let mut tx = StatementTxn::begin(&db).unwrap();
             let graph = tx.lookup(MAIN_SCHEMA, ObjectKind::Graph, "g").unwrap().id;
@@ -1441,4 +1449,129 @@ fn child_barrier() {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).unwrap();
     assert_eq!(line.trim(), "go");
+}
+
+#[test]
+fn element_allocation_conflicts_and_graph_read_dependencies_are_validated() {
+    let db = Database::new();
+    let a = create_graph(&db, "a");
+    let b = create_graph(&db, "b");
+    let mut first = StatementTxn::begin(&db).unwrap();
+    let mut second = StatementTxn::begin(&db).unwrap();
+    let ids = first.allocate_element_ids(a, 2).unwrap();
+    assert_eq!(ids, second.allocate_element_ids(a, 2).unwrap());
+    first.replace_graph_data(a, arrow_graph(ids)).unwrap();
+    first.commit().unwrap();
+    second
+        .replace_graph_data(a, arrow_graph(vec![0, 1]))
+        .unwrap();
+    assert!(matches!(second.commit(), Err(Error::Conflict(_))));
+    let mut reader_writer = StatementTxn::begin(&db).unwrap();
+    reader_writer.graph_data(a).unwrap();
+    reader_writer
+        .replace_graph_data(b, arrow_graph(vec![8]))
+        .unwrap();
+    let mut change = StatementTxn::begin(&db).unwrap();
+    change.replace_graph_data(a, arrow_graph(vec![7])).unwrap();
+    change.commit().unwrap();
+    assert!(matches!(reader_writer.commit(), Err(Error::Conflict(_))));
+    let mut next = StatementTxn::begin(&db).unwrap();
+    assert_eq!(next.allocate_element_ids(a, 1).unwrap(), vec![8]);
+}
+
+#[tokio::test]
+async fn imported_maximum_element_id_exhausts_allocator_without_wrapping() {
+    let dir = TestDir::new();
+    {
+        let db = dir.open();
+        let mut s = db.session();
+        s.execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+            .unwrap();
+        s.replace_graph_data(arrow_graph(vec![u64::MAX])).unwrap();
+        s.run("MATCH (n) DELETE n").await.unwrap();
+        db.checkpoint().unwrap();
+    }
+    let db = dir.open();
+    let mut s = db.session();
+    s.execute("SESSION SET GRAPH g").unwrap();
+    assert!(matches!(
+        s.run("INSERT (:N)").await,
+        Err(Error::InvalidDefinition(_))
+    ));
+    assert_eq!(
+        s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id")
+            .await
+            .unwrap()
+            .row_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn gql_write_crashes_recover_graph_and_identity_counter_together() {
+    for (point, committed) in [
+        ("parquet_directory", false),
+        ("parquet_wal_payload", false),
+        ("parquet_wal_commit", true),
+        ("before_publish", true),
+    ] {
+        let dir = TestDir::new();
+        let db = dir.open();
+        let mut s = db.session();
+        s.execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+            .unwrap();
+        s.replace_graph_data(arrow_graph(vec![1])).unwrap();
+        db.checkpoint().unwrap();
+        let child = child_command(&dir, "gql_write")
+            .env("GRAPHFUSION_TEST_CRASH", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(86),
+            "{point}: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(
+            s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id")
+                .await
+                .unwrap()
+                .row_count(),
+            if committed { 2 } else { 1 }
+        );
+        let result = s
+            .query("MATCH ()-[e:E]->(b) RETURN b.v AS v")
+            .await
+            .unwrap();
+        assert_eq!(result.row_count(), usize::from(committed));
+        if committed {
+            assert_eq!(
+                result.batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .value(0),
+                3
+            );
+        }
+        let outputs = s
+            .run("INSERT (n:N) RETURN ELEMENT_ID(n) AS id")
+            .await
+            .unwrap();
+        let StatementOutput::Query(result) = &outputs[0] else {
+            panic!("query output")
+        };
+        let id = result.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+        assert!(
+            id.ends_with(if committed { ":4" } else { ":2" }),
+            "{point}: {id}"
+        );
+        db.checkpoint().unwrap();
+    }
 }

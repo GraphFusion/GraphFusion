@@ -37,7 +37,12 @@ MATCH over validated Arrow graph tables. Run
 See [query execution](docs/query.md) and [graph import and MATCH](docs/graphs.md).
 `cargo run -p graphfusion --example social --locked` runs a two-hop social graph
 query. Pass a new database directory after `--` to persist the example in Parquet.
-GQL mutations are a subsequent task.
+`Session::run(...).await` also executes [GQL graph mutations](docs/mutations.md).
+The [pure GQL social example](examples/social.gql) creates and updates a graph:
+
+```sh
+cargo run -p graphfusion --locked -- run --database /tmp/gql-social --create --file examples/social.gql
+```
 
 ## CLI and Parquet storage
 
@@ -61,8 +66,8 @@ for the import manifest, transaction boundaries, crash recovery, and limits.
 The main crate implements in-memory and persistent catalogs for directories,
 schemas, graph types, and graphs. Independent sessions support catalog DDL and
 `SESSION SET`, `SESSION RESET`, and `SESSION CLOSE`. Statements auto-commit;
-explicit multi-statement transactions and GQL graph data modifications are not
-implemented yet.
+explicit multi-statement transactions are not implemented yet. INSERT, SET,
+REMOVE, DELETE and DETACH DELETE execute on open graphs through the async API.
 
 ```rust
 use graphfusion::Database;

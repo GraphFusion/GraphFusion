@@ -77,7 +77,7 @@ when the property is absent or its value is null.
   identity; applications should not depend on their textual encoding.
 
 Whole element/path result values, quantified/parenthesized paths, optional matches,
-graph YIELD/KEEP, aggregate results, SELECT FROM graph forms, and GQL mutations
+graph YIELD/KEEP, aggregate results, and SELECT FROM graph forms
 remain unimplemented. Reusing one variable as a different kind or across different
 graphs is rejected. These limits are explicit errors, not partial query results.
 
@@ -98,8 +98,9 @@ Both `Database::new()` and `Database::open(...)` support open graph imports.
 Persistent databases stage immutable Parquet files and publish their manifests
 through the same coordinator; see [storage and CLI](storage-cli.md). Typed graph
 imports and scans still wait for schema binding and validation. Memory buffers
-cannot be serialized into the metadata log/checkpoint. GQL writes and standard
-conformance are still required before the overall database objective is complete.
+cannot be serialized into the metadata log/checkpoint. [GQL writes](mutations.md)
+now use DataFusion plans and the same coordinator. Standard conformance and the
+remaining language features are still required before the objective is complete.
 
 ## Evidence and semantic references
 
