@@ -18,8 +18,8 @@ pub use error::{Error, Result};
 use persistence::Disk;
 pub use query::QueryResult;
 pub use session::{
-    ExecutionResult, Parameter, Session, SessionState, StatementOutput, StatementResult,
-    TransactionAction, TransactionStatus, Value,
+    ExecutionResult, Parameter, QueryLimits, Session, SessionState, StatementOutput,
+    StatementResult, TransactionAction, TransactionStatus, Value,
 };
 use std::{
     collections::HashMap,

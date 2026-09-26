@@ -5,6 +5,8 @@ mod execution;
 mod expressions;
 mod graph;
 mod mutations;
+mod path_values;
+mod paths;
 mod relational;
 
 use crate::{
@@ -84,7 +86,14 @@ pub(crate) async fn execute_statement(
     if let Some(schema) = at_schema {
         context.current_schema = crate::session::schema_reference(tx, session, schema)?;
     }
-    let ctx = SessionContext::new();
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_memory_pool(std::sync::Arc::new(
+            datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                session.query_limits.memory_limit_bytes,
+            ),
+        ))
+        .build()?;
+    let ctx = SessionContext::new_with_config_rt(Default::default(), std::sync::Arc::new(runtime));
     let mut writes = mutations::Writes::default();
     let mut trace = execution::Trace::default();
     let plan = plan(
@@ -248,7 +257,7 @@ async fn plan_body(
                     )
                     .await?
                 } else {
-                    graph::matches(plan, &mut scope, session, id, &data, clause)?
+                    graph::matches(plan, &mut scope, session, id, &data, clause, ctx, trace).await?
                 };
             }
             ast::QueryClause::OptionalMatchBlock(clauses) => {
@@ -352,7 +361,17 @@ async fn plan_body(
             )
             .await?
         } else {
-            graph::matches(plan, &mut scope, session, id, &data, &from.match_clause)?
+            graph::matches(
+                plan,
+                &mut scope,
+                session,
+                id,
+                &data,
+                &from.match_clause,
+                ctx,
+                trace,
+            )
+            .await?
         };
     }
     if let Some(from) = &body.select_query {

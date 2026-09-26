@@ -32,12 +32,14 @@ permissions and never merges PRs. Maintainer approval is required for merging.
 `Session::query(...).await` executes GQL queries through DataFusion and
 returns Arrow batches, their schema, and logical/physical plans. It supports
 parameters, LET/FOR/FILTER, RETURN/SELECT, scalar operators, pagination,
-fixed-length MATCH/OPTIONAL MATCH, grouping/aggregates and composite queries over
+MATCH/OPTIONAL MATCH, quantified edges, path modes/selectors, grouping/aggregates and composite queries over
 Arrow or Parquet graph tables. Run
 `cargo run -p graphfusion --example scalar --locked` for an executable example.
 See [query execution](docs/query.md), [graph import and MATCH](docs/graphs.md), and
 [relational queries](docs/relational.md). The [analytics example](examples/analytics.gql)
-shows optional aggregation, percentiles and UNION ALL.
+shows optional aggregation, percentiles and UNION ALL. [Path queries](docs/paths.md)
+describe native DataFusion recursion, path values, group lists and resource limits;
+the [path example](examples/paths.gql) finds all tied shortest routes.
 `cargo run -p graphfusion --example social --locked` runs a two-hop social graph
 query. Pass a new database directory after `--` to persist the example in Parquet.
 `Session::run(...).await` also executes [GQL graph mutations](docs/mutations.md).

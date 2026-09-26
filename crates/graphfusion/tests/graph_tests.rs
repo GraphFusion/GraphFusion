@@ -493,18 +493,11 @@ async fn let_and_quoted_names_are_separate_from_physical_columns() {
         Err(Error::InvalidQuery(_))
     ));
     assert!(session.query("LET n = 1 MATCH (n) RETURN n").await.is_err());
-    for query in [
-        "MATCH p=(n) RETURN n.name AS value",
-        "MATCH (a)-[:Knows]->{1,2}(b) RETURN b.name AS value",
-    ] {
-        assert!(
-            matches!(
-                session.query(query).await,
-                Err(Error::UnsupportedFeature(_))
-            ),
-            "{query}"
-        );
-    }
+    let result = session
+        .query("MATCH `a.b`=(n) RETURN PATH_LENGTH(`a.b`) AS hops")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["0"]; 4]);
 }
 
 #[test]

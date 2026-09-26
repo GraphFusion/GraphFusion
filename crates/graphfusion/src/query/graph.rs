@@ -127,36 +127,29 @@ impl Bindings {
     }
 }
 
-pub(super) fn matches(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn matches(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     session: &SessionState,
     graph_id: ObjectId,
     graph: &GraphData,
     clause: &ast::MatchClause,
+    ctx: &datafusion::execution::context::SessionContext,
+    trace: &mut super::execution::Trace,
 ) -> Result<LogicalPlanBuilder> {
+    use super::paths::{self, Selection, State};
     if clause.optional || clause.keep.is_some() || clause.yield_clause.is_some() {
         return Err(super::unsupported("OPTIONAL MATCH, KEEP, or graph YIELD"));
     }
     let different = !matches!(clause.mode, Some(ast::MatchMode::RepeatableElements { .. }));
-    let mut edge_ids: Vec<Expr> = Vec::new();
-    // Every element in this MATCH must be bound before resolving its predicates.
+    let mut edge_lists: Vec<Expr> = Vec::new();
+    // Unselected patterns bind every element before resolving their predicates.
     let mut element_predicates = Vec::new();
     for path in &clause.patterns {
-        if path.variable.is_some()
-            || path.parenthesized.is_some()
+        if path.parenthesized.is_some()
             || path.alternation.is_some()
             || !path.alternatives.is_empty()
-            || !matches!(
-                &path.prefix,
-                None | Some(ast::PathPatternPrefix::Mode {
-                    mode: ast::PathMode::Walk,
-                    ..
-                }) | Some(ast::PathPatternPrefix::Search(ast::PathSearchPrefix::All {
-                    mode: None | Some(ast::PathMode::Walk),
-                    ..
-                }))
-            )
             || path.factors.iter().any(|factor| {
                 !matches!(
                     factor,
@@ -165,72 +158,139 @@ pub(super) fn matches(
             })
             || path.factors.len() != path.chains.len() * 2 + 1
         {
-            return Err(super::unsupported("complex or named path pattern"));
+            return Err(super::unsupported(
+                "parenthesized or alternative path pattern",
+            ));
         }
-        let (next, mut current_node) = node(plan, scope, graph_id, graph, &path.start, None)?;
+        let (mode, selection) = paths::prefix(path.prefix.as_ref(), session)?;
+        let row = if matches!(selection, Selection::All) {
+            None
+        } else {
+            let name = scope.fresh("path_row");
+            plan = super::execution::ordinal(plan, ctx, trace, &name).await?;
+            Some(Expr::Column(Column::new_unqualified(name)))
+        };
+        let mut max_hops = 0_u64;
+        for chain in &path.chains {
+            max_hops = max_hops.saturating_add(match &chain.relationship.quantifier {
+                Some(q) => {
+                    paths::bounds(
+                        q,
+                        mode,
+                        different,
+                        graph,
+                        session.query_limits.max_path_hops,
+                    )?
+                    .1
+                }
+                None => 1,
+            });
+            if max_hops > session.query_limits.max_path_hops {
+                return Err(Error::InvalidQuery(format!(
+                    "path exceeds the {}-hop implementation limit",
+                    session.query_limits.max_path_hops
+                )));
+            }
+        }
+        let (next, start_node) = node(plan, scope, graph_id, graph, &path.start, None)?;
         plan = next;
-        element_predicates.push((
-            current_node.clone(),
+        let mut path_predicates = vec![(
+            start_node.clone(),
             &path.start.labels,
             path.start.label_expression.as_ref(),
             path.start.properties.as_ref(),
             path.start.where_clause.as_ref(),
-        ));
+        )];
+        let mut state = State::new(start_node.column(graph::ID));
         for chain in &path.chains {
             let edge = &chain.relationship;
-            if edge.temporary || edge.quantifier.is_some() {
-                return Err(super::unsupported("temporary or quantified edge pattern"));
+            if edge.temporary {
+                return Err(super::unsupported("temporary edge pattern"));
             }
-            let (edge_plan, binding) = scan(
-                scope,
-                graph_id,
-                graph,
-                ElementKind::Edge,
-                Some(edge.direction),
-            )?;
-            let mut predicates = vec![current_node
-                .column(graph::ID)
-                .eq(binding.column(graph::FROM))];
-            if let Some(name) = &edge.variable {
-                if let Some(previous) = scope.elements.get(&name.value) {
-                    check_binding(previous, graph_id, ElementKind::Edge)?;
-                    predicates.push(previous.column(graph::ID).eq(binding.column(graph::ID)));
-                } else {
-                    declare(scope, &name.value, &binding)?;
+            let endpoint = if edge.quantifier.is_some() {
+                (plan, state) = paths::expand(
+                    plan, scope, session, graph_id, graph, edge, &state, mode, different,
+                )?;
+                state.end()
+            } else {
+                let (edge_plan, binding) = scan(
+                    scope,
+                    graph_id,
+                    graph,
+                    ElementKind::Edge,
+                    Some(edge.direction),
+                )?;
+                let mut predicates = vec![state.end().eq(binding.column(graph::FROM))];
+                if let Some(name) = &edge.variable {
+                    if let Some(previous) = scope.elements.get(&name.value) {
+                        check_binding(previous, graph_id, ElementKind::Edge)?;
+                        predicates.push(previous.column(graph::ID).eq(binding.column(graph::ID)));
+                    } else {
+                        declare(scope, &name.value, &binding)?;
+                    }
                 }
-            }
-            plan = plan.join_on(edge_plan, JoinType::Inner, predicates)?;
-            if different {
-                for previous in &edge_ids {
-                    plan = plan.filter(previous.clone().not_eq(binding.column(graph::ID)))?;
-                }
-            }
-            edge_ids.push(binding.column(graph::ID));
-            element_predicates.push((
-                binding.clone(),
-                &edge.labels,
-                edge.label_expression.as_ref(),
-                edge.properties.as_ref(),
-                edge.where_clause.as_ref(),
-            ));
-            let (next, next_node) = node(
-                plan,
-                scope,
-                graph_id,
-                graph,
-                &chain.node,
-                Some(binding.column(graph::TO)),
-            )?;
+                plan = plan.join_on(edge_plan, JoinType::Inner, predicates)?;
+                path_predicates.push((
+                    binding.clone(),
+                    &edge.labels,
+                    edge.label_expression.as_ref(),
+                    edge.properties.as_ref(),
+                    edge.where_clause.as_ref(),
+                ));
+                state = state.append(binding.column(graph::ID), binding.column(graph::TO));
+                binding.column(graph::TO)
+            };
+            let (next, next_node) =
+                node(plan, scope, graph_id, graph, &chain.node, Some(endpoint))?;
             plan = next;
-            element_predicates.push((
-                next_node.clone(),
+            path_predicates.push((
+                next_node,
                 &chain.node.labels,
                 chain.node.label_expression.as_ref(),
                 chain.node.properties.as_ref(),
                 chain.node.where_clause.as_ref(),
             ));
-            current_node = next_node;
         }
+        if matches!(selection, Selection::All) {
+            element_predicates.extend(path_predicates);
+        } else {
+            // Inline predicates constrain candidates before shortest/ANY selection.
+            for (binding, labels, expression, properties, predicate) in path_predicates {
+                plan = predicates_for(
+                    plan, scope, session, &binding, labels, expression, properties, predicate,
+                )?;
+            }
+        }
+        plan = plan.filter(state.valid(mode, different))?;
+        if different {
+            for previous in &edge_lists {
+                plan = plan.filter(Expr::Not(Box::new(
+                    datafusion::functions_nested::expr_fn::array_has_any(
+                        previous.clone(),
+                        state.edges.clone(),
+                    ),
+                )))?;
+            }
+        }
+        plan = paths::select(plan, scope, &state, selection, row)?;
+        if let Some(name) = &path.variable {
+            if scope.contains(&name.value) {
+                return Err(Error::InvalidQuery(format!(
+                    "variable {} is already bound",
+                    name.value
+                )));
+            }
+            let column = scope.scalar(&name.value);
+            let mut projection: Vec<_> = plan
+                .schema()
+                .columns()
+                .into_iter()
+                .map(Expr::Column)
+                .collect();
+            projection.push(state.value(graph_id).alias(column.name));
+            plan = plan.project(projection)?;
+        }
+        edge_lists.push(state.edges);
     }
     for (binding, labels, expression, properties, predicate) in element_predicates {
         plan = predicates_for(
@@ -305,7 +365,7 @@ fn node(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn predicates_for(
+pub(super) fn predicates_for(
     mut plan: LogicalPlanBuilder,
     scope: &Bindings,
     session: &SessionState,

@@ -70,16 +70,17 @@ returns null.
   edges retain distinct IDs and therefore retain match multiplicity.
 - DIFFERENT EDGES (the default) constrains every edge occurrence in one MATCH,
   including across disconnected paths; REPEATABLE ELEMENTS lifts that constraint.
-  Each new MATCH starts its own edge-occurrence constraint set. Fixed-length WALK
-  and ALL prefixes are accepted; other path modes/selectors remain explicit errors.
+  Each new MATCH starts its own edge-occurrence constraint set. The default MATCH
+  choice still requires normative audit. [Paths](paths.md) adds named paths,
+  quantified edges, all four modes and endpoint-partitioned selectors.
 - Property projection and scalar expressions/LET, sorting and paging over result
   aliases, ELEMENT_ID, SAME, ALL_DIFFERENT, IS LABELED, IS DIRECTED and
   PROPERTY_EXISTS. Element IDs are opaque strings containing graph, kind and row
   identity; applications should not depend on their textual encoding.
 
 [Relational queries](relational.md) implement optional matches, aggregate results
-and SELECT FROM graph forms. Whole element/path result values,
-quantified/parenthesized paths and graph YIELD/KEEP remain unimplemented. Reusing one variable as a different kind or across different
+and SELECT FROM graph forms. Whole directly matched element values,
+parenthesized path expressions and graph YIELD/KEEP remain unimplemented. Reusing one variable as a different kind or across different
 graphs is rejected. These limits are explicit errors, not partial query results.
 
 ## Snapshot and persistence boundaries
