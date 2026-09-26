@@ -1,0 +1,25 @@
+{
+  "name": "graphfusion-docs",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "astro dev --host 127.0.0.1",
+    "check": "astro check",
+    "build": "astro build && python3 scripts/check-links.py",
+    "preview": "astro preview --host 127.0.0.1",
+    "test:examples": "python3 scripts/check-examples.py",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.4",
+    "astro": "7.3.5"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.10",
+    "@playwright/test": "1.63.0",
+    "typescript": "~5.9.3"
+  }
+}
