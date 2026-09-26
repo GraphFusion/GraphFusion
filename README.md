@@ -4,6 +4,11 @@ GraphFusion is a Rust graph database project. The repository is organized as a
 Cargo workspace so database components can evolve independently while sharing a
 single build and test surface.
 
+The target architecture implements GQL over Apache DataFusion, with Arrow and
+Parquet storage. See the [architecture](docs/architecture.md) and the
+[PR delivery plan and capability ledger](docs/roadmap.md). The current main branch
+provides parsing; runtime features are delivered in separate reviewed PRs.
+
 ## Development and CI
 
 The minimum supported Rust version is 1.89. `rust-toolchain.toml` pins the
