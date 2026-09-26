@@ -715,11 +715,26 @@ impl Parser {
                     | TokenKind::Intersect
                     | TokenKind::Otherwise
             ) {
+            // A nested read query is a query primary: its result flows outward.
+            // Only a modifying pipeline implicitly finishes without a result.
+            let inherit = clauses.last().is_some_and(is_nested_query_clause)
+                && !clauses.iter().any(is_data_modifying_query_clause);
             ResultClause {
-                kind: ResultKind::Finish,
+                kind: if inherit {
+                    ResultKind::Return
+                } else {
+                    ResultKind::Finish
+                },
                 quantifier: None,
                 distinct: false,
-                items: Vec::new(),
+                items: if inherit {
+                    vec![ResultItem {
+                        expr: Expr::Wildcard,
+                        alias: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
             }
         } else {
             self.parse_result_clause()?

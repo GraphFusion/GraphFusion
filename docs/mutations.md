@@ -2,7 +2,7 @@
 
 `Session::run(...).await` and the CLI execute `INSERT`, `SET`, `REMOVE`, `DELETE`,
 and `DETACH DELETE` against open graphs in memory or Parquet. A write can follow
-MATCH/LET/FILTER and return bindings, or terminate with FINISH (implicit for a
+MATCH/OPTIONAL MATCH/LET/FOR/FILTER and return bindings, or terminate with FINISH (implicit for a
 standalone modifying statement). `Session::query` stays read-only and rejects
 write clauses. The synchronous `Session::execute` remains for catalog/session
 commands.
@@ -60,6 +60,8 @@ DETACH DELETE n;
   including aliases. Referencing one afterwards rejects the statement rather
   than returning stale values. Mixed live/deleted values under one variable
   currently invalidate that entire variable.
+- Null optional targets are skipped by SET/REMOVE/DELETE without dropping other
+  bindings. A null INSERT endpoint is rejected.
 - Empty input produces no inserted elements or updates. Empty INSERT results
   retain the inferred property types without persisting new layouts. Open graph
   layouts still require one consistent scalar type per property name and element kind.
@@ -105,8 +107,9 @@ This first writer materializes the complete affected graph and rewrites its
 tables. It does not yet provide incremental file deltas, streaming writes,
 compaction, indexes, typed-graph constraint enforcement, explicit transactions,
 or query NEXT continuations. Mutating a binding from a different working graph
-is rejected. Read-only query limitations such as OPTIONAL/aggregation/path search
-remain; full GQL standard conformance is unproven.
+is rejected. [Relational queries](relational.md) now support OPTIONAL MATCH, FOR,
+aggregation and query composition. Path search and remaining query limitations
+still apply; full GQL standard conformance is unproven.
 
 Tests cover memory and Parquet CRUD, aliases, labels, all-property replacement,
 nulls, directions, duplicate inputs, empty input, rollback on later errors,

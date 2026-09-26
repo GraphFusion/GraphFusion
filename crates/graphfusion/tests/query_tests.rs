@@ -348,8 +348,6 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         "START TRANSACTION; RETURN 1 AS n; COMMIT",
         "RETURN 1 AS n; RETURN 2 AS n",
         "INSERT (:Person)",
-        "RETURN 1 AS n UNION RETURN 2 AS n",
-        "RETURN COUNT(*) AS n",
     ] {
         assert!(
             matches!(

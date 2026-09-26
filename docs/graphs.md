@@ -49,8 +49,9 @@ and can contain dots, quotes, or the same text as an internal column.
 
 Properties missing from one layout are projected as typed nulls when combining
 tables. The storage keeps layout membership distinct from a present null value.
-For the supported non-null element bindings, `PROPERTY_EXISTS(n, p)` is false
-when the property is absent or its value is null.
+`PROPERTY_EXISTS(n, p)` is false when a non-null element lacks the property or
+its value is null. For a null element introduced by OPTIONAL MATCH, the predicate
+returns null.
 
 ## Query semantics currently executed
 
@@ -76,9 +77,9 @@ when the property is absent or its value is null.
   PROPERTY_EXISTS. Element IDs are opaque strings containing graph, kind and row
   identity; applications should not depend on their textual encoding.
 
-Whole element/path result values, quantified/parenthesized paths, optional matches,
-graph YIELD/KEEP, aggregate results, and SELECT FROM graph forms
-remain unimplemented. Reusing one variable as a different kind or across different
+[Relational queries](relational.md) implement optional matches, aggregate results
+and SELECT FROM graph forms. Whole element/path result values,
+quantified/parenthesized paths and graph YIELD/KEEP remain unimplemented. Reusing one variable as a different kind or across different
 graphs is rejected. These limits are explicit errors, not partial query results.
 
 ## Snapshot and persistence boundaries

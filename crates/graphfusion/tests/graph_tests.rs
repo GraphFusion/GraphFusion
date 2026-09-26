@@ -494,7 +494,6 @@ async fn let_and_quoted_names_are_separate_from_physical_columns() {
     ));
     assert!(session.query("LET n = 1 MATCH (n) RETURN n").await.is_err());
     for query in [
-        "OPTIONAL MATCH (n) RETURN n.name AS value",
         "MATCH p=(n) RETURN n.name AS value",
         "MATCH (a)-[:Knows]->{1,2}(b) RETURN b.name AS value",
     ] {

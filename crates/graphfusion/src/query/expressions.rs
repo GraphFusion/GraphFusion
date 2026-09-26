@@ -9,6 +9,8 @@ pub(super) struct Binder<'a> {
     session: &'a SessionState,
     schema: &'a DFSchema,
     bindings: Option<&'a super::graph::Bindings>,
+    aggregates: bool,
+    aliases: Option<&'a std::collections::BTreeMap<String, Expr>>,
 }
 
 impl<'a> Binder<'a> {
@@ -17,6 +19,8 @@ impl<'a> Binder<'a> {
             session,
             schema,
             bindings: None,
+            aggregates: false,
+            aliases: None,
         }
     }
     pub fn with_bindings(
@@ -28,7 +32,17 @@ impl<'a> Binder<'a> {
             session,
             schema,
             bindings: Some(bindings),
+            aggregates: false,
+            aliases: None,
         }
+    }
+    pub fn aggregating(mut self) -> Self {
+        self.aggregates = true;
+        self
+    }
+    pub fn aliases(mut self, aliases: &'a std::collections::BTreeMap<String, Expr>) -> Self {
+        self.aliases = Some(aliases);
+        self
     }
     fn element(&self, name: &str) -> Result<&super::graph::ElementBinding> {
         self.bindings
@@ -82,30 +96,29 @@ impl<'a> Binder<'a> {
                     .parameters
                     .get(name)
                     .ok_or_else(|| Error::NotFound(format!("parameter {name}")))?;
-                let mut value = match &parameter.value {
-                    Value::Null => ScalarValue::Null,
-                    Value::Boolean(v) => ScalarValue::Boolean(Some(*v)),
-                    Value::Integer(v) => ScalarValue::Int64(Some(*v)),
-                    Value::Float(v) => ScalarValue::Float64(Some(*v)),
-                    Value::String(v) => ScalarValue::Utf8(Some(v.clone())),
-                    Value::Bytes(v) => ScalarValue::Binary(Some(v.clone())),
-                    _ => return Err(super::unsupported("non-scalar query parameter")),
+                let mut expression = match &parameter.value {
+                    Value::Null => datafusion::logical_expr::lit(ScalarValue::Null),
+                    Value::Boolean(v) => datafusion::logical_expr::lit(*v),
+                    Value::Integer(v) => datafusion::logical_expr::lit(*v),
+                    Value::Float(v) => datafusion::logical_expr::lit(*v),
+                    Value::String(v) => datafusion::logical_expr::lit(v.clone()),
+                    Value::Bytes(v) => {
+                        datafusion::logical_expr::lit(ScalarValue::Binary(Some(v.clone())))
+                    }
+                    Value::List(values) => list_parameter(values, self)?,
+                    _ => return Err(super::unsupported("query parameter value type")),
                 };
                 if let Some(declared) = &parameter.declared_type {
-                    let data_type = match declared.kind.as_str() {
-                        "any" => value.data_type(),
-                        "boolean" => DataType::Boolean,
-                        "integer" => DataType::Int64,
-                        "float" => DataType::Float64,
-                        "string" => DataType::Utf8,
-                        "bytes" => DataType::Binary,
-                        _ => return Err(super::unsupported("declared query parameter type")),
-                    };
-                    value = value.cast_to(&data_type)?;
+                    let data_type = parameter_type(declared, &expression.get_type(self.schema)?)?;
+                    expression = datafusion::logical_expr::cast(expression, data_type);
                 }
-                datafusion::logical_expr::lit(value)
+                expression
             }
+
             E::Identifier(name) => {
+                if let Some(value) = self.aliases.and_then(|aliases| aliases.get(&name.value)) {
+                    return Ok(value.clone());
+                }
                 if let Some(bindings) = self.bindings {
                     if let Some(column) = bindings.scalars.get(&name.value) {
                         return Ok(Expr::Column(column.clone()));
@@ -175,7 +188,9 @@ impl<'a> Binder<'a> {
                             left.column(crate::graph::ID)
                                 .eq(right.column(crate::graph::ID))
                         } else {
-                            datafusion::logical_expr::lit(false)
+                            left.nullable_predicate(
+                                right.nullable_predicate(datafusion::logical_expr::lit(false)),
+                            )
                         };
                         result = result.and(if matches!(expr, E::AllDifferent { .. }) {
                             Expr::Not(Box::new(same))
@@ -285,7 +300,19 @@ impl<'a> Binder<'a> {
                 }
             }
             E::IsNull { expr, negated } => {
-                let expr = self.bind(expr)?;
+                let expr = if let E::Identifier(name) = expr.as_ref() {
+                    if let Some(binding) = self
+                        .bindings
+                        .filter(|_| !self.aliases.is_some_and(|a| a.contains_key(&name.value)))
+                        .and_then(|b| b.elements.get(&name.value))
+                    {
+                        binding.column(crate::graph::ID)
+                    } else {
+                        self.bind(expr)?
+                    }
+                } else {
+                    self.bind(expr)?
+                };
                 if *negated {
                     expr.is_not_null()
                 } else {
@@ -340,6 +367,46 @@ impl<'a> Binder<'a> {
                     datafusion::functions::core::expr_fn::nullif(left, right)
                 }
             }
+            E::List(values) => {
+                let values = values
+                    .iter()
+                    .map(|e| self.bind(e))
+                    .collect::<Result<Vec<_>>>()?;
+                self.compatible(&values)?;
+                datafusion::functions_nested::expr_fn::make_array(values)
+            }
+            E::Function {
+                name,
+                quantifier,
+                args,
+            } if self.aggregates => {
+                let star = args.len() == 1 && matches!(args[0], E::Wildcard);
+                let bound = if star {
+                    vec![]
+                } else {
+                    args.iter()
+                        .map(|arg| {
+                            if name.value.eq_ignore_ascii_case("COUNT") {
+                                if let E::Identifier(name) = arg {
+                                    if let Some(binding) = self
+                                        .bindings
+                                        .filter(|_| {
+                                            !self
+                                                .aliases
+                                                .is_some_and(|a| a.contains_key(&name.value))
+                                        })
+                                        .and_then(|b| b.elements.get(&name.value))
+                                    {
+                                        return Ok(binding.identity());
+                                    }
+                                }
+                            }
+                            self.bind(arg)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+                super::aggregates::call(&name.value, *quantifier, bound, star, self.schema)?
+            }
             _ => return Err(super::unsupported("query expression")),
         })
     }
@@ -347,22 +414,75 @@ impl<'a> Binder<'a> {
     fn compatible(&self, expressions: &[Expr]) -> Result<()> {
         let mut previous = DataType::Null;
         for expr in expressions {
-            let next = expr.get_type(self.schema)?;
-            if previous != DataType::Null
-                && next != DataType::Null
-                && previous != next
-                && !(numeric(&previous) && numeric(&next))
-            {
-                return Err(Error::InvalidQuery(format!(
-                    "incompatible value types {previous} and {next}"
-                )));
-            }
-            if next != DataType::Null {
-                previous = next;
-            }
+            previous = common_value_type(&previous, &expr.get_type(self.schema)?)?;
         }
         Ok(())
     }
+}
+
+fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
+    if left == right || *right == DataType::Null {
+        return Ok(left.clone());
+    }
+    if *left == DataType::Null {
+        return Ok(right.clone());
+    }
+    let incompatible =
+        || Error::InvalidQuery(format!("incompatible value types {left} and {right}"));
+    match (left, right) {
+        (DataType::List(a), DataType::List(b)) => Ok(DataType::new_list(
+            common_value_type(a.data_type(), b.data_type())?,
+            a.is_nullable() || b.is_nullable(),
+        )),
+        (a, b) if numeric(a) && numeric(b) => {
+            datafusion::logical_expr::binary::binary_numeric_coercion(a, b).ok_or_else(incompatible)
+        }
+        _ => Err(incompatible()),
+    }
+}
+
+fn parameter_type(declared: &crate::types::ValueType, inferred: &DataType) -> Result<DataType> {
+    Ok(match declared.kind.as_str() {
+        "any" => inferred.clone(),
+        "boolean" => DataType::Boolean,
+        "integer" => DataType::Int64,
+        "float" => DataType::Float64,
+        "string" => DataType::Utf8,
+        "bytes" => DataType::Binary,
+        "list" | "array" => {
+            let inferred = match inferred {
+                DataType::List(field) => field.data_type(),
+                _ => &DataType::Null,
+            };
+            let element = declared
+                .arguments
+                .first()
+                .ok_or_else(|| Error::InvalidQuery("list parameter has no element type".into()))?;
+            DataType::new_list(parameter_type(element, inferred)?, true)
+        }
+        _ => return Err(super::unsupported("declared query parameter type")),
+    })
+}
+
+fn list_parameter(values: &[Value], binder: &Binder<'_>) -> Result<Expr> {
+    use datafusion::logical_expr::lit;
+    let args = values
+        .iter()
+        .map(|value| {
+            Ok(match value {
+                Value::Null => lit(ScalarValue::Null),
+                Value::Boolean(v) => lit(*v),
+                Value::Integer(v) => lit(*v),
+                Value::Float(v) => lit(*v),
+                Value::String(v) => lit(v.clone()),
+                Value::Bytes(v) => lit(ScalarValue::Binary(Some(v.clone()))),
+                Value::List(v) => list_parameter(v, binder)?,
+                _ => return Err(super::unsupported("list parameter element type")),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    binder.compatible(&args)?;
+    Ok(datafusion::functions_nested::expr_fn::make_array(args))
 }
 
 fn boolean(data_type: &DataType) -> bool {
