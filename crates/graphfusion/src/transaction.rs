@@ -113,6 +113,7 @@ impl PublishedState {
 #[derive(Debug)]
 pub(crate) struct StatementTxn {
     db: Database,
+    read_only: bool,
     _lease: Option<FileGuard>,
     pub base: Arc<PublishedState>,
     view: CatalogSnapshot,
@@ -159,6 +160,7 @@ impl StatementTxn {
         db.inner.active.fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             db: db.clone(),
+            read_only: false,
             _lease: lease,
             base: state.clone(),
             view: (*state.catalog).clone(),
@@ -172,6 +174,16 @@ impl StatementTxn {
             graph_versions: BTreeMap::new(),
             ids: 0..0,
         })
+    }
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+    fn require_writable(&self) -> Result<()> {
+        if self.read_only {
+            Err(Error::ReadOnlyTransaction)
+        } else {
+            Ok(())
+        }
     }
     pub fn catalog(&self) -> &CatalogSnapshot {
         &self.view
@@ -234,6 +246,7 @@ impl StatementTxn {
         graph: ObjectId,
         data: crate::graph::GraphData,
     ) -> Result<()> {
+        self.require_writable()?;
         let ObjectDefinition::Graph { storage, shape } = self.get(graph)?.definition else {
             return Err(Error::InvalidReference("graph required".into()));
         };
@@ -294,6 +307,7 @@ impl StatementTxn {
         Ok(())
     }
     pub fn allocate_element_ids(&mut self, graph: ObjectId, count: usize) -> Result<Vec<u64>> {
+        self.require_writable()?;
         let ObjectDefinition::Graph { storage, .. } = self.get(graph)?.definition else {
             return Err(Error::InvalidReference("graph required".into()));
         };
@@ -381,6 +395,7 @@ impl StatementTxn {
         name: &str,
         definition: ObjectDefinition,
     ) -> Result<ObjectId> {
+        self.require_writable()?;
         if name.is_empty() {
             return Err(Error::InvalidDefinition("empty object name".into()));
         }
@@ -429,6 +444,7 @@ impl StatementTxn {
         self.create(parent, name, ObjectDefinition::Graph { shape, storage })
     }
     pub fn drop_object(&mut self, id: ObjectId) -> Result<()> {
+        self.require_writable()?;
         if matches!(id, ROOT_DIRECTORY | MAIN_SCHEMA) {
             return Err(Error::DependencyExists(
                 "bootstrap objects cannot be dropped".into(),
@@ -554,6 +570,7 @@ impl StatementTxn {
         Ok(())
     }
     fn allocate_id(&mut self) -> Result<ObjectId> {
+        self.require_writable()?;
         if let Some(id) = self.ids.next() {
             return Ok(id);
         }
@@ -616,6 +633,7 @@ impl StatementTxn {
     }
     #[cfg(test)]
     pub fn write_row(&mut self, graph: ObjectId, key: &str, value: Option<Vec<u8>>) -> Result<()> {
+        self.require_writable()?;
         let ObjectDefinition::Graph { storage, .. } = self.get(graph)?.definition else {
             return Err(Error::InvalidReference("graph required".into()));
         };

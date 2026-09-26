@@ -94,7 +94,7 @@ The second command runs in a separate process and returns `Cara` from Parquet.
 4. Readers plan and scan exact immutable files through DataFusion while retaining
    their lifecycle lease. Replacing or dropping a graph cannot change an active
    reader's files. A checkpoint reports Busy while any process has an active
-   statement, including an import that is still staging files.
+   statement or explicit transaction, including an import that is still staging files.
 5. After publishing and syncing a new checkpoint, under an exclusive lease,
    cleanup removes unreferenced managed Parquet files. This includes replaced,
    dropped, aborted, and crash-orphaned files. Interrupted/failed cleanup is
@@ -128,5 +128,6 @@ checkpoint, and reopen, including paths with spaces, URL-special characters,
 and literal glob characters. Unscannable paths are rejected before import.
 
 These checks establish the implemented storage and CLI behavior. Full GQL
-conformance and explicit transactions remain separate tasks. Graph mutations
-and their validation are documented [separately](mutations.md).
+conformance remains unproven. [Explicit transactions](transactions.md) now combine
+multiple statements in one commit. [Graph mutations](mutations.md) document write
+semantics and limits.

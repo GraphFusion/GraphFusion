@@ -1,3 +1,6 @@
+mod transactions;
+pub use transactions::{TransactionAction, TransactionStatus};
+
 use crate::{
     catalog::*,
     gql as ast,
@@ -54,6 +57,9 @@ impl Default for SessionState {
 pub struct StatementResult {
     pub commit_seq: CommitSeq,
     pub affected_objects: usize,
+    /// Results inside an explicit transaction are provisional until COMMIT succeeds.
+    pub transaction_pending: bool,
+    pub transaction_action: Option<TransactionAction>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionResult {
@@ -69,6 +75,7 @@ pub struct Session {
     db: Database,
     state: SessionState,
     initial: SessionState,
+    transaction: Option<transactions::ExplicitTransaction>,
 }
 
 impl Session {
@@ -78,6 +85,7 @@ impl Session {
             db,
             initial: state.clone(),
             state,
+            transaction: None,
         }
     }
     pub fn state(&self) -> &SessionState {
@@ -86,26 +94,71 @@ impl Session {
     /// Executes one read-only GQL query through DataFusion and materializes Arrow results.
     /// Catalog/session commands continue to use `execute`.
     pub async fn query(&mut self, input: &str) -> Result<crate::QueryResult> {
-        crate::query::execute(&self.db, &self.state, input).await
+        let result = self.query_inner(input).await;
+        self.finish_request(result)
     }
-    /// Atomically replaces the current open graph with validated Arrow tables.
-    /// Persistent databases stage immutable Parquet files before publishing the manifest.
-    pub fn replace_graph_data(&mut self, data: crate::graph::GraphData) -> Result<CommitSeq> {
+    async fn query_inner(&mut self, input: &str) -> Result<crate::QueryResult> {
         if self.state.closed {
             return Err(Error::SessionClosed);
         }
-        let graph = self
-            .state
-            .current_graph
-            .ok_or_else(|| Error::InvalidReference("current graph is unset".into()))?;
-        let mut tx = StatementTxn::begin(&self.db)?;
-        tx.replace_graph_data(graph, data)?;
-        tx.commit()
+        let program = ast::parse(input)?;
+        if !program.definitions.is_empty() {
+            return Err(Error::UnsupportedFeature(
+                "procedure binding definitions".into(),
+            ));
+        }
+        let [ast::Statement::Query(query)] = program.statements.as_slice() else {
+            return Err(Error::UnsupportedFeature(
+                "query() requires exactly one read-only query".into(),
+            ));
+        };
+        self.run_query(query, program.at_schema.as_ref(), false)
+            .await
+    }
+    async fn run_query(
+        &mut self,
+        query: &ast::QueryStatement,
+        at_schema: Option<&ast::SchemaReference>,
+        allow_writes: bool,
+    ) -> Result<crate::QueryResult> {
+        let mut work = self.begin_statement(allow_writes && crate::query::has_mutations(query))?;
+        let mut result = crate::query::execute_statement(
+            &work.session.state,
+            work.tx.as_mut().unwrap(),
+            query,
+            at_schema,
+            allow_writes,
+        )
+        .await?;
+        let outcome = work.finish(None)?;
+        result.commit_seq = outcome.commit_seq;
+        result.transaction_pending = outcome.transaction_pending;
+        Ok(result)
+    }
+    /// Atomically replaces the current open graph with validated Arrow tables.
+    /// Persistent databases stage immutable Parquet files before publishing the manifest.
+    /// In an explicit transaction this stages a change and returns its starting snapshot
+    /// sequence; durability is acknowledged separately by COMMIT.
+    pub fn replace_graph_data(&mut self, data: crate::graph::GraphData) -> Result<CommitSeq> {
+        let result = (|| {
+            let mut work = self.begin_statement(true)?;
+            let graph = work
+                .session
+                .state
+                .current_graph
+                .ok_or_else(|| Error::InvalidReference("current graph is unset".into()))?;
+            work.tx.as_mut().unwrap().replace_graph_data(graph, data)?;
+            Ok(work.finish(None)?.commit_seq)
+        })();
+        self.finish_request(result)
     }
     /// Sets a driver-provided value. References are checked in the snapshot of each use.
     pub fn set_parameter(&mut self, name: impl Into<String>, value: Value) -> Result<()> {
         if self.state.closed {
             return Err(Error::SessionClosed);
+        }
+        if matches!(self.transaction_status(), TransactionStatus::Failed { .. }) {
+            return Err(Error::TransactionFailed);
         }
         self.state.parameters.insert(
             name.into(),
@@ -117,28 +170,21 @@ impl Session {
         Ok(())
     }
     /// Runs a parsed GQL program containing catalog/session commands, queries and graph writes.
-    /// Top-level statements auto-commit. A later error does not undo earlier statements.
+    /// Top-level statements auto-commit unless START TRANSACTION opens an explicit transaction.
     pub async fn run(&mut self, input: &str) -> Result<Vec<StatementOutput>> {
+        let result = self.run_inner(input).await;
+        self.finish_request(result)
+    }
+    async fn run_inner(&mut self, input: &str) -> Result<Vec<StatementOutput>> {
         if self.state.closed {
             return Err(Error::SessionClosed);
         }
         let program = ast::parse(input)?;
-        if program.statements.iter().any(contains_transaction) {
-            return Err(Error::UnsupportedFeature(
-                "explicit transactions; statements auto-commit".into(),
-            ));
-        }
         if program.definitions.is_empty() && program.at_schema.is_some() {
             if let [ast::Statement::Query(query)] = program.statements.as_slice() {
                 return Ok(vec![StatementOutput::Query(
-                    crate::query::execute_statement(
-                        &self.db,
-                        &self.state,
-                        query,
-                        program.at_schema.as_ref(),
-                        true,
-                    )
-                    .await?,
+                    self.run_query(query, program.at_schema.as_ref(), true)
+                        .await?,
                 )]);
             }
         }
@@ -166,8 +212,7 @@ impl Session {
                     return Err(Error::UnsupportedFeature("NEXT query continuation".into()));
                 }
                 outputs.push(StatementOutput::Query(
-                    crate::query::execute_statement(&self.db, &self.state, &query, None, true)
-                        .await?,
+                    self.run_query(&query, None, true).await?,
                 ));
             } else {
                 outputs.push(StatementOutput::Command(self.execute_group(group)?));
@@ -175,18 +220,17 @@ impl Session {
         }
         Ok(outputs)
     }
-    /// Top-level statements commit separately. On an error, earlier statements remain committed.
+    /// Top-level statements commit separately unless an explicit transaction is active.
     /// NEXT continuations and linear catalog statements share one atomic internal transaction.
     pub fn execute(&mut self, input: &str) -> Result<ExecutionResult> {
+        let result = self.execute_inner(input);
+        self.finish_request(result)
+    }
+    fn execute_inner(&mut self, input: &str) -> Result<ExecutionResult> {
         if self.state.closed {
             return Err(Error::SessionClosed);
         }
         let program = ast::parse(input)?;
-        if program.statements.iter().any(contains_transaction) {
-            return Err(Error::UnsupportedFeature(
-                "explicit transactions; statements auto-commit".into(),
-            ));
-        }
         if !program.definitions.is_empty() || program.at_schema.is_some() {
             return Err(Error::UnsupportedFeature(
                 "procedure binding definitions".into(),
@@ -212,29 +256,42 @@ impl Session {
         Ok(results)
     }
     fn execute_group(&mut self, statements: &[ast::Statement]) -> Result<StatementResult> {
-        let mut tx = StatementTxn::begin(&self.db)?;
-        let mut next = self.state.clone();
+        if let [statement] = statements {
+            match statement {
+                ast::Statement::StartTransaction(start) => return self.start_transaction(start),
+                ast::Statement::Commit(_) => return self.commit_transaction(),
+                ast::Statement::Rollback(_) => return self.rollback_transaction(),
+                ast::Statement::SessionClose(_) => return self.close_session(),
+                _ => (),
+            }
+        }
+        let mut work = self.begin_statement(statements.iter().any(modifies_catalog))?;
+        let mut next = work.session.state.clone();
         let mut affected = 0;
         for statement in statements {
-            affected += execute_statement(&mut tx, &mut next, &self.initial, statement)?;
+            affected += execute_statement(
+                work.tx.as_mut().unwrap(),
+                &mut next,
+                &work.session.initial,
+                statement,
+            )?;
         }
-        let commit_seq = tx.commit()?;
-        self.state = next;
-        Ok(StatementResult {
-            commit_seq,
-            affected_objects: affected,
-        })
+        let mut result = work.finish(Some(next))?;
+        result.affected_objects = affected;
+        Ok(result)
     }
 }
 
-fn contains_transaction(statement: &ast::Statement) -> bool {
+fn modifies_catalog(statement: &ast::Statement) -> bool {
     match statement {
-        ast::Statement::StartTransaction(_)
-        | ast::Statement::Commit(_)
-        | ast::Statement::Rollback(_) => true,
-        ast::Statement::LinearCatalog(items) => items.iter().any(contains_transaction),
-        ast::Statement::Next(next) => contains_transaction(&next.statement),
-        // Query and procedure bodies are rejected without effects by this catalog-only executor.
+        ast::Statement::CreateSchema(_)
+        | ast::Statement::DropSchema(_)
+        | ast::Statement::CreateGraph(_)
+        | ast::Statement::DropGraph(_)
+        | ast::Statement::CreateGraphType(_)
+        | ast::Statement::DropGraphType(_) => true,
+        ast::Statement::LinearCatalog(items) => items.iter().any(modifies_catalog),
+        ast::Statement::Next(next) => modifies_catalog(&next.statement),
         _ => false,
     }
 }
@@ -407,10 +464,10 @@ fn execute_statement(
             }
             Ok(0)
         }
-        S::SessionClose(_) => {
-            session.parameters.clear();
-            session.closed = true;
-            Ok(0)
+        S::SessionClose(_) | S::StartTransaction(_) | S::Commit(_) | S::Rollback(_) => {
+            Err(Error::UnsupportedFeature(
+                "transaction controls and SESSION CLOSE in NEXT/linear groups".into(),
+            ))
         }
         _ => Err(Error::UnsupportedFeature(
             "graph query/data execution or procedure calls".into(),

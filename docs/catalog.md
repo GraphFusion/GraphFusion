@@ -31,7 +31,7 @@ requires Rust 1.94 to integrate DataFusion 55.1.
 
 `Database::with_catalog` inspects a statement snapshot. `create_directory` is an
 administrative operation for provisioning directory paths. `checkpoint` attempts
-a checkpoint, returning `Error::Busy` if a statement in any process pins a
+a checkpoint, returning `Error::Busy` if a statement or transaction in any process pins a
 snapshot. There is no automatic checkpoint scheduler yet; callers should retry
 checkpointing at idle points. `statistics` reports commits, conflicts, lock wait,
 recovery/checkpoint time, busy checkpoints, and log bytes. Counts are process local.
@@ -68,16 +68,17 @@ supported; named timezone evaluation, general expression/query evaluation,
 external graph-type imports and graph data copying return `UnsupportedFeature`.
 Typed closed graph references currently require an exact bound definition match.
 
-Top-level statements auto-commit individually. `NEXT` continuations and linear
-catalog statements share one atomic statement transaction, including staged
-session changes. A batch stops on error; earlier successful top-level statements
-remain committed. Explicit transaction controls are rejected before executing any
-top-level effects. The parser still accepts transaction syntax. This runtime
-scope is not a claim that GQL lacks explicit transactions.
+Top-level statements auto-commit individually unless START TRANSACTION opens an
+[explicit transaction](transactions.md). NEXT continuations and linear catalog
+statements are atomic, including per-statement session changes. Explicit
+transactions accumulate catalog and graph changes until COMMIT; a failed
+statement fails the transaction. Earlier autocommitted statements survive later
+errors. Successful session characteristic changes remain after ROLLBACK.
 
 ## Snapshots and optimistic validation
 
-Each statement owns a lifecycle lease and an `Arc<PublishedState>` containing:
+Each autocommit statement or explicit transaction owns a lifecycle lease and an
+`Arc<PublishedState>` containing:
 
 - one commit sequence;
 - the immutable catalog root;
@@ -86,7 +87,8 @@ Each statement owns a lifecycle lease and an `Arc<PublishedState>` containing:
 
 Catalog changes use copy-on-write mappings and shared immutable entries. Writes
 and read dependencies remain private until commit. Lookup checks the private
-catalog view first, so a compound statement sees its own DDL.
+catalog view first, so compound statements and later statements in one explicit
+transaction see their own DDL.
 
 The read set tracks object versions, name bindings (including absent-name
 versions), directory membership scans, and reverse dependency scans. Commit
@@ -95,15 +97,16 @@ only the transaction's delta to that state, preserving disjoint concurrent
 changes. Membership changes do not change the container object's own version, so
 two independent creates in the same schema can both commit.
 
-The storage participant checks write-write conflicts on individual row keys and
-retains tombstones. Data reads use the starting storage root, while writes also
-record the graph definition dependency. Thus data uses snapshot isolation while
-catalog dependencies are validated for serializability; the entire database is
-not claimed to be serializable.
+Every public GQL graph read records the graph version, including empty reads.
+Write commit checks these along with catalog dependencies accumulated across all
+statements, providing optimistic serializable validation at graph granularity.
+The internal row-key store remains a commit-protocol test participant and is not
+exposed as a query storage engine.
 
-Read-only statements finish against their starting snapshot. Session handles do
-not pin snapshots between calls. Results are currently materialized DDL results;
-no externally held data cursor can prolong a lease.
+Read-only work finishes against its starting snapshot. Active explicit
+transactions retain that snapshot and lifecycle lease between API calls;
+autocommit statements release theirs after materialization. Returned Arrow
+batches do not prolong the lease.
 
 ## Multi-process coordination
 
@@ -114,12 +117,13 @@ also share a process-local coordinator.
 
 The lock order is:
 
-1. Lifecycle shared lock for statements, exclusive lock for checkpoints.
+1. Lifecycle shared lock for statements/transactions, exclusive lock for checkpoints.
 2. Process-local state mutex.
 3. Cross-process commit lock.
 
-Opening and statement start refresh from durable files under the commit lock.
-Statement execution releases that lock. Commit acquires it again, refreshes,
+Opening and transaction/autocommit start refresh from durable files under the
+commit lock. Statement execution releases that lock; subsequent statements in an
+explicit transaction keep the captured snapshot. Commit acquires it again, refreshes,
 validates, persists, and publishes. A writer process can die at any point; OS
 locks release when its descriptors close. No shared-memory pointer or process
 local reference count is used as authority for another process's readers.

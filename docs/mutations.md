@@ -85,7 +85,8 @@ RETURN or FINISH pipeline, executes successfully. Graph-wide identity, endpoint,
 and property-layout validation runs before publication. The coordinator then
 stages Parquet files and commits their manifests and identity counters together.
 An error in a later clause or result publishes none of that statement's writes.
-Top-level semicolon-separated statements still auto-commit independently.
+Top-level semicolon-separated statements auto-commit independently unless enclosed
+in an [explicit transaction](transactions.md); then all statements publish together.
 
 Graph read versions are checked when a statement writes. This includes a graph
 whose values were read to calculate a change to another graph. Concurrent
@@ -105,8 +106,8 @@ older formats are rejected and migration is not yet implemented.
 
 This first writer materializes the complete affected graph and rewrites its
 tables. It does not yet provide incremental file deltas, streaming writes,
-compaction, indexes, typed-graph constraint enforcement, explicit transactions,
-or query NEXT continuations. Mutating a binding from a different working graph
+compaction, indexes, typed-graph constraint enforcement, or query NEXT
+continuations. Explicit transactions now coordinate multiple write statements. Mutating a binding from a different working graph
 is rejected. [Relational queries](relational.md) now support OPTIONAL MATCH, FOR,
 aggregation and query composition. Path search and remaining query limitations
 still apply; full GQL standard conformance is unproven.

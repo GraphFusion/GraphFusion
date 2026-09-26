@@ -15,5 +15,9 @@ datafusion = { version = "55.1.0", default-features = false, features = ["math_e
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync"] }
+
 [lints]
 workspace = true

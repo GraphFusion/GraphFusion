@@ -254,6 +254,9 @@ impl Disk {
                 failpoint("parquet_wal_commit");
             }
             inject_io_error("wal_sync")?;
+            if graph_commit {
+                inject_io_error("parquet_wal_sync")?;
+            }
             file.sync_all()?;
             failpoint("wal_sync");
             if graph_commit {

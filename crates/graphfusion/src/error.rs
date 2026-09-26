@@ -17,6 +17,10 @@ pub enum Error {
     Conflict(String),
     InvalidReference(String),
     SessionClosed,
+    TransactionActive,
+    NoTransaction,
+    TransactionFailed,
+    ReadOnlyTransaction,
     Busy,
     CommitUnknown(io::Error),
     Poisoned,
@@ -38,7 +42,13 @@ impl fmt::Display for Error {
             Self::Conflict(s) => write!(f, "transaction conflict: {s}"),
             Self::InvalidReference(s) => write!(f, "invalid reference: {s}"),
             Self::SessionClosed => write!(f, "session is closed"),
-            Self::Busy => write!(f, "active statements prevent checkpoint"),
+            Self::TransactionActive => write!(f, "a transaction is already active"),
+            Self::NoTransaction => write!(f, "no explicit transaction is active"),
+            Self::TransactionFailed => write!(f, "transaction is failed; ROLLBACK is required"),
+            Self::ReadOnlyTransaction => {
+                write!(f, "writes are forbidden in a READ ONLY transaction")
+            }
+            Self::Busy => write!(f, "active statements or transactions prevent checkpoint"),
             Self::CommitUnknown(e) => {
                 write!(f, "commit outcome is unknown; reopen before retrying: {e}")
             }

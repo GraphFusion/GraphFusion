@@ -55,17 +55,21 @@ programs and multiple top-level statements before any command can execute.
 ## Results and snapshots
 
 `QueryResult` includes the Arrow schema even for empty results, batches, snapshot
-commit sequence, affected-element count, logical plans and physical plans. Results
+commit sequence, affected-element count, logical plans and physical plans.
+`transaction_pending` identifies results produced inside an
+[explicit transaction](transactions.md); the separate COMMIT result acknowledges
+durability. Results
 include the plans executed at each materialization barrier, including optional
 input buffers and selected OTHERWISE branches.
 Plan text is diagnostic rather than a stable serialization format and can contain
 bound parameter values; it is returned to the caller and is not logged.
 `graphfusion::arrow` re-exports the matching Arrow version for consumers.
 
-The statement lease remains alive across physical planning and collection.
-Materialization finishes before the lease is released, so a caller holding batches
-does not pin catalog files. Failed queries release their leases and do not modify
-catalog/session state. Streaming and prepared statements need separate lifetime
+The lifecycle lease remains alive across physical planning and collection, and
+between calls in an active explicit transaction. A caller holding materialized
+batches alone does not pin catalog files. Failed queries discard pending database
+changes and release the lease; an explicit transaction enters Failed and requires
+ROLLBACK or SESSION CLOSE. Streaming and prepared statements need separate lifetime
 and invalidation contracts and are not exposed yet.
 
 DataFusion 55.1 requires Rust 1.94. This PR raises the workspace MSRV and its CI

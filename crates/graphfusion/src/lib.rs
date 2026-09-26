@@ -18,7 +18,8 @@ pub use error::{Error, Result};
 use persistence::Disk;
 pub use query::QueryResult;
 pub use session::{
-    ExecutionResult, Parameter, Session, SessionState, StatementOutput, StatementResult, Value,
+    ExecutionResult, Parameter, Session, SessionState, StatementOutput, StatementResult,
+    TransactionAction, TransactionStatus, Value,
 };
 use std::{
     collections::HashMap,
@@ -162,8 +163,8 @@ impl Database {
         tx.commit()?;
         Ok(parent)
     }
-    /// Returns Busy instead of waiting for an active statement, which might belong to this
-    /// thread. Retry after statements have released their snapshots.
+    /// Returns Busy instead of waiting for an active statement or explicit transaction,
+    /// which might belong to this thread. Retry after snapshot leases are released.
     pub fn checkpoint(&self) -> Result<()> {
         self.check_healthy()?;
         let started = Instant::now();
