@@ -203,6 +203,7 @@ pub(super) fn result(
 ) -> Result<LogicalPlanBuilder> {
     let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
     let mut aliases = BTreeMap::new();
+    let mut result_scope = scope.clone();
     let mut projections = Vec::new();
     for (i, item) in body.result_clause.items.iter().enumerate() {
         if matches!(item.expr, ast::Expr::Wildcard) {
@@ -231,12 +232,34 @@ pub(super) fn result(
                     "duplicate result column {name}"
                 )));
             }
+            // Output names shadow input names in grouping, HAVING and ordering.
+            // Carry the source's lookup metadata along with its value expression,
+            // always resolving against the input scope (aliases are simultaneous).
+            result_scope.scalars.remove(&name);
+            result_scope.elements.remove(&name);
+            result_scope.references.remove(&name);
+            let source = match &item.expr {
+                ast::Expr::Identifier(source) => Some(&source.value),
+                _ => None,
+            };
+            if let Some(column) = source.and_then(|source| scope.scalars.get(source)) {
+                result_scope.scalars.insert(name.clone(), column.clone());
+            }
+            if let Some(element) = source.and_then(|source| scope.elements.get(source)) {
+                result_scope.elements.insert(name.clone(), element.clone());
+            }
+            if let Some(reference) = source.and_then(|source| scope.references.get(source)) {
+                result_scope
+                    .references
+                    .insert(name.clone(), reference.clone());
+            }
             projections.push((name, expr));
         }
     }
     if projections.is_empty() {
         return Err(Error::InvalidQuery("result has no bound columns".into()));
     }
+    let scope = &result_scope;
     let binder = Binder::with_bindings(session, plan.schema(), scope)
         .aggregating()
         .aliases(&aliases);
@@ -260,41 +283,39 @@ pub(super) fn result(
     if explicit {
         for expr in &body.group_by {
             if let ast::Expr::Identifier(name) = expr {
-                if !aliases.contains_key(&name.value) {
-                    if let Some(reference) = scope.references.get(&name.value) {
-                        let scalar = scope.scalars.get(&name.value).expect("scalar reference");
-                        groups.push(Expr::Column(scalar.clone()));
-                        groups.extend(
-                            plan.schema()
-                                .columns()
-                                .into_iter()
-                                .filter(|c| {
-                                    c.relation.as_ref().is_some_and(|r| {
-                                        reference.parts.iter().any(|p| r.table() == p.alias)
-                                            || scope
-                                                .elements
-                                                .get(&name.value)
-                                                .is_some_and(|p| r.table() == p.alias)
-                                    })
+                if let Some(reference) = scope.references.get(&name.value) {
+                    let scalar = scope.scalars.get(&name.value).expect("scalar reference");
+                    groups.push(Expr::Column(scalar.clone()));
+                    groups.extend(
+                        plan.schema()
+                            .columns()
+                            .into_iter()
+                            .filter(|c| {
+                                c.relation.as_ref().is_some_and(|r| {
+                                    reference.parts.iter().any(|p| r.table() == p.alias)
+                                        || scope
+                                            .elements
+                                            .get(&name.value)
+                                            .is_some_and(|p| r.table() == p.alias)
                                 })
-                                .map(Expr::Column),
-                        );
-                        continue;
-                    }
-                    if let Some(binding) = scope.elements.get(&name.value) {
-                        groups.extend(
-                            plan.schema()
-                                .columns()
-                                .into_iter()
-                                .filter(|c| {
-                                    c.relation
-                                        .as_ref()
-                                        .is_some_and(|r| r.table() == binding.alias)
-                                })
-                                .map(Expr::Column),
-                        );
-                        continue;
-                    }
+                            })
+                            .map(Expr::Column),
+                    );
+                    continue;
+                }
+                if let Some(binding) = scope.elements.get(&name.value) {
+                    groups.extend(
+                        plan.schema()
+                            .columns()
+                            .into_iter()
+                            .filter(|c| {
+                                c.relation
+                                    .as_ref()
+                                    .is_some_and(|r| r.table() == binding.alias)
+                            })
+                            .map(Expr::Column),
+                    );
+                    continue;
                 }
             }
             let group = binder.bind(expr)?;

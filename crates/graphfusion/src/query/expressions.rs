@@ -190,7 +190,14 @@ impl<'a> Binder<'a> {
                 }
             }
             E::ElementId { variable } => {
-                if let Some(column) = self.bindings.and_then(|b| b.scalars.get(&variable.value)) {
+                if self
+                    .aliases
+                    .is_some_and(|aliases| aliases.contains_key(&variable.value))
+                {
+                    super::path_values::identity(self.reference(&variable.value)?, self.schema)?
+                } else if let Some(column) =
+                    self.bindings.and_then(|b| b.scalars.get(&variable.value))
+                {
                     super::path_values::identity(Expr::Column(column.clone()), self.schema)?
                 } else {
                     self.element(&variable.value)?.identity()

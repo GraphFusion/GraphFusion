@@ -78,6 +78,77 @@ async fn optional_and_conditional_references_are_real_null_values() {
 }
 
 #[tokio::test]
+async fn optional_matches_preserve_incoming_reference_bindings() {
+    let mut s = graph().await;
+    check(&mut s, "MATCH (a {name:'C'}) LET r=a OPTIONAL MATCH (r)-[:E]->(b) RETURN r.name AS name,r IS NULL AS absent,SAME(r,a) AS same,b IS NULL AS missing", &[&["C","false","true","true"]]).await;
+    check(&mut s, "MATCH (a {name:'C'}) FOR r IN [a,a,NULL] OPTIONAL MATCH (r)-[:E]->(b) RETURN r.name AS name,r IS NULL AS absent,b.name AS target ORDER BY name", &[&["C","false","NULL"], &["C","false","NULL"], &["NULL","true","NULL"]]).await;
+    check(&mut s, "MATCH (a {name:'A'}) LET r=a OPTIONAL MATCH (r)-[:E]->(b) RETURN r.name AS name,b.name AS target", &[&["A","B"]]).await;
+    check(
+        &mut s,
+        "MATCH (a {name:'C'}) LET r=a OPTIONAL MATCH (r)-[:E]->(b) MATCH (r) RETURN r.name AS name",
+        &[&["C"]],
+    )
+    .await;
+    check(&mut s, "MATCH (a {name:'C'}) LET r=a OPTIONAL { MATCH (r)-[:U]-(b) MATCH (b)-[:E]->(c) } RETURN r.name AS name,b IS NULL AS missing,c IS NULL AS absent", &[&["C","true","true"]]).await;
+    check(&mut s, "MATCH ()-[e:E]->() LET r=e OPTIONAL MATCH (x {name:'C'})-[r]->(y) RETURN r.name AS name,r IS NULL AS absent,x IS NULL AS missing", &[&["AB","false","true"]]).await;
+    check(&mut s, "MATCH ()-[e:E]->() LET r=e OPTIONAL MATCH (x {name:'C'})-[r]->(y) MATCH (origin)-[r]->(target) RETURN r.name AS name,origin.name AS origin,target.name AS target", &[&["AB","A","B"]]).await;
+    check(
+        &mut s,
+        "LET r=NULL OPTIONAL MATCH (r)-[:E]->(b) RETURN r.name AS name,r IS NULL AS absent",
+        &[&["NULL", "true"]],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn output_reference_aliases_resolve_properties_before_input_names() {
+    let mut s = graph().await;
+    for query in [
+        "MATCH (n) LET r=n RETURN r AS x,n.name AS name ORDER BY x.name DESC",
+        "MATCH (n) RETURN n AS x,n.name AS name ORDER BY x.name DESC",
+        "MATCH (n),(x {name:'A'}) LET r=n RETURN r AS x,n.name AS name ORDER BY x.name DESC",
+        "MATCH (n),(a {name:'A'}) LET x=a,r=n RETURN r AS x,n.name AS name ORDER BY x.name DESC",
+        "MATCH (n) LET r=n RETURN r AS n,n.name AS name ORDER BY n.name DESC",
+        "MATCH (n) RETURN NULL AS n,n.name AS name ORDER BY n.name,name DESC",
+        "MATCH (n) RETURN NULL AS n,n.name AS name ORDER BY ELEMENT_ID(n),name DESC",
+        "MATCH (n) LET r=n RETURN NULL AS r,n.name AS name ORDER BY ELEMENT_ID(r),name DESC",
+    ] {
+        let result = s
+            .query(query)
+            .await
+            .unwrap_or_else(|e| panic!("{query}\n{e}"));
+        let names = rows(&result)
+            .into_iter()
+            .map(|row| row[1].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["C", "B", "A"], "{query}");
+    }
+    assert!(s
+        .query("MATCH (n) RETURN 1 AS n ORDER BY n.name")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn projected_reference_aliases_keep_grouping_lookup_columns() {
+    let mut s = graph().await;
+    for query in [
+        "MATCH (n) LET r=n FOR duplicate IN [1,2] RETURN r,r.name AS name,COUNT(*) AS count GROUP BY r ORDER BY name",
+        "MATCH (n) LET r=n FOR duplicate IN [1,2] RETURN r AS x,r.name AS name,COUNT(*) AS count GROUP BY x ORDER BY x.name",
+        "MATCH (n) LET r=n FOR duplicate IN [1,2] RETURN r AS n,r.name AS name,COUNT(*) AS count GROUP BY n ORDER BY name",
+        "MATCH (n) FOR duplicate IN [1,2] RETURN n AS x,n.name AS name,COUNT(*) AS count GROUP BY x ORDER BY name",
+        "SELECT r AS x,r.name AS name,COUNT(*) AS count FROM { MATCH (n) FOR duplicate IN [1,2] RETURN n AS r } GROUP BY x HAVING x.v > 0 ORDER BY x.name",
+    ] {
+        let result = s.query(query).await.unwrap_or_else(|e| panic!("{query}\n{e}"));
+        let values = rows(&result).into_iter().map(|row| {
+            assert_ne!(row[0], "NULL", "{query}");
+            row[1..].to_vec()
+        }).collect::<Vec<_>>();
+        assert_eq!(values, [["A", "2"], ["B", "2"], ["C", "2"]], "{query}");
+    }
+}
+
+#[tokio::test]
 async fn derived_queries_and_collected_elements_keep_reference_sources() {
     let mut s = graph().await;
     check(

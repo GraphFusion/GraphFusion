@@ -21,6 +21,7 @@ pub(super) async fn optional(
     ctx: &SessionContext,
     trace: &mut Trace,
 ) -> Result<LogicalPlanBuilder> {
+    let incoming = scope.clone();
     let row = scope.fresh("optional_row");
     let input = execution::ordinal(plan, ctx, trace, &row).await?;
     let input_columns = input.schema().columns();
@@ -58,6 +59,10 @@ pub(super) async fn optional(
     let right = execution::freeze(matches.project(right_columns)?, ctx, trace, None)
         .await?
         .build()?;
+    // Only new variables inherit null-extended element bindings. A reference
+    // constrained within the optional match retains its incoming binding outside it.
+    scope.elements.retain(|name, _| !incoming.contains(name));
+    scope.elements.extend(incoming.elements);
     let output = input_columns
         .into_iter()
         .filter(|c| c.name != row)
