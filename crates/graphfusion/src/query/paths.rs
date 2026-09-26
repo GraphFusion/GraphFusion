@@ -48,6 +48,21 @@ impl State {
             edges: array_append(self.edges.clone(), edge),
         }
     }
+    pub fn concat(&self, next: &Self) -> Self {
+        use datafusion::functions_nested::expr_fn::array_concat;
+        Self {
+            nodes: array_concat(vec![
+                self.nodes.clone(),
+                array_slice(
+                    next.nodes.clone(),
+                    lit(2_i64),
+                    cast(array_length(next.nodes.clone()), DataType::Int64),
+                    None,
+                ),
+            ]),
+            edges: array_concat(vec![self.edges.clone(), next.edges.clone()]),
+        }
+    }
     pub fn start(&self) -> Expr {
         array_element(self.nodes.clone(), lit(1_i64))
     }
@@ -387,6 +402,7 @@ pub(super) fn expand(
         );
         let value = super::path_values::references(lit(graph_id), None, Some(ids));
         let column = scope.scalar(&name.value);
+        scope.groups.insert(name.value.clone());
         let mut output: Vec<_> = result
             .schema()
             .columns()

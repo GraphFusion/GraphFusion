@@ -120,6 +120,34 @@ fn cli_recursive_paths_use_parquet_after_independent_process_reopen() {
 }
 
 #[test]
+fn cli_complex_patterns_and_unbounded_shortest_survive_parquet_restart() {
+    let fixture = Fixture::new();
+    fixture.run(
+        "run",
+        &[
+            "--create",
+            "--query",
+            include_str!("../../../examples/path-patterns.gql"),
+        ],
+    );
+    fixture.run("checkpoint", &[]);
+    let query = "USE GRAPH routes MATCH p = (a {name:'A'})((x)-[edges:Link]->(y)){0,2}(b) RETURN COUNT(*) AS paths, MAX(PATH_LENGTH(p)) AS longest";
+    let output = fixture.run("run", &["--query", query, "--explain"]);
+    assert!(output.contains("file_type=parquet"), "{output}");
+    assert!(output.contains("RecursiveQueryExec"), "{output}");
+    let compact: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("|5|2|"), "{output}");
+    let query = "USE GRAPH routes MATCH REPEATABLE ELEMENTS p = ALL SHORTEST (a {name:'A'})-[:Link]->+(b {name:'D'}) RETURN COUNT(*) AS ties, MAX(PATH_LENGTH(p)) AS hops";
+    let output = fixture.run("run", &["--query", query]);
+    let compact: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("|2|2|"), "{output}");
+    let query = "USE GRAPH routes MATCH p = (a {name:'A'})(-[e:Link]->(b))? RETURN COUNT(*) AS paths, COUNT(e) AS present";
+    let output = fixture.run("run", &["--query", query]);
+    let compact: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("|3|2|"), "{output}");
+}
+
+#[test]
 fn cli_import_query_and_checkpoint_survive_independent_processes() {
     let fixture = Fixture::new();
     fs::write(fixture.0.join("setup.gql"), "CREATE GRAPH social ANY GRAPH; SESSION SET GRAPH social; RETURN 'text;--still text' AS value;").unwrap();

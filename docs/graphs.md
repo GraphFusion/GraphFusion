@@ -80,7 +80,8 @@ returns null.
 
 [Relational queries](relational.md) implement optional matches, aggregate results
 and SELECT FROM graph forms. Whole directly matched element values,
-parenthesized path expressions and graph YIELD/KEEP remain unimplemented. Reusing one variable as a different kind or across different
+graph YIELD/KEEP remain unimplemented. [Complex paths](path-patterns.md) cover
+parenthesized expressions, repetition, alternatives and conditional variables. Reusing one variable as a different kind or across different
 graphs is rejected. These limits are explicit errors, not partial query results.
 
 ## Snapshot and persistence boundaries

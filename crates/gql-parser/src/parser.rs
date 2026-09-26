@@ -3647,27 +3647,6 @@ impl Parser {
                 None
             };
         let prefix = self.parse_optional_path_pattern_prefix()?;
-        if self.starts_parenthesized_path_pattern_expression() {
-            let parenthesized = self.parse_parenthesized_path_pattern_expression()?;
-            let start = parenthesized.pattern.start.clone();
-            let chains = parenthesized.pattern.chains.clone();
-            let factors = vec![PathPatternFactor::Parenthesized(Box::new(
-                parenthesized.clone(),
-            ))];
-            let alternation = parenthesized.pattern.alternation;
-            let alternatives = parenthesized.pattern.alternatives.clone();
-            return Ok(PathPattern {
-                variable,
-                prefix,
-                parenthesized: Some(parenthesized),
-                start,
-                chains,
-                factors,
-                alternation,
-                alternatives,
-            });
-        }
-
         let PathPatternTerm {
             start,
             chains,
@@ -3683,10 +3662,19 @@ impl Parser {
                 alternatives.push(self.parse_path_pattern_term()?);
             }
         }
+        let parenthesized = match factors.as_slice() {
+            [PathPatternFactor::Parenthesized(group)] if alternatives.is_empty() => {
+                Some((**group).clone())
+            }
+            _ => None,
+        };
+        let (start, chains) = parenthesized.as_ref().map_or((start, chains), |group| {
+            (group.pattern.start.clone(), group.pattern.chains.clone())
+        });
         Ok(PathPattern {
             variable,
             prefix,
-            parenthesized: None,
+            parenthesized,
             start,
             chains,
             factors,
@@ -3733,6 +3721,12 @@ impl Parser {
             };
         let prefix = self.parse_optional_path_mode_prefix();
         let pattern = self.parse_path_pattern()?;
+        if pattern.variable.is_some() || pattern.prefix.is_some() {
+            return Err(Error::Message {
+                offset: self.peek().offset,
+                message: "a parenthesized path body is a path expression; additional declarations or search prefixes are not allowed".into(),
+            });
+        }
         let where_clause = if self.eat(TokenKind::Where).is_some() {
             Some(self.parse_expr()?)
         } else {
