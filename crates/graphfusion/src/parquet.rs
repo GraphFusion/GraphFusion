@@ -18,8 +18,18 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
+    path::Path,
     sync::Arc,
 };
+
+fn table_url(path: &Path) -> Result<ListingTableUrl> {
+    // Plain paths are interpreted as glob patterns by ListingTableUrl::parse.
+    let url = url::Url::from_file_path(path)
+        .map_err(|_| Error::UnsupportedFeature("invalid Parquet database path".into()))?;
+    ListingTableUrl::try_new(url, None).map_err(|error| {
+        Error::UnsupportedFeature(format!("unscannable Parquet database path: {error}"))
+    })
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct GraphManifest {
@@ -62,11 +72,8 @@ impl TableManifest {
     fn open(&self, disk: &Disk, edge: bool) -> Result<Table> {
         let mut table = self.empty_table(edge)?;
         let path = disk.directory.join(self.name());
-        let path = path
-            .to_str()
-            .ok_or_else(|| Error::UnsupportedFeature("non-UTF-8 database path".into()))?;
         table.provider = Arc::new(ListingTable::try_new(
-            ListingTableConfig::new(ListingTableUrl::parse(path)?)
+            ListingTableConfig::new(table_url(&path)?)
                 .with_listing_options(ListingOptions::new(Arc::new(ParquetFormat::default())))
                 .with_schema(self.schema.clone()),
         )?);
@@ -146,6 +153,8 @@ impl GraphManifest {
 impl Disk {
     pub fn write_graph_table(&self, id: ObjectId, table: &Table) -> Result<TableManifest> {
         let path = self.directory.join(format!("graph-{id}.parquet"));
+        // Reject paths the query provider cannot read before staging or committing data.
+        table_url(&path)?;
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = ArrowWriter::try_new(file.try_clone()?, table.schema.clone(), None)
             .map_err(datafusion::error::DataFusionError::from)?;

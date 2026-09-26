@@ -67,6 +67,8 @@ The importer currently requires memory proportional to the full input and is not
 a streaming bulk loader. Empty manifests replace the graph with an empty graph;
 empty tables retain their property schema. Typed graph import awaits schema
 enforcement and is rejected before staging files.
+Persistent graph imports require a UTF-8 database path without ASCII control
+characters. Unsupported paths are rejected before staging graph files.
 
 For a self-contained example, use a new directory:
 
@@ -121,7 +123,8 @@ an old scan across replacement and DROP, and missing/truncated/corrupt files.
 Integration tests compare Arrow and Parquet query results for multi-label layouts,
 null/missing properties, parallel edges, directed and undirected traversal, and
 multi-hop joins. CLI tests use independent processes for import, query,
-checkpoint, and reopen, including paths with spaces and URL-special characters.
+checkpoint, and reopen, including paths with spaces, URL-special characters,
+and literal glob characters. Unscannable paths are rejected before import.
 
 These checks establish the implemented storage and CLI behavior. Full GQL
 conformance, graph mutations, and explicit transactions remain separate tasks.

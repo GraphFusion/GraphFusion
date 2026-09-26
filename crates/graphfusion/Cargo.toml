@@ -10,6 +10,7 @@ description = "GraphFusion graph database."
 gql-parser = { path = "../gql-parser" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+url = "2"
 datafusion = { version = "55.1.0", default-features = false, features = ["math_expressions", "string_expressions", "unicode_expressions", "recursive_protection", "parquet", "serde"] }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

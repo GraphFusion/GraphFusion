@@ -110,7 +110,7 @@ fn database() -> (Database, Session) {
 #[tokio::test]
 async fn parquet_matches_arrow_semantics_after_checkpoint_and_reopen() {
     let path = std::env::temp_dir().join(format!(
-        "graphfusion-layouts-{}-{}",
+        "graphfusion-layouts % # [data] * ?-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

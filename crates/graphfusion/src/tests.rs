@@ -1264,6 +1264,32 @@ fn parquet_files(dir: &TestDir) -> Vec<PathBuf> {
         .collect()
 }
 
+#[test]
+fn parquet_import_rejects_unscannable_paths_before_staging_files() {
+    let root = TestDir::new();
+    let dir = TestDir(root.0.join("control\n"));
+    let db = dir.open();
+    let mut session = db.session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    assert!(matches!(
+        session.replace_graph_data(arrow_graph(vec![1])),
+        Err(Error::UnsupportedFeature(_))
+    ));
+    assert!(parquet_files(&dir).is_empty());
+    let id = graph_id(&db, "g").unwrap();
+    assert_eq!(
+        StatementTxn::begin(&db)
+            .unwrap()
+            .graph_data(id)
+            .unwrap()
+            .node_count(),
+        0
+    );
+    db.checkpoint().unwrap();
+}
+
 #[tokio::test]
 async fn parquet_crash_matrix_atomically_publishes_catalog_and_graph() {
     for (point, committed) in [

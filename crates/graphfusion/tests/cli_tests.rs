@@ -15,7 +15,7 @@ struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "graphfusion-cli {} % # {}",
+            "graphfusion-cli {} % # [data] * ? [ {}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
