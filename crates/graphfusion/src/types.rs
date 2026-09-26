@@ -183,9 +183,12 @@ impl ValueType {
                 t.optional("scale", *scale);
                 t
             }
-            T::ApproximateNumeric { precision, .. } => {
+            T::ApproximateNumeric {
+                precision, scale, ..
+            } => {
                 let mut t = Self::scalar("float");
                 t.optional("precision", *precision);
+                t.optional("scale", *scale);
                 t
             }
             T::List(inner)
@@ -228,6 +231,7 @@ impl ValueType {
             T::DynamicUnion(types) => {
                 let mut t = Self::scalar("union");
                 t.arguments = types.iter().map(Self::bind).collect::<Result<_>>()?;
+                t.nullable = t.arguments.iter().any(|argument| argument.nullable);
                 t
             }
             T::GraphReference { body, .. } => {

@@ -739,6 +739,7 @@ fn eval(tx: &mut StatementTxn, session: &SessionState, expression: &ast::Expr) -
             ),
             (ast::UnaryOp::Neg, Value::Float(value)) => Value::Float(-value),
             (ast::UnaryOp::Not, Value::Boolean(value)) => Value::Boolean(!value),
+            (ast::UnaryOp::Not, Value::Null) => Value::Null,
             _ => return Err(Error::InvalidDefinition("invalid unary operand".into())),
         },
         _ => {

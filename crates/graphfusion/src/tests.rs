@@ -148,6 +148,67 @@ fn graph_types_and_restrict_survive_recovery() {
 }
 
 #[test]
+fn nested_definitions_are_rejected_before_commit_or_remain_recoverable() {
+    // Exercise both sides of the JSON recursion limit, including checkpoint envelopes.
+    let mut accepted = 0;
+    let mut rejected = 0;
+    for depth in 54..=60 {
+        for prefix in ["CREATE GRAPH g", "CREATE GRAPH TYPE t AS"] {
+            let dir = TestDir::new();
+            let db = dir.open();
+            let mut session = db.session();
+            let value_type = format!("{}INTEGER{}", "LIST<".repeat(depth), ">".repeat(depth));
+            let statement = format!("{prefix} {{ NODE N {{ value {value_type} }} }}");
+            let before = db.inner.state.lock().unwrap().commit_seq;
+            let committed = match session.execute(&statement) {
+                Ok(_) => {
+                    accepted += 1;
+                    true
+                }
+                Err(Error::UnsupportedFeature(message)) => {
+                    assert!(message.contains("recursion limit"), "{message}");
+                    rejected += 1;
+                    assert_eq!(db.inner.state.lock().unwrap().commit_seq, before);
+                    false
+                }
+                Err(error) => panic!("depth {depth}: {error}"),
+            };
+            if depth == 60 {
+                assert!(!committed, "unsupported nesting was acknowledged");
+            }
+            session
+                .execute("CREATE GRAPH after_write ANY GRAPH")
+                .unwrap();
+            let count = db
+                .with_catalog(|c| c.children(MAIN_SCHEMA).count())
+                .unwrap();
+            assert_eq!(count, 1 + usize::from(committed));
+            drop(session);
+            drop(db);
+            let recovered = dir.open();
+            assert_eq!(
+                recovered
+                    .with_catalog(|c| c.children(MAIN_SCHEMA).count())
+                    .unwrap(),
+                count
+            );
+            recovered.checkpoint().unwrap();
+            drop(recovered);
+            let recovered = dir.open();
+            assert_eq!(
+                recovered
+                    .with_catalog(|c| c.children(MAIN_SCHEMA).count())
+                    .unwrap(),
+                count
+            );
+            assert!(graph_id(&recovered, "after_write").is_some());
+        }
+    }
+    assert!(accepted > 0);
+    assert!(rejected > 0);
+}
+
+#[test]
 fn batches_next_and_transaction_preflight() {
     let db = Database::new();
     let mut s = db.session();
@@ -221,6 +282,84 @@ fn values_are_typed_and_set_is_atomic() {
     .unwrap();
     s.execute("SESSION SET BINDING TABLE $copy BINDING TABLE {id INTEGER} = VARIABLE $rows")
         .unwrap();
+}
+
+#[test]
+fn dynamic_unions_preserve_component_nullability() {
+    let db = Database::new();
+    let mut session = db.session();
+    for initializer in ["12", "'text'"] {
+        session
+            .execute(&format!(
+                "SESSION SET VALUE $x INTEGER NOT NULL | STRING NOT NULL = {initializer}"
+            ))
+            .unwrap();
+        assert!(
+            !session.state().parameters["x"]
+                .declared_type
+                .as_ref()
+                .unwrap()
+                .nullable
+        );
+    }
+    let before = session.state().clone();
+    for initializer in ["NULL", "UNKNOWN"] {
+        assert!(matches!(
+            session.execute(&format!(
+                "SESSION SET VALUE $x INTEGER NOT NULL | STRING NOT NULL = {initializer}"
+            )),
+            Err(Error::InvalidDefinition(_))
+        ));
+        assert_eq!(*session.state(), before);
+    }
+    session
+        .execute("SESSION SET VALUE $nullable INTEGER | STRING = NULL")
+        .unwrap();
+    assert_eq!(session.state().parameters["nullable"].value, Value::Null);
+    assert!(
+        session.state().parameters["nullable"]
+            .declared_type
+            .as_ref()
+            .unwrap()
+            .nullable
+    );
+    session
+        .execute("SESSION SET VALUE $items LIST<INTEGER NOT NULL | STRING NOT NULL> = [1, 'two']")
+        .unwrap();
+    assert!(matches!(
+        session
+            .execute("SESSION SET VALUE $items LIST<INTEGER NOT NULL | STRING NOT NULL> = [NULL]"),
+        Err(Error::InvalidDefinition(_))
+    ));
+}
+
+#[test]
+fn unary_not_preserves_unknown_in_session_initializers() {
+    let db = Database::new();
+    let mut session = db.session();
+    for (expression, expected) in [
+        ("NOT TRUE", Value::Boolean(false)),
+        ("NOT FALSE", Value::Boolean(true)),
+        ("NOT UNKNOWN", Value::Null),
+        ("NOT NULL", Value::Null),
+        ("NOT NOT UNKNOWN", Value::Null),
+    ] {
+        session
+            .execute(&format!("SESSION SET VALUE $x BOOLEAN = {expression}"))
+            .unwrap();
+        assert_eq!(session.state().parameters["x"].value, expected);
+    }
+    let before = session.state().clone();
+    for statement in [
+        "SESSION SET VALUE $x BOOLEAN NOT NULL = NOT UNKNOWN",
+        "SESSION SET VALUE $x BOOLEAN = NOT 1",
+    ] {
+        assert!(matches!(
+            session.execute(statement),
+            Err(Error::InvalidDefinition(_))
+        ));
+        assert_eq!(*session.state(), before);
+    }
 }
 
 #[test]
@@ -594,6 +733,43 @@ fn checkpoint_crash_matrix_retains_joint_state() {
 }
 
 #[test]
+fn recovery_requires_a_durable_manifest_before_accepting_writes() {
+    let dir = TestDir::new();
+    let db = dir.open();
+    create_graph(&db, "before");
+    drop(db);
+    let crashed = child_command(&dir, "checkpoint")
+        .env("GRAPHFUSION_TEST_CRASH", "manifest_rename")
+        .output()
+        .unwrap();
+    assert_eq!(crashed.status.code(), Some(86));
+    let wal = dir.0.join("wal-1.log");
+    let before = fs::read(&wal).unwrap();
+    let failed = child_command(&dir, "recovery_sync_error")
+        .env("GRAPHFUSION_TEST_IO", "recovery_directory_sync")
+        .output()
+        .unwrap();
+    assert!(
+        failed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert_eq!(fs::read(&wal).unwrap(), before);
+    let recovered = child_command(&dir, "recovery_write").output().unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let db = dir.open();
+    assert!(graph_id(&db, "before").is_some());
+    assert!(graph_id(&db, "after_recovery").is_some());
+    db.checkpoint().unwrap();
+    drop(db);
+    assert!(graph_id(&dir.open(), "after_recovery").is_some());
+}
+
+#[test]
 fn corrupted_complete_records_fail_closed_and_torn_tail_is_removed() {
     let dir = TestDir::new();
     let db = dir.open();
@@ -769,6 +945,52 @@ fn integer_bounds_and_closed_reference_constraints_are_enforced() {
 }
 
 #[test]
+fn approximate_numeric_scale_survives_recovery_and_reference_checks() {
+    let dir = TestDir::new();
+    {
+        let db = dir.open();
+        db.session().execute("CREATE GRAPH TYPE floating AS { NODE N {v FLOAT(24,2)} }; CREATE GRAPH named TYPED floating; CREATE GRAPH inline { NODE N {v FLOAT(24,2)} }").unwrap();
+    }
+    // First recover from the WAL, then recover from a checkpoint.
+    for _ in 0..2 {
+        let db = dir.open();
+        db.with_catalog(|catalog| {
+            let entry = catalog
+                .lookup(MAIN_SCHEMA, ObjectKind::GraphType, "floating")
+                .unwrap();
+            let ObjectDefinition::GraphType(definition) = &entry.definition else {
+                panic!()
+            };
+            let value_type = &definition.nodes["N"].properties["v"];
+            assert_eq!(value_type.parameters.get("precision"), Some(&24));
+            assert_eq!(value_type.parameters.get("scale"), Some(&2));
+        })
+        .unwrap();
+        let mut session = db.session();
+        for graph in ["named", "inline"] {
+            session
+                .execute(&format!(
+                    "SESSION SET GRAPH $g GRAPH {{ NODE N {{v FLOAT(24,2)}} }} = {graph}"
+                ))
+                .unwrap();
+            let before = session.state().clone();
+            assert!(matches!(
+                session.execute(&format!(
+                    "SESSION SET GRAPH $g GRAPH {{ NODE N {{v FLOAT(24,4)}} }} = {graph}"
+                )),
+                Err(Error::InvalidDefinition(_))
+            ));
+            assert_eq!(*session.state(), before);
+        }
+        assert!(matches!(
+            session.execute("SESSION SET VALUE $bad FLOAT(24,25) = 1.0"),
+            Err(Error::InvalidDefinition(_))
+        ));
+        db.checkpoint().unwrap();
+    }
+}
+
+#[test]
 fn indeterminate_io_commit_requires_reopen_and_recovers_joint_state() {
     let dir = TestDir::new();
     let db = dir.open();
@@ -797,9 +1019,16 @@ fn child_worker() {
         OpenOptions {
             create_if_missing: mode == "initialize",
         },
-    )
-    .unwrap();
+    );
+    if mode == "recovery_sync_error" {
+        assert!(matches!(db, Err(Error::Io(_))), "{db:?}");
+        return;
+    }
+    let db = db.unwrap();
     match mode.as_str() {
+        "recovery_write" => {
+            create_graph(&db, "after_recovery");
+        }
         "create" => {
             let mut tx = StatementTxn::begin(&db).unwrap();
             tx.create_graph(

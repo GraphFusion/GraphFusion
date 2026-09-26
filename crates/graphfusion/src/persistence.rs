@@ -217,12 +217,21 @@ impl Disk {
         // A crashed writer can leave a complete but unsynced commit. Make it durable before
         // exposing it to a reader, including readers in a different OS process.
         log.sync_all()?;
+        // A checkpoint may have crashed after renaming MANIFEST but before syncing the
+        // directory. Persist the selected generation before accepting writes to its WAL.
+        inject_io_error("recovery_directory_sync")?;
+        sync_directory(&self.directory)?;
         Ok((state, manifest.generation))
     }
 
     pub fn append(&self, generation: u64, record: &LogRecord) -> Result<()> {
         let payload = serde_json::to_vec(record)?;
         let bytes = encode_frame(&payload)?;
+        // Serialization does not enforce the recovery deserializer's recursion limit.
+        // Reject unreadable records before writing any part of their commit frame.
+        serde_json::from_slice::<LogRecord>(&payload).map_err(|error| {
+            Error::UnsupportedFeature(format!("WAL record cannot be recovered: {error}"))
+        })?;
         let mut file = OpenOptions::new()
             .append(true)
             .open(self.path("wal", generation, "log"))?;
