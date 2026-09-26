@@ -1,0 +1,45 @@
+---
+title: Graph queries. Columnar execution.
+description: GraphFusion is an embedded Rust graph database that executes GQL through Apache DataFusion, with Arrow results and Parquet persistence.
+template: splash
+hero:
+  title: Graph queries. Columnar execution.
+  tagline: An embedded graph database in Rust. Express relationships in GQL, execute with Apache DataFusion, and work with Arrow and Parquet.
+  actions:
+    - text: Run your first graph query
+      link: /GraphFusion/start/quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: Explore supported features
+      link: /GraphFusion/start/status/
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## From a pattern to a result
+
+```gql test
+MATCH (person:Person {name: 'Alice'})-[:Knows]->(friend)-[:Knows]->(next)
+RETURN next.name AS friend_of_friend;
+```
+
+GraphFusion turns graph patterns into DataFusion plans. Scans, joins, recursive paths and aggregates run in the same query engine; results come back as Arrow batches.
+
+<CardGrid>
+  <Card title="GQL for connected data" icon="puzzle">Match relationships, explore paths, aggregate results and update a property graph with one language.</Card>
+  <Card title="Embedded in your application" icon="setting">Use the Rust API or the CLI. Start in memory, then open a local database directory when you need persistence.</Card>
+  <Card title="Arrow in memory, Parquet on disk" icon="document">Import columnar graph tables and consume Arrow results. Catalog and graph changes commit together.</Card>
+  <Card title="An explicit support boundary" icon="list-format">The runtime implements a growing subset of GQL. Every reference page distinguishes executable features from syntax-only support.</Card>
+</CardGrid>
+
+## Learn by doing
+
+<CardGrid>
+  <LinkCard title="Create your first graph" description="Insert Alice → Bob → Cara and query friends of friends." href="/GraphFusion/start/quickstart/" />
+  <LinkCard title="Find shortest paths" description="Understand selectors, ties, repeated groups and search limits." href="/GraphFusion/patterns/selectors/" />
+  <LinkCard title="Embed in Rust" description="Run queries and consume Arrow record batches." href="/GraphFusion/rust/embedding/" />
+  <LinkCard title="Make writes durable" description="Use transactions, Parquet storage and checkpoints." href="/GraphFusion/storage/transactions/" />
+</CardGrid>
+
+GraphFusion is under active development. It does not yet claim complete ISO GQL conformance. Start with the [support matrix](/GraphFusion/start/status/) and [operational limits](/GraphFusion/storage/limits/) when evaluating it for a workload.
