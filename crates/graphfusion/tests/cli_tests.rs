@@ -120,6 +120,39 @@ fn cli_recursive_paths_use_parquet_after_independent_process_reopen() {
 }
 
 #[test]
+fn cli_reference_lookups_and_mutations_survive_parquet_restart() {
+    let fixture = Fixture::new();
+    fixture.run(
+        "run",
+        &[
+            "--create",
+            "--query",
+            include_str!("../../../examples/element-references.gql"),
+        ],
+    );
+    fixture.run("checkpoint", &[]);
+    let query="USE GRAPH routes MATCH p=(a {name:'A'})-[:Link]->{2}(c) FOR item IN ELEMENTS(p) WITH ORDINALITY i RETURN i,item.name AS name,item IS LABELED Station AS station ORDER BY i";
+    let output = fixture.run("run", &["--query", query, "--explain"]);
+    assert!(output.contains("file_type=parquet"), "{output}");
+    assert!(output.contains("HashJoinExec"), "{output}");
+    let compact: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+    for row in [
+        "|1|A|true|",
+        "|2|AB|false|",
+        "|3|B|true|",
+        "|4|BC|false|",
+        "|5|C|true|",
+    ] {
+        assert!(compact.contains(row), "{output}");
+    }
+    let output=fixture.run("run", &["--query","USE GRAPH routes MATCH (n) LET r=n RETURN r.name AS name,r.visits AS visits ORDER BY name"]);
+    let compact: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+    for row in ["|A|0|", "|B|1|", "|C|1|"] {
+        assert!(compact.contains(row), "{output}");
+    }
+}
+
+#[test]
 fn cli_complex_patterns_and_unbounded_shortest_survive_parquet_restart() {
     let fixture = Fixture::new();
     fixture.run(

@@ -1,0 +1,15 @@
+CREATE GRAPH routes ANY;
+SESSION SET GRAPH routes;
+INSERT (a:Station {name:'A',visits:0}), (b:Station {name:'B',visits:0}),
+       (c:Station {name:'C',visits:0}),
+       (a)-[:Link {name:'AB',distance:5}]->(b),
+       (b)-[:Link {name:'BC',distance:7}]->(c);
+MATCH p = (a {name:'A'})-[:Link]->{2}(c)
+FOR item IN ELEMENTS(p) WITH ORDINALITY position
+RETURN position, item.name AS name, item IS LABELED Station AS station
+ORDER BY position;
+MATCH (a {name:'A'})((origin)-[links:Link]->(destination)){2}(c)
+FOR node IN destination
+SET node.visits = node.visits + 1
+RETURN node.name AS name, node.visits AS visits
+ORDER BY name;

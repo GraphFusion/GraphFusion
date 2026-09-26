@@ -122,8 +122,9 @@ by concatenation and alternation. CLI validation exercises Parquet after restart
 
 KEEP and graph YIELD remain explicit errors. General unbounded selective regular
 patterns and predicates over complete path histories need further planning and
-termination/resource work. Group-reference property/label dereference and
-horizontal aggregation remain part of the expression/scope task. Default MATCH
+termination/resource work. [Element references](element-references.md) now provide
+property/label dereference after group-list expansion; horizontal aggregation
+remains part of the expression/scope task. Default MATCH
 mode and the remaining ISO conformance details still require normative audit.
 Multi-path DIFFERENT EDGES clauses with selective prefixes are rejected before
 execution: cross-path uniqueness and per-path selection must not silently depend

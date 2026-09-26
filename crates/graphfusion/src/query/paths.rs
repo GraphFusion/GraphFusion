@@ -403,6 +403,10 @@ pub(super) fn expand(
         let value = super::path_values::references(lit(graph_id), None, Some(ids));
         let column = scope.scalar(&name.value);
         scope.groups.insert(name.value.clone());
+        scope.domains.insert(
+            name.value.clone(),
+            [(graph_id, graph::ElementKind::Edge)].into(),
+        );
         let mut output: Vec<_> = result
             .schema()
             .columns()

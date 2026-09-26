@@ -581,10 +581,12 @@ async fn binding_constraints_empty_import_and_explicit_null_ordering() {
             .row_count(),
         0
     );
+    let elements = session.query("MATCH (n) RETURN n").await.unwrap();
     assert!(matches!(
-        session.query("MATCH (n) RETURN n").await,
-        Err(Error::UnsupportedFeature(_))
+        elements.schema.field(0).data_type(),
+        DataType::Struct(_)
     ));
+    assert_eq!(elements.row_count(), 4);
     let result = session
         .query("MATCH (n:Person) RETURN n.name AS name, n.age AS age ORDER BY age ASC NULLS FIRST")
         .await

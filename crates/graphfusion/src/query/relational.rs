@@ -21,6 +21,7 @@ pub(super) async fn optional(
     ctx: &SessionContext,
     trace: &mut Trace,
 ) -> Result<LogicalPlanBuilder> {
+    let incoming = scope.clone();
     let row = scope.fresh("optional_row");
     let input = execution::ordinal(plan, ctx, trace, &row).await?;
     let input_columns = input.schema().columns();
@@ -58,6 +59,10 @@ pub(super) async fn optional(
     let right = execution::freeze(matches.project(right_columns)?, ctx, trace, None)
         .await?
         .build()?;
+    // Only new variables inherit null-extended element bindings. A reference
+    // constrained within the optional match retains its incoming binding outside it.
+    scope.elements.retain(|name, _| !incoming.contains(name));
+    scope.elements.extend(incoming.elements);
     let output = input_columns
         .into_iter()
         .filter(|c| c.name != row)
@@ -73,11 +78,13 @@ pub(super) async fn optional(
         .project(output)?)
 }
 
-pub(super) fn for_clause(
+pub(super) async fn for_clause(
     plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     session: &SessionState,
     clause: &ast::ForClause,
+    ctx: &SessionContext,
+    trace: &mut Trace,
 ) -> Result<LogicalPlanBuilder> {
     use datafusion::{
         arrow::datatypes::DataType,
@@ -103,6 +110,9 @@ pub(super) fn for_clause(
         return Err(Error::InvalidQuery("FOR requires a list value".into()));
     }
     let variable = scope.scalar(&clause.variable.value);
+    if let Some(domain) = super::references::domain(&clause.source, scope) {
+        scope.domains.insert(clause.variable.value.clone(), domain);
+    }
     let mut output: Vec<_> = plan
         .schema()
         .columns()
@@ -127,9 +137,10 @@ pub(super) fn for_clause(
         output.push(indices.alias(&column.name));
         unnest.push(column);
     }
-    Ok(plan
+    let plan = plan
         .project(output)?
-        .unnest_columns_with_options(unnest, UnnestOptions::new().with_preserve_nulls(false))?)
+        .unnest_columns_with_options(unnest, UnnestOptions::new().with_preserve_nulls(false))?;
+    super::references::prepare(plan, scope, ctx, trace).await
 }
 
 pub(super) fn derived(

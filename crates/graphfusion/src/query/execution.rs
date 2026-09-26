@@ -18,6 +18,8 @@ pub(super) struct Trace {
     pub logical: Vec<String>,
     pub physical: Vec<String>,
     pub validate_only: bool,
+    pub sources: std::collections::BTreeMap<crate::catalog::ObjectId, Arc<crate::graph::GraphData>>,
+    pub output_domains: std::collections::BTreeMap<String, super::references::Domain>,
 }
 impl Trace {
     pub async fn collect(
@@ -97,8 +99,14 @@ async fn freeze_impl(
         .build()?;
     let (schema, batches) = trace.collect(ctx, &renamed).await?;
     let mut fields = schema.fields().to_vec();
-    if let Some((name, _)) = &ids {
-        fields.push(Arc::new(Field::new(*name, DataType::UInt64, false)));
+    if ids.is_some() {
+        // Keep generated IDs behind the same physical-column renaming barrier as
+        // input values; projection pushdown must not expose qualified duplicates.
+        fields.push(Arc::new(Field::new(
+            format!("__gf_frozen_{}", columns.len()),
+            DataType::UInt64,
+            false,
+        )));
     }
     let schema = Arc::new(Schema::new(fields));
     let mut offset = 0;
@@ -132,7 +140,7 @@ async fn freeze_impl(
         })
         .collect();
     if let Some((name, _)) = ids {
-        output.push(col("__gf_buffer", name).alias(name));
+        output.push(col("__gf_buffer", &format!("__gf_frozen_{}", columns.len())).alias(name));
     }
     Ok(memory(schema, extended)?.project(output)?)
 }

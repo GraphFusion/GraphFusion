@@ -8,6 +8,7 @@ mod mutations;
 mod path_values;
 mod paths;
 mod patterns;
+mod references;
 mod relational;
 
 use crate::{
@@ -197,8 +198,17 @@ async fn plan(
         );
     }
     let mut result = plan_body(&query.body, &first_context, tx, ctx, writes, trace).await?;
+    let mut domains = trace.output_domains.clone();
     for op in &query.set_operations {
         let right = plan_body(&op.body, &context, tx, ctx, writes, trace).await?;
+        domains.retain(|name, domain| {
+            if let Some(right) = trace.output_domains.get(name) {
+                domain.extend(right.iter().copied());
+                true
+            } else {
+                false
+            }
+        });
         result = relational::set_operation(
             result,
             right,
@@ -206,6 +216,7 @@ async fn plan(
             op.quantifier == Some(ast::SetQuantifier::All),
         )?;
     }
+    trace.output_domains = domains;
     Ok(result)
 }
 
@@ -285,10 +296,14 @@ async fn plan_body(
                     false,
                 ))
                 .await?;
+                scope.sources.extend(trace.sources.clone());
+                scope.domains.extend(trace.output_domains.clone());
                 plan = relational::derived(plan, &mut scope, nested)?;
+                plan = references::prepare(plan, &mut scope, ctx, trace).await?;
             }
             ast::QueryClause::For(clause) => {
-                plan = relational::for_clause(plan, &mut scope, session, clause)?;
+                plan =
+                    relational::for_clause(plan, &mut scope, session, clause, ctx, trace).await?;
             }
             ast::QueryClause::Let(clause) => {
                 for item in &clause.items {
@@ -309,9 +324,14 @@ async fn plan_body(
                         .map(Expr::Column)
                         .collect();
                     let expression = binder.bind(&item.value)?;
+                    let domain = references::domain(&item.value, &scope);
                     let column = scope.scalar(&item.name.value);
+                    if let Some(domain) = domain {
+                        scope.domains.insert(item.name.value.clone(), domain);
+                    }
                     expressions.push(expression.alias(column.name));
                     plan = plan.project(expressions)?;
+                    plan = references::prepare(plan, &mut scope, ctx, trace).await?;
                 }
             }
             ast::QueryClause::Filter(clause) => {
@@ -392,12 +412,18 @@ async fn plan_body(
             false,
         ))
         .await?;
+        scope.sources.extend(trace.sources.clone());
+        scope.domains.extend(trace.output_domains.clone());
         plan = relational::derived(plan, &mut scope, nested)?;
+        plan = references::prepare(plan, &mut scope, ctx, trace).await?;
     }
     if body.result_clause.kind == ast::ResultKind::Finish {
+        trace.output_domains.clear();
         trace.collect(ctx, &plan.build()?).await?;
         return Ok(LogicalPlanBuilder::empty(false).build()?);
     }
+    trace.sources.extend(scope.sources.clone());
+    trace.output_domains = references::result_domains(body, &scope);
     if let Some(predicate) = &body.select_where {
         let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
         plan = plan.filter(expr)?;

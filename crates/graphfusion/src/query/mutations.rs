@@ -158,6 +158,7 @@ pub(super) async fn apply(
 ) -> Result<LogicalPlanBuilder> {
     let affected_before = writes.affected;
     let mut data = (*writes.data(tx, id)?).clone();
+    scope.sources.insert(id, Arc::new(data.clone()));
     // Durable providers contain no resident Arrow batches. Materialize their immutable
     // snapshot through DataFusion before validating or rewriting the graph.
     for node in &mut data.nodes {
@@ -286,7 +287,7 @@ pub(super) async fn apply(
                         vec![],
                     ),
                 };
-                let binding = target(scope, &name, id)?;
+                let binding = target(&plan, scope, &name, id, ctx, trace).await?;
                 let patch = patch(&plan, &binding, values, &mut edit, ctx, trace).await?;
                 if let Some((patch, count)) = patch {
                     data = edit_graph(&data, binding.kind, &patch, &edit, ctx, trace).await?;
@@ -317,7 +318,7 @@ pub(super) async fn apply(
                         },
                     ),
                 };
-                let binding = target(scope, &name, id)?;
+                let binding = target(&plan, scope, &name, id, ctx, trace).await?;
                 let mut edit = edit;
                 if let Some((patch, count)) =
                     patch(&plan, &binding, vec![], &mut edit, ctx, trace).await?
@@ -361,11 +362,23 @@ pub(super) async fn apply(
                 }
             }
             scope.elements.retain(|name, _| !removed.contains(name));
+            scope.scalars.retain(|name, _| !removed.contains(name));
+            scope.references.retain(|name, _| !removed.contains(name));
+            scope.domains.retain(|name, _| !removed.contains(name));
             scope.order.retain(|name| !removed.contains(name));
             plan = refresh(plan, scope, id, &data)?;
         }
         _ => unreachable!("mutation dispatch"),
     }
+    if !scope.references.is_empty() {
+        // Keep allocated identity projections below reference lookup joins.
+        plan = freeze(plan, ctx, trace, None).await?;
+    }
+    plan = super::references::refresh(plan, scope, id, &data)?;
+    if !scope.references.is_empty() {
+        plan = freeze(plan, ctx, trace, None).await?;
+    }
+    trace.sources.insert(id, Arc::new(data.clone()));
     if writes.affected != affected_before {
         writes.graphs.insert(id, data);
     }
@@ -388,7 +401,7 @@ async fn insert_node(
     validate_insert_labels(node.label_expression.as_ref())?;
     if let Some(name) = &node.variable {
         if scope.contains(&name.value) {
-            let binding = target(scope, &name.value, graph)?;
+            let binding = target(&plan, scope, &name.value, graph, ctx, trace).await?;
             if binding.kind != ElementKind::Node
                 || !node.labels.is_empty()
                 || node.properties.is_some()
@@ -493,12 +506,41 @@ async fn insert_element(
     Ok((plan, binding))
 }
 
-fn target(scope: &Bindings, name: &str, graph: ObjectId) -> Result<ElementBinding> {
-    let binding = scope.element(name)?.clone();
+async fn target(
+    plan: &LogicalPlanBuilder,
+    scope: &Bindings,
+    name: &str,
+    graph: ObjectId,
+    ctx: &SessionContext,
+    trace: &mut Trace,
+) -> Result<ElementBinding> {
+    let binding = if let Some(binding) = scope.elements.get(name) {
+        binding.clone()
+    } else if let Some(reference) = scope.references.get(name) {
+        let [binding] = reference.parts.as_slice() else {
+            return Err(super::unsupported("mutation reference requires one known graph and element kind; bind it with MATCH first"));
+        };
+        binding.clone()
+    } else {
+        return Err(Error::InvalidQuery(format!(
+            "unbound element variable {name}"
+        )));
+    };
     if binding.graph != graph {
         return Err(Error::InvalidQuery(
             "mutation target belongs to another working graph".into(),
         ));
+    }
+    if let Some(reference) = scope.references.get(name) {
+        let value = Expr::Column(scope.scalars.get(name).expect("scalar reference").clone());
+        // Evaluate before null-target elimination: a genuine null is a no-op,
+        // while a non-null identity deleted earlier in the statement is an error.
+        trace
+            .collect(
+                ctx,
+                &plan.clone().project([reference.guard(value)])?.build()?,
+            )
+            .await?;
     }
     Ok(binding)
 }
@@ -681,7 +723,7 @@ fn refresh(
             .project(retained.into_iter().chain(appended))?;
         scope.elements.insert(name, after);
     }
-    Ok(plan)
+    super::references::refresh(plan, scope, graph_id, data)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -700,7 +742,7 @@ async fn delete_graph(
         let ast::Expr::Identifier(name) = item else {
             return Err(super::unsupported("DELETE requires element variables"));
         };
-        let binding = target(scope, &name.value, graph_id)?;
+        let binding = target(plan, scope, &name.value, graph_id, ctx, trace).await?;
         let ids = plan.clone().project([binding.column(ID).alias(ID)])?;
         let target = if binding.kind == ElementKind::Node {
             &mut node_ids
