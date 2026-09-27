@@ -7,13 +7,13 @@ sidebar:
 
 Run `graphfusion --help` for supported options. The 0.2.0 development CLI provides an interactive REPL and one-shot commands. It runs locally and does not listen on a network port.
 
-## repl
+## Interactive mode
 
 ```sh
-cargo run -p graphfusion --locked -- repl --database ./demo-db --create
+cargo run -p graphfusion --locked -- ./demo-db
 ```
 
-With no command, `graphfusion` starts an in-memory REPL. `repl` accepts `--database`, `--create` and `--explain`. The prompt retains one session: current graph, parameters and explicit transactions survive between inputs. End GQL with a top-level semicolon; strings, comments and nested query bodies may contain semicolons and span lines.
+Run `graphfusion` for an in-memory session, or `graphfusion ./demo-db` to open or create a persistent database directory. No subcommand or `--create` is needed. `:memory:` explicitly selects in-memory mode. `--database DIR` is an alternative to the positional directory; specify only one. Add `--explain` before or after the directory to print execution plans. Use `graphfusion -- -data` for a directory starting with `-`, or `graphfusion -- run` for one named like a command. `run`, `import`, `checkpoint` and `help` are reserved when they are the first argument. The prompt retains one session: current graph, parameters and explicit transactions survive between inputs. End GQL with a top-level semicolon; strings, comments and nested query bodies may contain semicolons and span lines.
 
 ```text
 graphfusion> CREATE GRAPH social ANY GRAPH;

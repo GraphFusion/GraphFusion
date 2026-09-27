@@ -15,14 +15,15 @@ use std::{
 
 const HELP: &str = "GraphFusion — GQL on DataFusion
 Usage:
-  graphfusion [repl [--database DIR] [--create] [--explain]]
+  graphfusion [DIR] [--explain]
+  graphfusion --database DIR [--explain]
   graphfusion run [--database DIR] [--create] (--file FILE | --query GQL) [--explain]
   graphfusion import --database DIR --graph EXPR --manifest FILE
   graphfusion checkpoint --database DIR
 
-Running without a command starts an interactive in-memory REPL. End GQL with a semicolon.
-repl and run use an in-memory database if --database is omitted.
---create permits creating a database directory; otherwise it must already exist.
+Interactive mode opens or creates DIR; omitting it or using :memory: uses memory.
+End GQL with a semicolon. Use -- DIR for paths beginning with '-' or command names.
+run uses memory without --database; --create permits creating its database directory.
 import replaces an existing open graph with validated external Parquet tables.
 Statements auto-commit unless enclosed in START TRANSACTION and COMMIT/ROLLBACK.
 With run, an explicit transaction must end before the file/query finishes.
@@ -49,25 +50,51 @@ struct EdgeInput {
 }
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Interactive,
+    Run,
+    Import,
+    Checkpoint,
+}
+
 pub(super) async fn run() -> CliResult<()> {
-    let mut args = std::env::args().skip(1);
-    let command = args.next().unwrap_or_else(|| "repl".into());
-    if command == "--help" || command == "help" {
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "help") {
         print!("{HELP}");
         return Ok(());
     }
-    let allowed: &[&str] = match command.as_str() {
-        "repl" => &["--database", "--create", "--explain"],
-        "run" => &["--database", "--create", "--file", "--query", "--explain"],
-        "import" => &["--database", "--graph", "--manifest"],
-        "checkpoint" => &["--database"],
-        _ => return Err(format!("unknown command {command}; use --help").into()),
+    let command = match args.peek().map(String::as_str) {
+        Some("run") => Command::Run,
+        Some("import") => Command::Import,
+        Some("checkpoint") => Command::Checkpoint,
+        _ => Command::Interactive,
+    };
+    if command != Command::Interactive {
+        args.next();
+    }
+    let allowed: &[&str] = match command {
+        Command::Interactive => &["--database", "--explain"],
+        Command::Run => &["--database", "--create", "--file", "--query", "--explain"],
+        Command::Import => &["--database", "--graph", "--manifest"],
+        Command::Checkpoint => &["--database"],
     };
     let mut options = BTreeMap::new();
+    let mut positional_only = false;
     while let Some(name) = args.next() {
-        if name == "--help" {
+        if command == Command::Interactive && (positional_only || !name.starts_with('-')) {
+            if options.insert("--database".into(), name).is_some() {
+                return Err("specify only one database path: DIR or --database DIR".into());
+            }
+            continue;
+        }
+        if name == "--help" || name == "-h" {
             print!("{HELP}");
             return Ok(());
+        }
+        if command == Command::Interactive && name == "--" {
+            positional_only = true;
+            continue;
         }
         if !allowed.contains(&name.as_str()) {
             return Err(format!("unknown option {name}").into());
@@ -75,8 +102,15 @@ pub(super) async fn run() -> CliResult<()> {
         let value = if name == "--create" || name == "--explain" {
             String::new()
         } else {
-            args.next()
-                .ok_or_else(|| format!("missing value for {name}"))?
+            let value = args
+                .next()
+                .ok_or_else(|| format!("missing value for {name}"))?;
+            // Do not mistake an option for the interactive database path.
+            // Paths starting with '-' can use './' or positional '-- DIR'.
+            if command == Command::Interactive && value.starts_with('-') {
+                return Err(format!("missing value for {name}").into());
+            }
+            value
         };
         if options.insert(name.clone(), value).is_some() {
             return Err(format!("duplicate option {name}").into());
@@ -85,23 +119,25 @@ pub(super) async fn run() -> CliResult<()> {
     if options.contains_key("--create") && !options.contains_key("--database") {
         return Err("--create requires --database".into());
     }
-    if command == "repl" {
-        let database = match options.get("--database") {
+    if options.get("--database").is_some_and(String::is_empty) {
+        return Err("database path must not be empty".into());
+    }
+    if command == Command::Interactive {
+        let path = options
+            .get("--database")
+            .map(String::as_str)
+            .filter(|path| *path != ":memory:");
+        let database = match path {
             Some(path) => Database::open(
                 path,
                 OpenOptions {
-                    create_if_missing: options.contains_key("--create"),
+                    create_if_missing: true,
                 },
             )?,
             None => Database::new(),
         };
-        repl::run(
-            database,
-            options.get("--database").map(String::as_str),
-            options.contains_key("--explain"),
-        )
-        .await?;
-    } else if command == "run" {
+        repl::run(database, path, options.contains_key("--explain")).await?;
+    } else if command == Command::Run {
         let input = match (options.get("--file"), options.get("--query")) {
             (Some(path), None) => fs::read_to_string(path)?,
             (None, Some(query)) => query.clone(),
@@ -124,7 +160,7 @@ pub(super) async fn run() -> CliResult<()> {
             return Err("unfinished explicit transaction rolled back; end the file/query with COMMIT or ROLLBACK".into());
         }
         print_outputs(outputs, options.contains_key("--explain"))?;
-    } else if command == "import" {
+    } else if command == Command::Import {
         let database = required(&options, "--database")?;
         let graph = required(&options, "--graph")?;
         let path = Path::new(required(&options, "--manifest")?);

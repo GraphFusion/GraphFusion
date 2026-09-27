@@ -2,8 +2,9 @@
 
 ## 0.2.0 — Unreleased
 
-- Add an interactive `graphfusion repl` with multiline GQL, session history,
-  cancellation, transaction prompts and file execution.
+- Launch an interactive session with `graphfusion [DIR]`; open or create a local
+  database directory, or omit it for in-memory use. Includes multiline GQL,
+  history, cancellation, transaction prompts and file execution.
 - Breaking: persistent database directories are owned exclusively by one process
   until its last handle drops. Threads in that process share the coordinator and
   execute through independent sessions; other processes receive `DatabaseInUse`.

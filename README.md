@@ -29,7 +29,7 @@ For the Rust library, add `graphfusion = "0.1.1"` to your dependencies.
 From a repository checkout, start an interactive database REPL (0.2.0 development):
 
 ```sh
-cargo run -p graphfusion --locked -- repl --database ./demo-db --create
+cargo run -p graphfusion --locked -- ./demo-db
 ```
 
 At the prompt, enter `\read examples/social.gql`, then query the graph with

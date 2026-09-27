@@ -12,7 +12,7 @@ This example creates Alice → Bob → Cara, then finds Alice's friend of a frie
 From the 0.2.0 source checkout:
 
 ```sh
-cargo run -p graphfusion --locked -- repl --database ./demo-db --create
+cargo run -p graphfusion --locked -- ./demo-db
 ```
 
 At the prompt, load the bundled example once with `\read examples/social.gql`. Then enter `MATCH (p:Person) RETURN p.name AS name, p.age AS age;`. End each GQL input with a semicolon; use `\help` for commands and `\quit` to exit. Reopen with the same command and enter `SESSION SET GRAPH social;` to select the existing graph. Do not reload the create script into a database that already contains it.

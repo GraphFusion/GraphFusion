@@ -15,9 +15,11 @@ use std::{
 struct Fixture(PathBuf);
 impl Fixture {
     fn repl(&self, input: &str) -> Output {
+        self.interactive(&["db"], input)
+    }
+    fn interactive(&self, args: &[&str], input: &str) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_graphfusion"))
-            .args(["repl", "--create", "--database"])
-            .arg(self.0.join("db"))
+            .args(args)
             .current_dir(&self.0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -125,10 +127,104 @@ fn repl_keeps_graph_parameters_and_transactions_between_inputs() {
 }
 
 #[test]
+fn interactive_entry_defaults_to_memory_and_opens_or_creates_a_directory() {
+    let fixture = Fixture::new();
+    let initial_files = fs::read_dir(&fixture.0).unwrap().count();
+    let memory_args: &[&[&str]] = &[&[], &[":memory:"], &["--database", ":memory:"]];
+    for args in memory_args {
+        let output = fixture.interactive(args, "RETURN 42 AS answer;\n\\quit\n");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("42"));
+    }
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), initial_files);
+    let created = fixture.repl("CREATE GRAPH g ANY GRAPH;\n\\quit\n");
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(fixture.0.join("db/MANIFEST").is_file());
+    let reopened = fixture.repl("USE GRAPH g RETURN 42 AS answer;\n\\quit\n");
+    assert!(
+        reopened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("42"));
+}
+
+#[test]
+fn interactive_paths_support_options_spaces_and_command_names() {
+    let fixture = Fixture::new();
+    let cases: &[(&[&str], &str)] = &[
+        (&["--explain", "with spaces"], "with spaces"),
+        (&["with spaces", "--explain"], "with spaces"),
+        (
+            &["--database", "named directory", "--explain"],
+            "named directory",
+        ),
+        (&["--", "-data"], "-data"),
+        (&["--", "run"], "run"),
+        (&["./run"], "run"),
+        (&["--database", "run"], "run"),
+    ];
+    for (args, directory) in cases {
+        let output = fixture.interactive(args, "RETURN 42 AS answer;\n\\quit\n");
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("42"), "{stdout}");
+        if args.contains(&"--explain") {
+            assert!(stdout.contains("Logical plan:"), "{stdout}");
+        }
+        assert!(fixture.0.join(directory).join("MANIFEST").is_file());
+    }
+}
+
+#[test]
+fn invalid_interactive_arguments_and_help_do_not_create_databases() {
+    let fixture = Fixture::new();
+    let initial_files = fs::read_dir(&fixture.0).unwrap().count();
+    let invalid: &[&[&str]] = &[
+        &["db", "second"],
+        &["db", "--database", "second"],
+        &["--database", "db", "second"],
+        &["db", "--unknown"],
+        &["db", "--create"],
+        &["--database"],
+        &["--database", "--explain"],
+        &["db", "--explain", "--explain"],
+        &["db", "--file", "missing"],
+        &[""],
+    ];
+    for args in invalid {
+        let output = fixture.interactive(args, "");
+        assert!(!output.status.success(), "{args:?}");
+        assert_eq!(
+            fs::read_dir(&fixture.0).unwrap().count(),
+            initial_files,
+            "{args:?}"
+        );
+    }
+    for help in ["-h", "--help"] {
+        let output = fixture.interactive(&["db", help], "");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("graphfusion [DIR]"));
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), initial_files);
+    }
+}
+
+#[test]
 fn idle_repl_holds_database_until_exit() {
     let fixture = Fixture::new();
     let mut child = Command::new(env!("CARGO_BIN_EXE_graphfusion"))
-        .args(["repl", "--create", "--database"])
         .arg(fixture.0.join("db"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
