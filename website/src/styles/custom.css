@@ -11,7 +11,7 @@
   --sl-color-accent: #006e83;
   --sl-color-accent-high: #063d48;
 }
-.site-title { font-weight: 750; letter-spacing: -0.045em; }
+.site-title { gap: 0.625rem; font-weight: 750; letter-spacing: -0.045em; }
 h1, h2, h3 { letter-spacing: -0.025em; }
 .hero { padding-block: 3rem; }
 .hero h1 { max-width: 14ch; font-size: clamp(2.6rem, 5vw, 4.5rem); line-height: 1.04; }

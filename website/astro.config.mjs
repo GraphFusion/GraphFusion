@@ -7,6 +7,7 @@ export default defineConfig({
     title: 'GraphFusion',
     description: 'An embedded graph database in Rust. Query property graphs with GQL, execute with Apache DataFusion, and store data in Arrow and Parquet.',
     favicon: '/favicon.svg',
+    logo: { src: './src/assets/graphfusion.svg', alt: '', replacesTitle: false },
     expressiveCode: { shiki: { langAlias: { gql: 'cypher' } } },
     social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/GraphFusion/GraphFusion' }],
     customCss: ['./src/styles/custom.css'],
