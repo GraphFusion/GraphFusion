@@ -94,11 +94,7 @@ fn cli_recursive_paths_use_parquet_after_independent_process_reopen() {
     let fixture = Fixture::new();
     fixture.run(
         "run",
-        &[
-            "--create",
-            "--query",
-            include_str!("../../../examples/paths.gql"),
-        ],
+        &["--create", "--query", include_str!("fixtures/paths.gql")],
     );
     fixture.run("checkpoint", &[]);
     let query = "USE GRAPH routes MATCH p = ALL SHORTEST (a {name:'A'})-[:Link]->{1,4}(b {name:'D'}) RETURN COUNT(*) AS ties, MIN(PATH_LENGTH(p)) AS hops";
@@ -127,7 +123,7 @@ fn cli_reference_lookups_and_mutations_survive_parquet_restart() {
         &[
             "--create",
             "--query",
-            include_str!("../../../examples/element-references.gql"),
+            include_str!("fixtures/element-references.gql"),
         ],
     );
     fixture.run("checkpoint", &[]);
@@ -160,7 +156,7 @@ fn cli_complex_patterns_and_unbounded_shortest_survive_parquet_restart() {
         &[
             "--create",
             "--query",
-            include_str!("../../../examples/path-patterns.gql"),
+            include_str!("fixtures/path-patterns.gql"),
         ],
     );
     fixture.run("checkpoint", &[]);
@@ -386,7 +382,7 @@ fn cli_relational_queries_and_rollback_survive_parquet_reopen() {
     let fixture = Fixture::new();
     fs::write(
         fixture.0.join("analytics.gql"),
-        include_str!("../../../examples/analytics.gql"),
+        include_str!("fixtures/analytics.gql"),
     )
     .unwrap();
     let result = fixture.run("run", &["--create", "--file", "analytics.gql"]);
@@ -414,7 +410,7 @@ fn cli_explicit_transactions_publish_once_and_survive_reopen() {
     let fixture = Fixture::new();
     fs::write(
         fixture.0.join("transactions.gql"),
-        include_str!("../../../examples/transactions.gql"),
+        include_str!("fixtures/transactions.gql"),
     )
     .unwrap();
     let result = fixture.run("run", &["--create", "--file", "transactions.gql"]);

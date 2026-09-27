@@ -1,6 +1,6 @@
 //! GQL catalog, sessions, and DataFusion query execution.
 pub mod gql {
-    pub use gql_parser::*;
+    pub use graphfusion_gql_parser::*;
 }
 pub mod catalog;
 mod error;

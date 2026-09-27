@@ -1,4 +1,4 @@
-use gql_parser::{
+use graphfusion_gql_parser::{
     parse, ApproximateNumericTypeKind, BinaryOp, BindingTableExpression, BindingTableName,
     BindingVariableDefinition, BooleanTypeKind, ByteStringTypeKind, CharacterStringTypeKind,
     CreateGraphType, CreateGraphTypeSource, DateTimeFunctionKind, Direction, ExactNumericTypeKind,
@@ -16,8 +16,8 @@ fn ident(value: &str) -> Identifier {
     Identifier::new(value)
 }
 
-fn graph_name(parts: &[&str]) -> gql_parser::GraphName {
-    gql_parser::GraphName {
+fn graph_name(parts: &[&str]) -> graphfusion_gql_parser::GraphName {
+    graphfusion_gql_parser::GraphName {
         absolute: false,
         current_schema: false,
         home_schema: false,
@@ -26,8 +26,8 @@ fn graph_name(parts: &[&str]) -> gql_parser::GraphName {
     }
 }
 
-fn absolute_graph_name(parts: &[&str]) -> gql_parser::GraphName {
-    gql_parser::GraphName {
+fn absolute_graph_name(parts: &[&str]) -> graphfusion_gql_parser::GraphName {
+    graphfusion_gql_parser::GraphName {
         absolute: true,
         current_schema: false,
         home_schema: false,
@@ -36,8 +36,8 @@ fn absolute_graph_name(parts: &[&str]) -> gql_parser::GraphName {
     }
 }
 
-fn current_schema_graph_name(parts: &[&str]) -> gql_parser::GraphName {
-    gql_parser::GraphName {
+fn current_schema_graph_name(parts: &[&str]) -> graphfusion_gql_parser::GraphName {
+    graphfusion_gql_parser::GraphName {
         absolute: false,
         current_schema: true,
         home_schema: false,
@@ -46,8 +46,8 @@ fn current_schema_graph_name(parts: &[&str]) -> gql_parser::GraphName {
     }
 }
 
-fn home_schema_graph_name(parts: &[&str]) -> gql_parser::GraphName {
-    gql_parser::GraphName {
+fn home_schema_graph_name(parts: &[&str]) -> graphfusion_gql_parser::GraphName {
+    graphfusion_gql_parser::GraphName {
         absolute: false,
         current_schema: false,
         home_schema: true,
@@ -56,8 +56,8 @@ fn home_schema_graph_name(parts: &[&str]) -> gql_parser::GraphName {
     }
 }
 
-fn parent_graph_name(levels: usize, parts: &[&str]) -> gql_parser::GraphName {
-    gql_parser::GraphName {
+fn parent_graph_name(levels: usize, parts: &[&str]) -> graphfusion_gql_parser::GraphName {
+    graphfusion_gql_parser::GraphName {
         absolute: false,
         current_schema: false,
         home_schema: false,
@@ -116,8 +116,8 @@ fn parent_binding_table_name(levels: usize, parts: &[&str]) -> BindingTableName 
     }
 }
 
-fn schema_name(parts: &[&str]) -> gql_parser::SchemaName {
-    gql_parser::SchemaName {
+fn schema_name(parts: &[&str]) -> graphfusion_gql_parser::SchemaName {
+    graphfusion_gql_parser::SchemaName {
         absolute: false,
         current_schema: false,
         home_schema: false,
@@ -126,8 +126,8 @@ fn schema_name(parts: &[&str]) -> gql_parser::SchemaName {
     }
 }
 
-fn graph_type_name(parts: &[&str]) -> gql_parser::GraphTypeName {
-    gql_parser::GraphTypeName {
+fn graph_type_name(parts: &[&str]) -> graphfusion_gql_parser::GraphTypeName {
+    graphfusion_gql_parser::GraphTypeName {
         absolute: false,
         current_schema: false,
         home_schema: false,
@@ -136,8 +136,8 @@ fn graph_type_name(parts: &[&str]) -> gql_parser::GraphTypeName {
     }
 }
 
-fn absolute_graph_type_name(parts: &[&str]) -> gql_parser::GraphTypeName {
-    gql_parser::GraphTypeName {
+fn absolute_graph_type_name(parts: &[&str]) -> graphfusion_gql_parser::GraphTypeName {
+    graphfusion_gql_parser::GraphTypeName {
         absolute: true,
         current_schema: false,
         home_schema: false,
@@ -146,8 +146,8 @@ fn absolute_graph_type_name(parts: &[&str]) -> gql_parser::GraphTypeName {
     }
 }
 
-fn current_schema_graph_type_name(parts: &[&str]) -> gql_parser::GraphTypeName {
-    gql_parser::GraphTypeName {
+fn current_schema_graph_type_name(parts: &[&str]) -> graphfusion_gql_parser::GraphTypeName {
+    graphfusion_gql_parser::GraphTypeName {
         absolute: false,
         current_schema: true,
         home_schema: false,
@@ -156,8 +156,8 @@ fn current_schema_graph_type_name(parts: &[&str]) -> gql_parser::GraphTypeName {
     }
 }
 
-fn home_schema_graph_type_name(parts: &[&str]) -> gql_parser::GraphTypeName {
-    gql_parser::GraphTypeName {
+fn home_schema_graph_type_name(parts: &[&str]) -> graphfusion_gql_parser::GraphTypeName {
+    graphfusion_gql_parser::GraphTypeName {
         absolute: false,
         current_schema: false,
         home_schema: true,
@@ -166,8 +166,8 @@ fn home_schema_graph_type_name(parts: &[&str]) -> gql_parser::GraphTypeName {
     }
 }
 
-fn parent_graph_type_name(levels: usize, parts: &[&str]) -> gql_parser::GraphTypeName {
-    gql_parser::GraphTypeName {
+fn parent_graph_type_name(levels: usize, parts: &[&str]) -> graphfusion_gql_parser::GraphTypeName {
+    graphfusion_gql_parser::GraphTypeName {
         absolute: false,
         current_schema: false,
         home_schema: false,
@@ -181,7 +181,7 @@ fn graph_type_ref(parts: &[&str]) -> GraphTypeReference {
 }
 
 fn procedure_ref(parts: &[&str]) -> ProcedureReference {
-    ProcedureReference::Name(gql_parser::ProcedureName {
+    ProcedureReference::Name(graphfusion_gql_parser::ProcedureName {
         absolute: false,
         current_schema: false,
         home_schema: false,
@@ -191,7 +191,7 @@ fn procedure_ref(parts: &[&str]) -> ProcedureReference {
 }
 
 fn absolute_procedure_ref(parts: &[&str]) -> ProcedureReference {
-    ProcedureReference::Name(gql_parser::ProcedureName {
+    ProcedureReference::Name(graphfusion_gql_parser::ProcedureName {
         absolute: true,
         current_schema: false,
         home_schema: false,
@@ -201,7 +201,7 @@ fn absolute_procedure_ref(parts: &[&str]) -> ProcedureReference {
 }
 
 fn current_schema_procedure_ref(parts: &[&str]) -> ProcedureReference {
-    ProcedureReference::Name(gql_parser::ProcedureName {
+    ProcedureReference::Name(graphfusion_gql_parser::ProcedureName {
         absolute: false,
         current_schema: true,
         home_schema: false,
@@ -211,7 +211,7 @@ fn current_schema_procedure_ref(parts: &[&str]) -> ProcedureReference {
 }
 
 fn home_schema_procedure_ref(parts: &[&str]) -> ProcedureReference {
-    ProcedureReference::Name(gql_parser::ProcedureName {
+    ProcedureReference::Name(graphfusion_gql_parser::ProcedureName {
         absolute: false,
         current_schema: false,
         home_schema: true,
@@ -221,7 +221,7 @@ fn home_schema_procedure_ref(parts: &[&str]) -> ProcedureReference {
 }
 
 fn parent_procedure_ref(levels: usize, parts: &[&str]) -> ProcedureReference {
-    ProcedureReference::Name(gql_parser::ProcedureName {
+    ProcedureReference::Name(graphfusion_gql_parser::ProcedureName {
         absolute: false,
         current_schema: false,
         home_schema: false,
@@ -2079,7 +2079,9 @@ fn rejects_invalid_fixture_cases() {
     }
 }
 
-fn first_match(query: &gql_parser::QueryStatement) -> &gql_parser::MatchClause {
+fn first_match(
+    query: &graphfusion_gql_parser::QueryStatement,
+) -> &graphfusion_gql_parser::MatchClause {
     let QueryClause::Match(match_clause) = &query.body.clauses[0] else {
         panic!("expected match clause");
     };

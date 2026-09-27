@@ -4,10 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "GQL lexer, parser, and AST definitions"
+description = "GQL lexer, parser, and AST definitions for GraphFusion."
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/gql-parser"
+readme = "README.md"
+keywords = ["gql", "graph", "parser"]
+categories = ["parser-implementations"]
 
 [lib]
-name = "gql_parser"
+name = "graphfusion_gql_parser"
 path = "src/lib.rs"
 
 [lints]
