@@ -156,6 +156,25 @@ fn idle_shell_holds_database_until_exit() {
 }
 
 #[test]
+fn piped_shell_preserves_multiline_string_contents_exactly() {
+    let fixture = Fixture::new();
+    let output = fixture.shell("CREATE GRAPH g ANY GRAPH;\nSESSION SET GRAPH g;\nINSERT (:N {text: 'first\nsecond;still string'});\n\\quit\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fixture.run(
+        "run",
+        &[
+            "--query",
+            "USE GRAPH g MATCH (n) RETURN n.text = 'first\nsecond;still string' AS exact",
+        ],
+    );
+    assert!(result.contains("| true  |"), "{result}");
+}
+
+#[test]
 fn shell_recovers_from_errors_and_requires_rollback_after_transaction_failure() {
     let fixture = Fixture::new();
     let output = fixture.shell("START TRANSACTION;\nCREATE GRAPH uncommitted ANY GRAPH;\nRETURN missing;\n\\status\nCOMMIT;\nROLLBACK;\nSTART TRANSACTION;\nCREATE GRAPH lexical_error ANY GRAPH;\nRETURN @;\nCOMMIT;\nROLLBACK;\nCREATE GRAPH committed ANY GRAPH;\nRETURN 42 AS answer;\n\\quit\n");

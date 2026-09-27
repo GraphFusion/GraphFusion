@@ -1,6 +1,6 @@
 //! Stateful terminal shell. GQL framing uses the parser's lexer, including its
 //! string escapes and comments; nested procedure bodies are never split on ';'.
-use crate::{print_outputs, CliResult};
+use super::{print_outputs, CliResult};
 use graphfusion::{
     catalog::ObjectKind,
     gql::{self, lexer::Lexer, token::TokenKind},
@@ -118,7 +118,11 @@ pub async fn run(db: Database, path: Option<&str>, mut explain: bool) -> CliResu
             report(result, &mut failed);
         } else {
             buffer.push_str(&line);
-            buffer.push('\n');
+            // readline strips the terminal's Enter; BufRead retains the input
+            // newline. Preserve literal string contents in both input modes.
+            if terminal {
+                buffer.push('\n');
+            }
             loop {
                 match next_statement(&buffer) {
                     Ok(Some(end)) => {
