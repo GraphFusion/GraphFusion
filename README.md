@@ -54,9 +54,9 @@ To inspect a query's AST without executing it (0.2.0 development):
 cargo run -p graphfusion --locked -- run --dump-ast --query 'MATCH (p:Person) RETURN p.name AS name;'
 ```
 
-Use `run --dump-ast --file examples/social.gql` to inspect a whole file, or
-start `graphfusion --dump-ast` to inspect statements interactively. AST mode
-does not open a database or execute queries, writes, or session commands.
+Use `run --dump-ast --file examples/social.gql` to inspect a whole file.
+This option is available only with `run`; it does not open a database or
+execute queries, writes, or session commands.
 
 ## What works today
 

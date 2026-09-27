@@ -1,6 +1,6 @@
 //! Stateful GQL REPL. GQL framing uses the parser's lexer, including its
 //! string escapes and comments; nested procedure bodies are never split on ';'.
-use super::{print_ast, print_outputs, CliResult, InputMode};
+use super::{print_outputs, CliResult};
 use graphfusion::{
     catalog::ObjectKind,
     gql::{self, lexer::Lexer, token::TokenKind},
@@ -22,16 +22,7 @@ Ctrl-C clears input or cancels an executing query; Ctrl-D exits.
 Up/Down and Ctrl-R recall this session's history. History is kept in memory.
 ";
 
-const AST_HELP: &str = r"Enter GQL terminated by ';' to print its AST without executing it.
-  \help                Show this help
-  \read FILE           Parse and print a whole GQL file (path may contain spaces)
-  \clear               Discard unfinished input
-  \quit, \q            Exit AST inspection
-Ctrl-C clears input; Ctrl-D exits. Statements can span multiple lines.
-Up/Down and Ctrl-R recall this session's history. History is kept in memory.
-";
-
-pub(super) async fn run(db: Database, path: Option<&str>, mut mode: InputMode) -> CliResult<()> {
+pub async fn run(db: Database, path: Option<&str>, mut explain: bool) -> CliResult<()> {
     let terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
     let mut editor = if terminal {
         Some(DefaultEditor::new()?)
@@ -47,17 +38,13 @@ pub(super) async fn run(db: Database, path: Option<&str>, mut mode: InputMode) -
         println!(
             "GraphFusion {} — {}",
             env!("CARGO_PKG_VERSION"),
-            if matches!(mode, InputMode::DumpAst) {
-                "AST inspection (GQL is not executed)"
-            } else {
-                path.unwrap_or("in-memory database")
-            }
+            path.unwrap_or("in-memory database")
         );
         println!("End GQL with ';'. Type \\help for help or \\quit to exit.");
     }
     loop {
         let line = if let Some(editor) = &mut editor {
-            match editor.readline(prompt(&session, !buffer.is_empty(), mode)) {
+            match editor.readline(prompt(&session, !buffer.is_empty())) {
                 Ok(line) => {
                     editor.add_history_entry(line.as_str())?;
                     line
@@ -90,22 +77,8 @@ pub(super) async fn run(db: Database, path: Option<&str>, mut mode: InputMode) -
             let result = match (command, arg) {
                 ("\\q" | "\\quit", "") => break,
                 ("\\help", "") => {
-                    print!(
-                        "{}",
-                        if matches!(mode, InputMode::DumpAst) {
-                            AST_HELP
-                        } else {
-                            HELP
-                        }
-                    );
+                    print!("{HELP}");
                     Ok(())
-                }
-                ("\\read", path) if !path.is_empty() => match std::fs::read_to_string(path) {
-                    Ok(program) => execute(&mut session, &program, mode).await,
-                    Err(error) => Err(error.into()),
-                },
-                _ if matches!(mode, InputMode::DumpAst) => {
-                    Err("AST mode supports only \\help, \\read, \\clear and \\quit (or \\q)".into())
                 }
                 ("\\status", "") => {
                     println!(
@@ -132,12 +105,14 @@ pub(super) async fn run(db: Database, path: Option<&str>, mut mode: InputMode) -
                     .map(|()| println!("OK checkpoint"))
                     .map_err(Into::into),
                 ("\\explain", "on" | "off") => {
-                    mode = InputMode::Execute {
-                        explain: arg == "on",
-                    };
+                    explain = arg == "on";
                     println!("Explain {arg} (queries and writes are executed).");
                     Ok(())
                 }
+                ("\\read", path) if !path.is_empty() => match std::fs::read_to_string(path) {
+                    Ok(program) => execute(&mut session, &program, explain).await,
+                    Err(error) => Err(error.into()),
+                },
                 _ => Err("unknown REPL command or arguments; use \\help".into()),
             };
             report(result, &mut failed);
@@ -153,7 +128,10 @@ pub(super) async fn run(db: Database, path: Option<&str>, mut mode: InputMode) -
                     Ok(Some(end)) => {
                         let statement: String = buffer.drain(..end).collect();
                         if !is_empty(&statement) {
-                            report(execute(&mut session, &statement, mode).await, &mut failed);
+                            report(
+                                execute(&mut session, &statement, explain).await,
+                                &mut failed,
+                            );
                         }
                         if session.state().closed {
                             break;
@@ -166,9 +144,9 @@ pub(super) async fn run(db: Database, path: Option<&str>, mut mode: InputMode) -
                         break;
                     }
                     Err(_) => {
-                        // Execution mode routes lexical failures through Session,
-                        // so bad input fails an explicit transaction consistently.
-                        report(execute(&mut session, &buffer, mode).await, &mut failed);
+                        // Route lexical failures through Session as well, so a
+                        // bad input fails an explicit transaction consistently.
+                        report(execute(&mut session, &buffer, explain).await, &mut failed);
                         buffer.clear();
                         break;
                     }
@@ -195,12 +173,9 @@ pub(super) async fn run(db: Database, path: Option<&str>, mut mode: InputMode) -
     Ok(())
 }
 
-fn prompt(session: &Session, pending: bool, mode: InputMode) -> &'static str {
+fn prompt(session: &Session, pending: bool) -> &'static str {
     if pending {
         return "       ...> ";
-    }
-    if matches!(mode, InputMode::DumpAst) {
-        return "graphfusion[ast]> ";
     }
     match session.transaction_status() {
         TransactionStatus::Idle => "graphfusion> ",
@@ -209,11 +184,7 @@ fn prompt(session: &Session, pending: bool, mode: InputMode) -> &'static str {
     }
 }
 
-async fn execute(session: &mut Session, input: &str, mode: InputMode) -> CliResult<()> {
-    let explain = match mode {
-        InputMode::DumpAst => return print_ast(&gql::parse(input)?),
-        InputMode::Execute { explain } => explain,
-    };
+async fn execute(session: &mut Session, input: &str, explain: bool) -> CliResult<()> {
     let outputs = tokio::select! {
         biased;
         signal = tokio::signal::ctrl_c() => {

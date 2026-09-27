@@ -43,7 +43,8 @@ The REPL holds an exclusive process lock on its persistent database even while i
 
 ```text
 graphfusion run [--database DIR] [--create]
-  (--file FILE | --query GQL) [--explain | --dump-ast]
+  (--file FILE | --query GQL) [--explain]
+graphfusion run --dump-ast (--file FILE | --query GQL)
 ```
 
 Without --database, each invocation gets a fresh in-memory database. --create permits creating a database directory and requires --database. Exactly one of --file and --query is required; stdin is not an input mode.
@@ -54,30 +55,16 @@ The whole program parses before execution. Catalog/session/query/write statement
 
 ## Inspect an AST
 
-Use `--dump-ast` to parse GQL and print its syntax tree without executing it:
+Use `run --dump-ast` to parse a query or file and print its syntax tree without executing it:
 
 ```sh
 cargo run -p graphfusion --locked -- run --dump-ast --query 'MATCH (p:Person) RETURN p.name AS name;'
 cargo run -p graphfusion --locked -- run --dump-ast --file examples/social.gql
 ```
 
-The tree includes the complete program, field names and literal values, using the parser's AST visitor. Graphs, labels and variables do not need to exist: this checks syntax, not name binding or runtime support. Queries, writes, transactions and session commands are never executed. This mode does not open or create a database and cannot be combined with a database directory, `--database`, `--create` or `--explain`. It is not available for `import` or `checkpoint`.
+The tree includes the complete program, field names and literal values, using the parser's AST visitor. Graphs, labels and variables do not need to exist: this checks syntax, not name binding or runtime support. Queries, writes, transactions and session commands are never executed. This option is available only with `run`, requires exactly one of `--query` or `--file`, and cannot be combined with `--database`, `--create` or `--explain`. It does not open or create a database.
 
-For interactive AST inspection, start:
-
-```sh
-cargo run -p graphfusion --locked -- --dump-ast
-```
-
-The prompt is `graphfusion[ast]>`. Each complete semicolon-terminated input prints a tree; multiline input, quoted semicolons, history and `\clear` work as in execution mode. Use `\read FILE` to parse and print a whole file, `\help` for help, or `\quit` / `\q` to exit. Other REPL commands are unavailable. GQL such as `SESSION SET GRAPH`, `START TRANSACTION` and `SESSION CLOSE` is printed without changing session state or leaving AST mode.
-
-Piped input is also supported:
-
-```sh
-printf '%s\n' 'RETURN 1 + 2 * 3 AS value;' | cargo run -q -p graphfusion --locked -- --dump-ast
-```
-
-`run --dump-ast` parses the entire query or file before printing, with no final semicolon required. A syntax error produces a diagnostic on stderr, a nonzero exit status and no tree. Interactive mode continues after errors; piped input returns a nonzero status if any input failed or an unfinished statement was discarded. AST output goes to stdout and can be redirected to a file.
+`run --dump-ast` parses the entire query or file before printing, with no final semicolon required. A syntax error produces a diagnostic on stderr, a nonzero exit status and no tree. AST output goes to stdout and can be redirected to a file.
 
 ## import
 
