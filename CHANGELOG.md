@@ -2,6 +2,10 @@
 
 ## 0.2.0 — Unreleased
 
+- Breaking: rename the parser's Rust library from `graphfusion_gql_parser` to
+  `gql_parser`, following Cargo's default for the `gql-parser` package. Update
+  Rust import paths when upgrading; the package name remains `gql-parser`.
+
 ## 0.1.1 — 2026-09-27
 
 First release of the GraphFusion database and CLI.

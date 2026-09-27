@@ -1,4 +1,4 @@
-use graphfusion_gql_parser::{lexer::Lexer, parse, Error, Expr, Literal, Statement};
+use gql_parser::{lexer::Lexer, parse, Error, Expr, Literal, Statement};
 
 fn parse_expression(expression: &str) -> Expr {
     let input = format!("RETURN {expression} AS value");

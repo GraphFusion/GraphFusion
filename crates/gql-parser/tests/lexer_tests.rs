@@ -1,4 +1,4 @@
-use graphfusion_gql_parser::{
+use gql_parser::{
     lexer::Lexer,
     token::{Token, TokenKind},
     Error,

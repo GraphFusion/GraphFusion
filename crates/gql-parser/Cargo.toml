@@ -13,7 +13,6 @@ keywords = ["gql", "graph", "parser"]
 categories = ["parser-implementations"]
 
 [lib]
-name = "graphfusion_gql_parser"
 path = "src/lib.rs"
 
 [[example]]

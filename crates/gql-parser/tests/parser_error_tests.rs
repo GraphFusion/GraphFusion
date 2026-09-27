@@ -1,4 +1,4 @@
-use graphfusion_gql_parser::{parse, token::TokenKind, Error};
+use gql_parser::{parse, token::TokenKind, Error};
 
 // These cases check the structured diagnostic, including UTF-8 byte offsets,
 // independently of the broader message-substring fixtures.

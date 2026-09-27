@@ -1,9 +1,7 @@
 use std::ops::ControlFlow;
 
-use graphfusion_gql_parser::visit::Visitor;
-use graphfusion_gql_parser::{
-    format_ast, parse, AstTreePrinter, Expr, InlineProcedureCall, Literal,
-};
+use gql_parser::visit::Visitor;
+use gql_parser::{format_ast, parse, AstTreePrinter, Expr, InlineProcedureCall, Literal};
 
 macro_rules! snapshots {
     ($($name:ident),* $(,)?) => {

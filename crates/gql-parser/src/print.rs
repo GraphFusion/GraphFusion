@@ -15,7 +15,7 @@ use crate::visit::{AstNode, Field, Scalar, Visitor};
 /// Format a complete program as a tree, ending with a newline.
 ///
 /// ```
-/// use graphfusion_gql_parser::{format_ast, parse};
+/// use gql_parser::{format_ast, parse};
 /// let ast = parse("RETURN 1 + 2 * 3 AS value").unwrap();
 /// let tree = format_ast(&ast);
 /// assert!(tree.starts_with("Program\n"));
@@ -40,8 +40,8 @@ struct Tree {
 ///
 /// ```
 /// use std::ops::ControlFlow;
-/// use graphfusion_gql_parser::{AstTreePrinter, Expr};
-/// use graphfusion_gql_parser::visit::Visitor;
+/// use gql_parser::{AstTreePrinter, Expr};
+/// use gql_parser::visit::Visitor;
 /// let mut printer = AstTreePrinter::new();
 /// let ControlFlow::Continue(()) = printer.visit_expr(&Expr::Wildcard);
 /// assert_eq!(printer.finish(), "Expr::Wildcard\n");
