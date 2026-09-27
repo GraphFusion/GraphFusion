@@ -2,7 +2,7 @@
 
 ## 0.2.0 — Unreleased
 
-- Add an interactive `graphfusion shell` with multiline GQL, session history,
+- Add an interactive `graphfusion repl` with multiline GQL, session history,
   cancellation, transaction prompts and file execution.
 - Breaking: persistent database directories are owned exclusively by one process
   until its last handle drops. Threads in that process share the coordinator and

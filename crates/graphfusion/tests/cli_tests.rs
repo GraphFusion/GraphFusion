@@ -14,9 +14,9 @@ use std::{
 
 struct Fixture(PathBuf);
 impl Fixture {
-    fn shell(&self, input: &str) -> Output {
+    fn repl(&self, input: &str) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_graphfusion"))
-            .args(["shell", "--create", "--database"])
+            .args(["repl", "--create", "--database"])
             .arg(self.0.join("db"))
             .current_dir(&self.0)
             .stdin(Stdio::piped())
@@ -104,9 +104,9 @@ impl Fixture {
 }
 
 #[test]
-fn shell_keeps_graph_parameters_and_transactions_between_inputs() {
+fn repl_keeps_graph_parameters_and_transactions_between_inputs() {
     let fixture = Fixture::new();
-    let output = fixture.shell("\\help\nCREATE GRAPH g ANY GRAPH;\nSESSION SET GRAPH g;\nSESSION SET VALUE $name STRING = 'Alice;--still text';\nSTART TRANSACTION;\nINSERT (:Person {name: $name});\nMATCH (p:Person)\nRETURN p.name AS name; -- comment;\nCOMMIT;\n\\graphs\n\\checkpoint\n\\q\n");
+    let output = fixture.repl("\\help\nCREATE GRAPH g ANY GRAPH;\nSESSION SET GRAPH g;\nSESSION SET VALUE $name STRING = 'Alice;--still text';\nSTART TRANSACTION;\nINSERT (:Person {name: $name});\nMATCH (p:Person)\nRETURN p.name AS name; -- comment;\nCOMMIT;\n\\graphs\n\\checkpoint\n\\q\n");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -125,10 +125,10 @@ fn shell_keeps_graph_parameters_and_transactions_between_inputs() {
 }
 
 #[test]
-fn idle_shell_holds_database_until_exit() {
+fn idle_repl_holds_database_until_exit() {
     let fixture = Fixture::new();
     let mut child = Command::new(env!("CARGO_BIN_EXE_graphfusion"))
-        .args(["shell", "--create", "--database"])
+        .args(["repl", "--create", "--database"])
         .arg(fixture.0.join("db"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -156,9 +156,9 @@ fn idle_shell_holds_database_until_exit() {
 }
 
 #[test]
-fn piped_shell_preserves_multiline_string_contents_exactly() {
+fn piped_repl_preserves_multiline_string_contents_exactly() {
     let fixture = Fixture::new();
-    let output = fixture.shell("CREATE GRAPH g ANY GRAPH;\nSESSION SET GRAPH g;\nINSERT (:N {text: 'first\nsecond;still string'});\n\\quit\n");
+    let output = fixture.repl("CREATE GRAPH g ANY GRAPH;\nSESSION SET GRAPH g;\nINSERT (:N {text: 'first\nsecond;still string'});\n\\quit\n");
     assert!(
         output.status.success(),
         "{}",
@@ -175,9 +175,9 @@ fn piped_shell_preserves_multiline_string_contents_exactly() {
 }
 
 #[test]
-fn shell_recovers_from_errors_and_requires_rollback_after_transaction_failure() {
+fn repl_recovers_from_errors_and_requires_rollback_after_transaction_failure() {
     let fixture = Fixture::new();
-    let output = fixture.shell("START TRANSACTION;\nCREATE GRAPH uncommitted ANY GRAPH;\nRETURN missing;\n\\status\nCOMMIT;\nROLLBACK;\nSTART TRANSACTION;\nCREATE GRAPH lexical_error ANY GRAPH;\nRETURN @;\nCOMMIT;\nROLLBACK;\nCREATE GRAPH committed ANY GRAPH;\nRETURN 42 AS answer;\n\\quit\n");
+    let output = fixture.repl("START TRANSACTION;\nCREATE GRAPH uncommitted ANY GRAPH;\nRETURN missing;\n\\status\nCOMMIT;\nROLLBACK;\nSTART TRANSACTION;\nCREATE GRAPH lexical_error ANY GRAPH;\nRETURN @;\nCOMMIT;\nROLLBACK;\nCREATE GRAPH committed ANY GRAPH;\nRETURN 42 AS answer;\n\\quit\n");
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -196,10 +196,10 @@ fn shell_recovers_from_errors_and_requires_rollback_after_transaction_failure() 
 }
 
 #[test]
-fn shell_exit_and_eof_rollback_and_discard_unterminated_input() {
+fn repl_exit_and_eof_rollback_and_discard_unterminated_input() {
     for ending in ["\\q\n", ""] {
         let fixture = Fixture::new();
-        let output = fixture.shell(&format!(
+        let output = fixture.repl(&format!(
             "START TRANSACTION; CREATE GRAPH uncommitted ANY GRAPH;\n{ending}"
         ));
         assert!(!output.status.success());
@@ -210,7 +210,7 @@ fn shell_exit_and_eof_rollback_and_discard_unterminated_input() {
             .success());
     }
     let fixture = Fixture::new();
-    let output = fixture.shell("CREATE GRAPH unfinished ANY GRAPH");
+    let output = fixture.repl("CREATE GRAPH unfinished ANY GRAPH");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unfinished input discarded"));
     assert!(!fixture
@@ -220,14 +220,14 @@ fn shell_exit_and_eof_rollback_and_discard_unterminated_input() {
 }
 
 #[test]
-fn shell_reads_files_clears_input_and_handles_multiline_strings() {
+fn repl_reads_files_clears_input_and_handles_multiline_strings() {
     let fixture = Fixture::new();
     fs::write(
         fixture.0.join("my setup.gql"),
         "CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {name: 'from file'});",
     )
     .unwrap();
-    let output = fixture.shell("\\read my setup.gql\nMATCH (n) RETURN n.name AS name;\nRETURN 'unfinished\n\\clear\n/* incomplete;\ncomment; */ RETURN 'multi\nline;value' AS text;\nRETURN 7 AS n;\n\\explain on\nRETURN 42 AS answer;\n\\q\n");
+    let output = fixture.repl("\\read my setup.gql\nMATCH (n) RETURN n.name AS name;\nRETURN 'unfinished\n\\clear\n/* incomplete;\ncomment; */ RETURN 'multi\nline;value' AS text;\nRETURN 7 AS n;\n\\explain on\nRETURN 42 AS answer;\n\\q\n");
     assert!(
         output.status.success(),
         "{}",

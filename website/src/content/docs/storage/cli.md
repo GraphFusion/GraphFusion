@@ -5,15 +5,15 @@ sidebar:
   order: 4
 ---
 
-Run `graphfusion --help` for supported options. The 0.2.0 development CLI provides an interactive shell and one-shot commands. It runs locally and does not listen on a network port.
+Run `graphfusion --help` for supported options. The 0.2.0 development CLI provides an interactive REPL and one-shot commands. It runs locally and does not listen on a network port.
 
-## shell
+## repl
 
 ```sh
-cargo run -p graphfusion --locked -- shell --database ./demo-db --create
+cargo run -p graphfusion --locked -- repl --database ./demo-db --create
 ```
 
-With no command, `graphfusion` starts an in-memory shell. `shell` accepts `--database`, `--create` and `--explain`. The prompt retains one session: current graph, parameters and explicit transactions survive between inputs. End GQL with a top-level semicolon; strings, comments and nested query bodies may contain semicolons and span lines.
+With no command, `graphfusion` starts an in-memory REPL. `repl` accepts `--database`, `--create` and `--explain`. The prompt retains one session: current graph, parameters and explicit transactions survive between inputs. End GQL with a top-level semicolon; strings, comments and nested query bodies may contain semicolons and span lines.
 
 ```text
 graphfusion> CREATE GRAPH social ANY GRAPH;
@@ -33,11 +33,11 @@ graphfusion> MATCH (p:Person) RETURN p.name AS name;
 | `\clear` | Discard unfinished input, including an unclosed string |
 | `\quit` / `\q` | Exit and roll back any uncommitted transaction |
 
-Enter shell commands on their own line, without a semicolon and with no pending GQL (`\clear` also works during unfinished input). Up/Down and Ctrl-R access in-memory input history. Ctrl-C clears pending input or cancels a running query; cancellation of a statement in an explicit transaction leaves it failed and requires ROLLBACK. Completed autocommits remain committed. Ctrl-D exits and discards unfinished input. History is not written to disk.
+Enter REPL commands on their own line, without a semicolon and with no pending GQL (`\clear` also works during unfinished input). Up/Down and Ctrl-R access in-memory input history. Ctrl-C clears pending input or cancels a running query; cancellation of a statement in an explicit transaction leaves it failed and requires ROLLBACK. Completed autocommits remain committed. Ctrl-D exits and discards unfinished input. History is not written to disk.
 
-The prompt shows `[tx]` in an explicit transaction and `[failed]` when ROLLBACK is required. Query errors keep the shell running. `SESSION CLOSE;` also exits. Piped shell input uses the same framing without prompts; errors, unfinished input or an uncommitted transaction at exit return a nonzero status. For whole-file execution without requiring a final semicolon, use `run --file`.
+The prompt shows `[tx]` in an explicit transaction and `[failed]` when ROLLBACK is required. Query errors keep the REPL running. `SESSION CLOSE;` also exits. Piped REPL input uses the same framing without prompts; errors, unfinished input or an uncommitted transaction at exit return a nonzero status. For whole-file execution without requiring a final semicolon, use `run --file`.
 
-The shell holds an exclusive process lock even while idle. Another process attempting to open the same directory fails immediately with `DatabaseInUse`. Exit before using a separate `run`, `import` or `checkpoint` command on that directory; `\read` and `\checkpoint` work in the owning shell.
+The REPL holds an exclusive process lock even while idle. Another process attempting to open the same directory fails immediately with `DatabaseInUse`. Exit before using a separate `run`, `import` or `checkpoint` command on that directory; `\read` and `\checkpoint` work in the owning REPL.
 
 ## run
 

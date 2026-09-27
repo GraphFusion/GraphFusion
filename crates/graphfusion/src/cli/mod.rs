@@ -15,13 +15,13 @@ use std::{
 
 const HELP: &str = "GraphFusion — GQL on DataFusion
 Usage:
-  graphfusion [shell [--database DIR] [--create] [--explain]]
+  graphfusion [repl [--database DIR] [--create] [--explain]]
   graphfusion run [--database DIR] [--create] (--file FILE | --query GQL) [--explain]
   graphfusion import --database DIR --graph EXPR --manifest FILE
   graphfusion checkpoint --database DIR
 
-Running without a command starts an interactive in-memory shell. End GQL with a semicolon.
-shell and run use an in-memory database if --database is omitted.
+Running without a command starts an interactive in-memory REPL. End GQL with a semicolon.
+repl and run use an in-memory database if --database is omitted.
 --create permits creating a database directory; otherwise it must already exist.
 import replaces an existing open graph with validated external Parquet tables.
 Statements auto-commit unless enclosed in START TRANSACTION and COMMIT/ROLLBACK.
@@ -51,13 +51,13 @@ type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 pub(super) async fn run() -> CliResult<()> {
     let mut args = std::env::args().skip(1);
-    let command = args.next().unwrap_or_else(|| "shell".into());
+    let command = args.next().unwrap_or_else(|| "repl".into());
     if command == "--help" || command == "help" {
         print!("{HELP}");
         return Ok(());
     }
     let allowed: &[&str] = match command.as_str() {
-        "shell" => &["--database", "--create", "--explain"],
+        "repl" => &["--database", "--create", "--explain"],
         "run" => &["--database", "--create", "--file", "--query", "--explain"],
         "import" => &["--database", "--graph", "--manifest"],
         "checkpoint" => &["--database"],
@@ -85,7 +85,7 @@ pub(super) async fn run() -> CliResult<()> {
     if options.contains_key("--create") && !options.contains_key("--database") {
         return Err("--create requires --database".into());
     }
-    if command == "shell" {
+    if command == "repl" {
         let database = match options.get("--database") {
             Some(path) => Database::open(
                 path,

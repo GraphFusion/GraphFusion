@@ -11,7 +11,7 @@ A checkpoint writes a new durable snapshot and WAL generation, then permits obso
 cargo run -p graphfusion --locked -- checkpoint --database ./demo-db
 ```
 
-Close the interactive shell before using this separate command, or run `\checkpoint` inside the shell. A second process cannot open the same database while the shell owns it.
+Close the interactive REPL before using this separate command, or run `\checkpoint` inside the REPL. A second process cannot open the same database while the REPL owns it.
 
 `Database::checkpoint()` returns `Error::Busy` when a statement or explicit transaction pins a snapshot. Schedule retries at idle points. Simply keeping already materialized Arrow result batches does not hold the snapshot lease.
 

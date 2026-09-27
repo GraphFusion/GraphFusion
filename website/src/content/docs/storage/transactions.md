@@ -29,4 +29,4 @@ Write commit validates recorded graph and catalog dependencies against the lates
 
 Results inside a transaction are provisional (`transaction_pending = true`). The separate COMMIT result acknowledges durability. A `CommitUnknown` error requires dropping all database/session handles and reopening and inspecting recovered state before deciding whether to retry; rollback cannot undo an outcome that may already be durable.
 
-The interactive shell retains a transaction between inputs until COMMIT, ROLLBACK or exit; an error leaves the transaction failed and requires ROLLBACK. Exiting rolls back uncommitted work. The one-shot `run` CLI requires the transaction to finish before its file/query ends. Earlier autocommits survive a later failure. See [error handling](/storage/errors/).
+The interactive REPL retains a transaction between inputs until COMMIT, ROLLBACK or exit; an error leaves the transaction failed and requires ROLLBACK. Exiting rolls back uncommitted work. The one-shot `run` CLI requires the transaction to finish before its file/query ends. Earlier autocommits survive a later failure. See [error handling](/storage/errors/).

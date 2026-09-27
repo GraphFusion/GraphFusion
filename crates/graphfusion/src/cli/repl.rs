@@ -1,4 +1,4 @@
-//! Stateful terminal shell. GQL framing uses the parser's lexer, including its
+//! Stateful GQL REPL. GQL framing uses the parser's lexer, including its
 //! string escapes and comments; nested procedure bodies are never split on ';'.
 use super::{print_outputs, CliResult};
 use graphfusion::{
@@ -113,7 +113,7 @@ pub async fn run(db: Database, path: Option<&str>, mut explain: bool) -> CliResu
                     Ok(program) => execute(&mut session, &program, explain).await,
                     Err(error) => Err(error.into()),
                 },
-                _ => Err("unknown shell command or arguments; use \\help".into()),
+                _ => Err("unknown REPL command or arguments; use \\help".into()),
             };
             report(result, &mut failed);
         } else {
@@ -168,7 +168,7 @@ pub async fn run(db: Database, path: Option<&str>, mut explain: bool) -> CliResu
         failed = true;
     }
     if failed && !terminal {
-        return Err("shell input contained errors or unfinished work".into());
+        return Err("REPL input contained errors or unfinished work".into());
     }
     Ok(())
 }
