@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -18,15 +19,18 @@ Usage:
   graphfusion [DIR] [--explain]
   graphfusion --database DIR [--explain]
   graphfusion run [--database DIR] [--create] (--file FILE | --query GQL) [--explain]
+  graphfusion run --dump-ast (--file FILE | --query GQL)
   graphfusion import --database DIR --graph EXPR --manifest FILE
   graphfusion checkpoint --database DIR
 
 Interactive mode opens or creates DIR; omitting it or using :memory: uses memory.
 End GQL with a semicolon. Use -- DIR for paths beginning with '-' or command names.
 run uses memory without --database; --create permits creating its database directory.
+run --dump-ast only parses and prints the AST; it never executes GQL or opens a database.
+It cannot be combined with --database, --create or --explain.
 import replaces an existing open graph with validated external Parquet tables.
 Statements auto-commit unless enclosed in START TRANSACTION and COMMIT/ROLLBACK.
-With run, an explicit transaction must end before the file/query finishes.
+When executing with run, an explicit transaction must end before the file/query finishes.
 ";
 
 #[derive(Deserialize)]
@@ -75,7 +79,14 @@ pub(super) async fn run() -> CliResult<()> {
     }
     let allowed: &[&str] = match command {
         Command::Interactive => &["--database", "--explain"],
-        Command::Run => &["--database", "--create", "--file", "--query", "--explain"],
+        Command::Run => &[
+            "--database",
+            "--create",
+            "--file",
+            "--query",
+            "--explain",
+            "--dump-ast",
+        ],
         Command::Import => &["--database", "--graph", "--manifest"],
         Command::Checkpoint => &["--database"],
     };
@@ -99,7 +110,7 @@ pub(super) async fn run() -> CliResult<()> {
         if !allowed.contains(&name.as_str()) {
             return Err(format!("unknown option {name}").into());
         }
-        let value = if name == "--create" || name == "--explain" {
+        let value = if matches!(name.as_str(), "--create" | "--explain" | "--dump-ast") {
             String::new()
         } else {
             let value = args
@@ -115,6 +126,14 @@ pub(super) async fn run() -> CliResult<()> {
         if options.insert(name.clone(), value).is_some() {
             return Err(format!("duplicate option {name}").into());
         }
+    }
+    let dump_ast = options.contains_key("--dump-ast");
+    if dump_ast
+        && ["--database", "--create", "--explain"]
+            .iter()
+            .any(|key| options.contains_key(*key))
+    {
+        return Err("--dump-ast cannot be combined with --database, --create or --explain".into());
     }
     if options.contains_key("--create") && !options.contains_key("--database") {
         return Err("--create requires --database".into());
@@ -144,7 +163,10 @@ pub(super) async fn run() -> CliResult<()> {
             _ => return Err("run requires exactly one of --file and --query".into()),
         };
         // Parse before creating a database, and preserve quoted semicolons/comments via the AST.
-        gql::parse(&input)?;
+        let program = gql::parse(&input)?;
+        if dump_ast {
+            return print_ast(&program);
+        }
         let db = match options.get("--database") {
             Some(path) => Database::open(
                 path,
@@ -199,6 +221,13 @@ pub(super) async fn run() -> CliResult<()> {
         Database::open(required(&options, "--database")?, OpenOptions::default())?.checkpoint()?;
         println!("OK checkpoint");
     }
+    Ok(())
+}
+
+fn print_ast(program: &gql::Program) -> CliResult<()> {
+    io::stdout()
+        .lock()
+        .write_all(gql::format_ast(program).as_bytes())?;
     Ok(())
 }
 
