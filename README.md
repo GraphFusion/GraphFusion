@@ -48,6 +48,16 @@ Add `--database ./demo-db --create` to keep the graph in a new local database
 directory. Use the [Rust API](https://graphfusion.github.io/rust/embedding/)
 to embed GraphFusion and consume Arrow results directly.
 
+To inspect a query's AST without executing it (0.2.0 development):
+
+```sh
+cargo run -p graphfusion --locked -- run --dump-ast --query 'MATCH (p:Person) RETURN p.name AS name;'
+```
+
+Use `run --dump-ast --file examples/social.gql` to inspect a whole file, or
+start `graphfusion --dump-ast` to inspect statements interactively. AST mode
+does not open a database or execute queries, writes, or session commands.
+
 ## What works today
 
 - MATCH/OPTIONAL MATCH, quantified and shortest paths, and element references.

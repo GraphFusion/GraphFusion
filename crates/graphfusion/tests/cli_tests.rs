@@ -4,6 +4,7 @@ use graphfusion::arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use graphfusion::gql;
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -103,6 +104,130 @@ impl Fixture {
         );
         String::from_utf8(output.stdout).unwrap()
     }
+}
+
+#[test]
+fn run_dump_ast_accepts_queries_and_files_without_executing() {
+    let fixture = Fixture::new();
+    let input =
+        "CREATE GRAPH ast_only ANY GRAPH; START TRANSACTION; MATCH (p:Person) RETURN p.name AS name;";
+    fs::write(fixture.0.join("inspect query.gql"), input).unwrap();
+    let initial_files = fs::read_dir(&fixture.0).unwrap().count();
+    let expected = gql::format_ast(&gql::parse(input).unwrap());
+    for args in [
+        vec!["run", "--dump-ast", "--query", input],
+        vec!["run", "--file", "inspect query.gql", "--dump-ast"],
+    ] {
+        let output = fixture.interactive(&args, "");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        assert!(output.stderr.is_empty());
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), initial_files);
+    }
+}
+
+#[test]
+fn dump_ast_rejects_execution_options_and_invalid_inputs() {
+    let fixture = Fixture::new();
+    let initial_files = fs::read_dir(&fixture.0).unwrap().count();
+    let invalid: &[&[&str]] = &[
+        &["--dump-ast", "db"],
+        &["--database", "db", "--dump-ast"],
+        &["--dump-ast", "--explain"],
+        &["--dump-ast", "--dump-ast"],
+        &["run", "--dump-ast", "--create", "--query", "RETURN 1 AS n"],
+        &[
+            "run",
+            "--database",
+            "db",
+            "--dump-ast",
+            "--query",
+            "RETURN 1 AS n",
+        ],
+        &["run", "--dump-ast", "--explain", "--query", "RETURN 1 AS n"],
+        &["run", "--dump-ast"],
+        &["run", "--dump-ast", "--query", "RETURN 1 AS n; RETURN @"],
+        &["run", "--dump-ast", "--query", "RETURN 'unfinished"],
+        &["run", "--dump-ast", "--file", "missing.gql"],
+        &[
+            "run",
+            "--dump-ast",
+            "--file",
+            "missing.gql",
+            "--query",
+            "RETURN 1 AS n",
+        ],
+        &["import", "--dump-ast"],
+        &["checkpoint", "--dump-ast"],
+    ];
+    for args in invalid {
+        let output = fixture.interactive(args, "");
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), initial_files);
+    }
+}
+
+#[test]
+fn repl_dump_ast_preserves_framing_and_parses_files_without_session_changes() {
+    let fixture = Fixture::new();
+    let file = "CREATE GRAPH ast_only ANY GRAPH; START TRANSACTION;";
+    fs::write(fixture.0.join("inspect query.gql"), file).unwrap();
+    let initial_files = fs::read_dir(&fixture.0).unwrap().count();
+    let statements = [
+        "RETURN 'first\nsecond;still text' AS value;",
+        "CALL { RETURN 1 AS n; RETURN 2 AS n; };",
+        "SESSION CLOSE;",
+        "MATCH (p:Person) RETURN p.name AS name;",
+    ];
+    let mut input = String::from("\\read inspect query.gql\n");
+    input.push_str(&statements.join("\n"));
+    input.push_str("\n\\q\n");
+    let output = fixture.interactive(&["--dump-ast"], &input);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected: String = std::iter::once(file)
+        .chain(statements)
+        .map(|source| gql::format_ast(&gql::parse(source).unwrap()))
+        .collect();
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), initial_files);
+}
+
+#[test]
+fn repl_dump_ast_reports_errors_continues_and_discards_unfinished_input() {
+    let fixture = Fixture::new();
+    let valid = "RETURN 42 AS answer;";
+    let output = fixture.interactive(
+        &["--dump-ast"],
+        &format!("RETURN @;\n\\checkpoint\n\\explain on\n{valid}\nRETURN 'unfinished"),
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        gql::format_ast(&gql::parse(valid).unwrap())
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("AST mode supports only"), "{stderr}");
+    assert!(stderr.contains("unfinished input discarded"), "{stderr}");
+    let cleared = fixture.interactive(
+        &["--dump-ast"],
+        &format!("RETURN 'unfinished\n\\clear\n{valid}\n\\quit\n"),
+    );
+    assert!(cleared.status.success());
+    assert_eq!(
+        String::from_utf8(cleared.stdout).unwrap(),
+        gql::format_ast(&gql::parse(valid).unwrap())
+    );
 }
 
 #[test]

@@ -2,6 +2,8 @@
 
 ## 0.2.0 — Unreleased
 
+- Add `graphfusion --dump-ast` and `graphfusion run --dump-ast` to inspect GQL
+  syntax trees without executing statements or opening a persistent database.
 - Launch an interactive session with `graphfusion [DIR]`; open or create a local
   database directory, or omit it for in-memory use. Includes multiline GQL,
   history, cancellation, transaction prompts and file execution.

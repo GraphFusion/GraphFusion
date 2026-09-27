@@ -37,13 +37,13 @@ Enter REPL commands on their own line, without a semicolon and with no pending G
 
 The prompt shows `[tx]` in an explicit transaction and `[failed]` when ROLLBACK is required. Query errors keep the REPL running. `SESSION CLOSE;` also exits. Piped REPL input uses the same framing without prompts; errors, unfinished input or an uncommitted transaction at exit return a nonzero status. For whole-file execution without requiring a final semicolon, use `run --file`.
 
-The REPL holds an exclusive process lock even while idle. Another process attempting to open the same directory fails immediately with `DatabaseInUse`. Exit before using a separate `run`, `import` or `checkpoint` command on that directory; `\read` and `\checkpoint` work in the owning REPL.
+The REPL holds an exclusive process lock on its persistent database even while idle. Another process attempting to open the same directory fails immediately with `DatabaseInUse`. Exit before using a separate `run`, `import` or `checkpoint` command on that directory; `\read` and `\checkpoint` work in the owning REPL.
 
 ## run
 
 ```text
 graphfusion run [--database DIR] [--create]
-  (--file FILE | --query GQL) [--explain]
+  (--file FILE | --query GQL) [--explain | --dump-ast]
 ```
 
 Without --database, each invocation gets a fresh in-memory database. --create permits creating a database directory and requires --database. Exactly one of --file and --query is required; stdin is not an input mode.
@@ -51,6 +51,33 @@ Without --database, each invocation gets a fresh in-memory database. --create pe
 The whole program parses before execution. Catalog/session/query/write statements execute in source order. Semicolon-separated statements auto-commit individually unless an explicit transaction encloses them. An unfinished transaction at the end is rolled back and reported as an error.
 
 --explain executes the program and prints its actual plan diagnostics, including writes. It is not a dry run. Success outputs are buffered; if a later statement fails, earlier autocommits can remain durable even though the invocation returns an error without those buffered outputs.
+
+## Inspect an AST
+
+Use `--dump-ast` to parse GQL and print its syntax tree without executing it:
+
+```sh
+cargo run -p graphfusion --locked -- run --dump-ast --query 'MATCH (p:Person) RETURN p.name AS name;'
+cargo run -p graphfusion --locked -- run --dump-ast --file examples/social.gql
+```
+
+The tree includes the complete program, field names and literal values, using the parser's AST visitor. Graphs, labels and variables do not need to exist: this checks syntax, not name binding or runtime support. Queries, writes, transactions and session commands are never executed. This mode does not open or create a database and cannot be combined with a database directory, `--database`, `--create` or `--explain`. It is not available for `import` or `checkpoint`.
+
+For interactive AST inspection, start:
+
+```sh
+cargo run -p graphfusion --locked -- --dump-ast
+```
+
+The prompt is `graphfusion[ast]>`. Each complete semicolon-terminated input prints a tree; multiline input, quoted semicolons, history and `\clear` work as in execution mode. Use `\read FILE` to parse and print a whole file, `\help` for help, or `\quit` / `\q` to exit. Other REPL commands are unavailable. GQL such as `SESSION SET GRAPH`, `START TRANSACTION` and `SESSION CLOSE` is printed without changing session state or leaving AST mode.
+
+Piped input is also supported:
+
+```sh
+printf '%s\n' 'RETURN 1 + 2 * 3 AS value;' | cargo run -q -p graphfusion --locked -- --dump-ast
+```
+
+`run --dump-ast` parses the entire query or file before printing, with no final semicolon required. A syntax error produces a diagnostic on stderr, a nonzero exit status and no tree. Interactive mode continues after errors; piped input returns a nonzero status if any input failed or an unfinished statement was discarded. AST output goes to stdout and can be redirected to a file.
 
 ## import
 
