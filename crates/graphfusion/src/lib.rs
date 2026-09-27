@@ -15,7 +15,7 @@ pub mod types;
 
 pub use datafusion::arrow;
 pub use error::{Error, Result};
-use persistence::Disk;
+use persistence::{Disk, FileGuard};
 pub use query::QueryResult;
 pub use session::{
     ExecutionResult, Parameter, QueryLimits, Session, SessionState, StatementOutput,
@@ -74,8 +74,30 @@ impl Default for Database {
         Self::new()
     }
 }
-type Registry = Mutex<HashMap<PathBuf, Weak<Inner>>>;
+struct RegisteredDatabase {
+    inner: Weak<Inner>,
+    _owner: FileGuard,
+}
+type Registry = Mutex<HashMap<PathBuf, RegisteredDatabase>>;
 static DATABASES: OnceLock<Registry> = OnceLock::new();
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(disk) = &self.disk {
+            let mut registry = DATABASES
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if registry
+                .get(&disk.directory)
+                .is_some_and(|entry| std::ptr::eq(entry.inner.as_ptr(), self))
+            {
+                registry.remove(&disk.directory);
+            }
+        }
+    }
+}
 
 impl Database {
     pub fn new() -> Self {
@@ -89,8 +111,10 @@ impl Database {
             }),
         }
     }
-    /// Opens a database directory. All processes must use this locking protocol. Network
-    /// filesystems and using inherited database handles after fork are unsupported.
+    /// Opens a database directory exclusively for this process. Reopening the same
+    /// canonical directory shares its coordinator; cloned handles and independent
+    /// sessions may be used on multiple threads. Another process gets DatabaseInUse.
+    /// Network filesystems and inherited handles after fork are unsupported.
     pub fn open(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Err(Error::UnsupportedFeature(
@@ -111,15 +135,25 @@ impl Database {
             .get_or_init(Mutex::default)
             .lock()
             .map_err(|_| Error::Poisoned)?;
-        if let Some(inner) = registry.get(&directory).and_then(Weak::upgrade) {
-            if !inner.unhealthy.load(Ordering::SeqCst) {
-                return Ok(Self { inner });
+        if let Some(inner) = registry
+            .get(&directory)
+            .and_then(|entry| entry.inner.upgrade())
+        {
+            drop(registry);
+            if inner.unhealthy.load(Ordering::SeqCst) {
+                return Err(Error::Poisoned);
             }
+            return Ok(Self { inner });
         }
+        // A concurrent last-handle drop can leave a dead Weak while Inner::drop
+        // waits for this mutex. Release its lock here before acquiring a new one;
+        // otherwise this process could spuriously reject its own reopen. That
+        // destructor checks identity so it cannot remove the replacement entry.
+        registry.remove(&directory);
         let disk = Disk {
             directory: directory.clone(),
         };
-        let _lease = disk.lifecycle(false)?;
+        let owner = disk.acquire_ownership()?;
         let _commit = disk.commit_lock()?;
         if !options.create_if_missing && !directory.join("MANIFEST").exists() {
             return Err(Error::NotFound("database manifest".into()));
@@ -133,7 +167,13 @@ impl Database {
             unhealthy: AtomicBool::new(false),
             metrics: Metrics::default(),
         });
-        registry.insert(directory, Arc::downgrade(&inner));
+        registry.insert(
+            directory,
+            RegisteredDatabase {
+                inner: Arc::downgrade(&inner),
+                _owner: owner,
+            },
+        );
         Ok(Self { inner })
     }
     pub fn parse_gql(&self, input: &str) -> gql::Result<gql::Program> {
@@ -168,19 +208,6 @@ impl Database {
     pub fn checkpoint(&self) -> Result<()> {
         self.check_healthy()?;
         let started = Instant::now();
-        let lease = self
-            .inner
-            .disk
-            .as_ref()
-            .map(|d| d.lifecycle(true))
-            .transpose();
-        if matches!(lease, Err(Error::Busy)) {
-            self.inner
-                .metrics
-                .checkpoint_busy
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let _lease = lease?;
         let mut current = self.inner.state.lock().map_err(|_| Error::Poisoned)?;
         self.check_healthy()?;
         if self.inner.active.load(Ordering::SeqCst) != 0 {

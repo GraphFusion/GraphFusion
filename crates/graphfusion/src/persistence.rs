@@ -61,16 +61,16 @@ pub(crate) enum LogRecord {
 }
 
 impl Disk {
-    pub fn lifecycle(&self, exclusive: bool) -> Result<FileGuard> {
+    pub fn acquire_ownership(&self) -> Result<FileGuard> {
+        // Reuse the lifecycle lock so older clients' shared statement leases also
+        // exclude the owner. Never unlink this file: the inode carries the lock.
         let file = lock_file(&self.directory.join("lifecycle.lock"))?;
-        if exclusive {
-            match file.try_lock() {
-                Ok(()) => (),
-                Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Busy),
-                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        match file.try_lock() {
+            Ok(()) => (),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::DatabaseInUse(self.directory.clone()));
             }
-        } else {
-            file.lock_shared()?;
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
         Ok(FileGuard(file))
     }

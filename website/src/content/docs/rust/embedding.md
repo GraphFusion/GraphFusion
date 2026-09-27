@@ -47,3 +47,30 @@ The result is 42. Run the equivalent checked-in example with `cargo run -p graph
 `query` rejects mixed programs and writes before executing them. `run` returns Command or Query outputs in order and stops at the first error. Earlier autocommits may survive an error; use an explicit transaction for joint publication.
 
 Use `Database::open(path, OpenOptions { create_if_missing: true })` instead of `new` for persistence. No nested runtime is created by the synchronous command API. [Results](/rust/results/) explains schemas, batches and provisional transaction state.
+
+## Share a database across threads
+
+In 0.2.0, one process exclusively owns each persistent database directory. Clone
+`Database` into each worker and create a separate mutable `Session` per worker:
+
+```rust
+let mut workers = Vec::new();
+for n in 0..4 {
+    let database = db.clone();
+    workers.push(tokio::spawn(async move {
+        let mut session = database.session();
+        session.set_parameter("n", Value::Integer(n))?;
+        session.query("RETURN $n AS worker").await
+    }));
+}
+for worker in workers {
+    let result = worker.await??;
+    println!("{} rows", result.row_count());
+}
+```
+
+Each session has independent graph/parameter/transaction state. Queries execute
+concurrently, while commit publication is serialized and conflicting writes may
+return `Error::Conflict`. Reopening the same canonical directory in this process
+shares the coordinator. Another process receives `Error::DatabaseInUse`, even
+while the owner is idle. Drop all database and session handles to release ownership.

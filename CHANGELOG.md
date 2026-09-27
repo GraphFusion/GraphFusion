@@ -2,6 +2,13 @@
 
 ## 0.2.0 — Unreleased
 
+- Add an interactive `graphfusion shell` with multiline GQL, session history,
+  cancellation, transaction prompts and file execution.
+- Breaking: persistent database directories are owned exclusively by one process
+  until its last handle drops. Threads in that process share the coordinator and
+  execute through independent sessions; other processes receive `DatabaseInUse`.
+  Recovery after `CommitUnknown` requires dropping all database/session handles.
+
 - Breaking: rename the parser's Rust library from `graphfusion_gql_parser` to
   `gql_parser`, following Cargo's default for the `gql-parser` package. Update
   Rust import paths when upgrading; the package name remains `gql-parser`.

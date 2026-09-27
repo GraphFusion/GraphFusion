@@ -1,3 +1,5 @@
+mod shell;
+
 use graphfusion::{
     arrow::{record_batch::RecordBatch, util::pretty::pretty_format_batches},
     gql,
@@ -13,15 +15,17 @@ use std::{
 
 const HELP: &str = "GraphFusion — GQL on DataFusion
 Usage:
+  graphfusion [shell [--database DIR] [--create] [--explain]]
   graphfusion run [--database DIR] [--create] (--file FILE | --query GQL) [--explain]
   graphfusion import --database DIR --graph EXPR --manifest FILE
   graphfusion checkpoint --database DIR
 
-run uses an in-memory database if --database is omitted.
+Running without a command starts an interactive in-memory shell. End GQL with a semicolon.
+shell and run use an in-memory database if --database is omitted.
 --create permits creating a database directory; otherwise it must already exist.
 import replaces an existing open graph with validated external Parquet tables.
 Statements auto-commit unless enclosed in START TRANSACTION and COMMIT/ROLLBACK.
-An explicit transaction must end before this one-shot run finishes.
+With run, an explicit transaction must end before the file/query finishes.
 ";
 
 #[derive(Deserialize)]
@@ -58,15 +62,13 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> CliResult<()> {
     let mut args = std::env::args().skip(1);
-    let Some(command) = args.next() else {
-        print!("{HELP}");
-        return Ok(());
-    };
+    let command = args.next().unwrap_or_else(|| "shell".into());
     if command == "--help" || command == "help" {
         print!("{HELP}");
         return Ok(());
     }
     let allowed: &[&str] = match command.as_str() {
+        "shell" => &["--database", "--create", "--explain"],
         "run" => &["--database", "--create", "--file", "--query", "--explain"],
         "import" => &["--database", "--graph", "--manifest"],
         "checkpoint" => &["--database"],
@@ -91,15 +93,31 @@ async fn run() -> CliResult<()> {
             return Err(format!("duplicate option {name}").into());
         }
     }
-    if command == "run" {
+    if options.contains_key("--create") && !options.contains_key("--database") {
+        return Err("--create requires --database".into());
+    }
+    if command == "shell" {
+        let database = match options.get("--database") {
+            Some(path) => Database::open(
+                path,
+                OpenOptions {
+                    create_if_missing: options.contains_key("--create"),
+                },
+            )?,
+            None => Database::new(),
+        };
+        shell::run(
+            database,
+            options.get("--database").map(String::as_str),
+            options.contains_key("--explain"),
+        )
+        .await?;
+    } else if command == "run" {
         let input = match (options.get("--file"), options.get("--query")) {
             (Some(path), None) => fs::read_to_string(path)?,
             (None, Some(query)) => query.clone(),
             _ => return Err("run requires exactly one of --file and --query".into()),
         };
-        if options.contains_key("--create") && !options.contains_key("--database") {
-            return Err("--create requires --database".into());
-        }
         // Parse before creating a database, and preserve quoted semicolons/comments via the AST.
         gql::parse(&input)?;
         let db = match options.get("--database") {
@@ -116,64 +134,7 @@ async fn run() -> CliResult<()> {
         if session.transaction_status() != TransactionStatus::Idle {
             return Err("unfinished explicit transaction rolled back; end the file/query with COMMIT or ROLLBACK".into());
         }
-        for output in outputs {
-            match output {
-                StatementOutput::Command(result) => match result.transaction_action {
-                    Some(action) => println!(
-                        "OK transaction={} {}={}",
-                        match action {
-                            TransactionAction::Started => "started",
-                            TransactionAction::Committed => "committed",
-                            TransactionAction::RolledBack => "rolled_back",
-                        },
-                        if action == TransactionAction::Committed {
-                            "commit"
-                        } else {
-                            "snapshot"
-                        },
-                        result.commit_seq
-                    ),
-                    None => println!(
-                        "OK {}={} affected_objects={}",
-                        if result.transaction_pending {
-                            "pending_snapshot"
-                        } else {
-                            "commit"
-                        },
-                        result.commit_seq,
-                        result.affected_objects
-                    ),
-                },
-                StatementOutput::Query(result) => {
-                    if result.schema.fields().is_empty() || result.transaction_pending {
-                        println!(
-                            "OK {}={} affected_elements={}",
-                            if result.transaction_pending {
-                                "pending_snapshot"
-                            } else {
-                                "commit"
-                            },
-                            result.commit_seq,
-                            result.affected_elements,
-                        );
-                    }
-                    let batches = if result.batches.is_empty() {
-                        vec![RecordBatch::new_empty(result.schema)]
-                    } else {
-                        result.batches
-                    };
-                    if !batches[0].schema().fields().is_empty() {
-                        println!("{}", pretty_format_batches(&batches)?);
-                    }
-                    if options.contains_key("--explain") {
-                        println!(
-                            "Logical plan:\n{}\nPhysical plan:\n{}",
-                            result.logical_plan, result.physical_plan
-                        );
-                    }
-                }
-            }
-        }
+        print_outputs(outputs, options.contains_key("--explain"))?;
     } else if command == "import" {
         let database = required(&options, "--database")?;
         let graph = required(&options, "--graph")?;
@@ -221,4 +182,66 @@ fn required<'a>(options: &'a BTreeMap<String, String>, key: &str) -> CliResult<&
         .get(key)
         .map(String::as_str)
         .ok_or_else(|| format!("missing required option {key}").into())
+}
+
+fn print_outputs(outputs: Vec<StatementOutput>, explain: bool) -> CliResult<()> {
+    for output in outputs {
+        match output {
+            StatementOutput::Command(result) => match result.transaction_action {
+                Some(action) => println!(
+                    "OK transaction={} {}={}",
+                    match action {
+                        TransactionAction::Started => "started",
+                        TransactionAction::Committed => "committed",
+                        TransactionAction::RolledBack => "rolled_back",
+                    },
+                    if action == TransactionAction::Committed {
+                        "commit"
+                    } else {
+                        "snapshot"
+                    },
+                    result.commit_seq
+                ),
+                None => println!(
+                    "OK {}={} affected_objects={}",
+                    if result.transaction_pending {
+                        "pending_snapshot"
+                    } else {
+                        "commit"
+                    },
+                    result.commit_seq,
+                    result.affected_objects
+                ),
+            },
+            StatementOutput::Query(result) => {
+                if result.schema.fields().is_empty() || result.transaction_pending {
+                    println!(
+                        "OK {}={} affected_elements={}",
+                        if result.transaction_pending {
+                            "pending_snapshot"
+                        } else {
+                            "commit"
+                        },
+                        result.commit_seq,
+                        result.affected_elements,
+                    );
+                }
+                let batches = if result.batches.is_empty() {
+                    vec![RecordBatch::new_empty(result.schema)]
+                } else {
+                    result.batches
+                };
+                if !batches[0].schema().fields().is_empty() {
+                    println!("{}", pretty_format_batches(&batches)?);
+                }
+                if explain {
+                    println!(
+                        "Logical plan:\n{}\nPhysical plan:\n{}",
+                        result.logical_plan, result.physical_plan
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }

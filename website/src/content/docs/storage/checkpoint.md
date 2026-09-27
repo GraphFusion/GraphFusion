@@ -5,11 +5,13 @@ sidebar:
   order: 5
 ---
 
-A checkpoint writes a new durable snapshot and WAL generation, then permits obsolete storage generations to be reclaimed. The database must be idle with respect to snapshot leases across all cooperating processes.
+A checkpoint writes a new durable snapshot and WAL generation, then permits obsolete storage generations to be reclaimed. The database must have no active statement or transaction snapshots in its owning process.
 
 ```sh
 cargo run -p graphfusion --locked -- checkpoint --database ./demo-db
 ```
+
+Close the interactive shell before using this separate command, or run `\checkpoint` inside the shell. A second process cannot open the same database while the shell owns it.
 
 `Database::checkpoint()` returns `Error::Busy` when a statement or explicit transaction pins a snapshot. Schedule retries at idle points. Simply keeping already materialized Arrow result batches does not hold the snapshot lease.
 

@@ -20,15 +20,15 @@ OPTIONAL MATCH, path composition and writes sometimes materialize intermediate t
 
 ## Published state and commit
 
-One published snapshot combines a commit sequence, immutable catalog root, storage root and identity reservation watermark. Statements and explicit transactions keep a lifecycle lease plus private changes. Catalog maps use copy-on-write entries; graph generations are immutable Arrow buffers or Parquet files.
+One published snapshot combines a commit sequence, immutable catalog root, storage root and identity reservation watermark. Statements and explicit transactions register active snapshots and keep private changes. Catalog maps use copy-on-write entries; graph generations are immutable Arrow buffers or Parquet files.
 
 At write commit, optimistic validation checks graph versions and catalog object/name/membership/dependency reads against the newest committed state. A validated delta merges into that state, preserving disjoint changes. Persistent publication stages and syncs graph files, appends a checksummed WAL record, then exposes the new snapshot. Catalog and graph data are not committed independently.
 
-Lock order is lifecycle lease, process-local state mutex, then cross-process commit lock. Opening and autocommit/transaction start recover the latest durable generation under the commit lock. A live explicit transaction retains its starting snapshot rather than refreshing every statement.
+Opening acquires an exclusive nonblocking lifecycle lock retained by the database coordinator until its last handle drops. The canonical-path registry shares that coordinator across threads. Operations take the process-local state mutex, then the commit lock; query execution runs outside the state mutex. Opening and autocommit/transaction start recover the latest durable generation under the commit lock. A live explicit transaction retains its starting snapshot rather than refreshing every statement.
 
 ## Storage lifecycle
 
-Recovery establishes a durable manifest generation before accepting new writes. Checkpoint takes an exclusive lifecycle lease, publishes a synced checkpoint/WAL generation and reclaims files no active snapshot can use. Fixed coordinating lock files must keep stable inodes while the database is open.
+Recovery establishes a durable manifest generation before accepting new writes. Checkpoint holds the state mutex, refuses active snapshots, publishes a synced checkpoint/WAL generation and reclaims files no active snapshot can use. Fixed coordinating lock files must keep stable inodes while the database is open.
 
 The internal row-key storage participant is used to verify joint commit behavior; it is not the graph query engine. Current user-visible graph tables are Arrow or Parquet.
 
