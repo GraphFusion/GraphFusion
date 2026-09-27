@@ -22,7 +22,9 @@ test('homepage leads to a readable quickstart and copied GQL', async ({ page, co
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Your first graph');
   await page.waitForLoadState('load');
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
-  const block = page.locator('.expressive-code').first();
+  const block = page.locator('.expressive-code')
+    .filter({ has: page.locator('pre[data-language="gql"]') })
+    .first();
   await block.hover();
   await block.getByRole('button').click();
   await expect(block.locator('.feedback')).toHaveText('Copied!');
