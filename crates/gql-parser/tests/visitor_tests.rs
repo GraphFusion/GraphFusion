@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 use std::ops::ControlFlow;
 
-use graphfusion_gql_parser::visit::{self, AstNode, Field, Scalar, Visitor};
-use graphfusion_gql_parser::{parse, Expr, Identifier, Literal};
+use gql_parser::visit::{self, AstNode, Field, Scalar, Visitor};
+use gql_parser::{parse, Expr, Identifier, Literal};
 
 #[derive(Default)]
 struct Recorder<'ast> {

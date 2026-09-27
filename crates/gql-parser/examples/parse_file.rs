@@ -2,7 +2,7 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 
-use graphfusion_gql_parser::{format_ast, parse};
+use gql_parser::{format_ast, parse};
 
 const USAGE: &str =
     "usage: parse_file [--dump-ast] [--] FILE [FILE ...]\nUse - to read GQL from stdin.";

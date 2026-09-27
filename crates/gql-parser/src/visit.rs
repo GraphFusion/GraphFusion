@@ -13,8 +13,8 @@
 //!
 //! ```
 //! use std::ops::ControlFlow;
-//! use graphfusion_gql_parser::{parse, Expr};
-//! use graphfusion_gql_parser::visit::{self, Visitor};
+//! use gql_parser::{parse, Expr};
+//! use gql_parser::visit::{self, Visitor};
 //!
 //! struct Parameters<'ast>(Vec<&'ast str>);
 //! impl<'ast> Visitor<'ast> for Parameters<'ast> {

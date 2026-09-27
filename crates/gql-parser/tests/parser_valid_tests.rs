@@ -1,4 +1,4 @@
-use graphfusion_gql_parser::parse;
+use gql_parser::parse;
 
 // Register each fixture separately so Cargo can filter it and report every failure.
 macro_rules! valid_cases {
