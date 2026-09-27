@@ -1,5 +1,5 @@
 # Transactions
 
-This documentation now lives in the [GraphFusion documentation website](https://graphfusion.github.io/GraphFusion/storage/transactions/).
+This documentation now lives in the [GraphFusion documentation website](https://graphfusion.github.io/storage/transactions/).
 
-[Read the Markdown source](../website/src/content/docs/storage/transactions.md) or [browse all documentation](https://graphfusion.github.io/GraphFusion/).
+[Read the Markdown source](../website/src/content/docs/storage/transactions.md) or [browse all documentation](https://graphfusion.github.io/).

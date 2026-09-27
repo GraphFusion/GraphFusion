@@ -18,4 +18,4 @@ VALUE answer INTEGER = 42 RETURN answer NEXT YIELD answer AS n RETURN n;
 
 Procedure bodies can declare GRAPH, [BINDING] TABLE and VALUE variables. NEXT optionally renames yielded bindings before another statement. Runtime programs support semicolon-separated statements, but do not carry query bindings through NEXT; use supported nested sources or session parameters instead.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

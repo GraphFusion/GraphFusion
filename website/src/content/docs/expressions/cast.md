@@ -18,4 +18,4 @@ RETURN CAST('42' AS INTEGER) AS answer;
 
 The target uses the value-type grammar, including NOT NULL and compound types. Parsing a target type does not provide a runtime conversion implementation. Declared session parameters perform supported validation; they do not implicitly cast arbitrary strings to numbers.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

@@ -6,9 +6,9 @@ Write property-graph queries in GQL. GraphFusion builds DataFusion plans for
 pattern matching, recursive paths, aggregation and updates, returns Apache Arrow
 batches, and persists graph data in Apache Parquet.
 
-[Documentation](https://graphfusion.github.io/GraphFusion/) ·
-[Quickstart](https://graphfusion.github.io/GraphFusion/start/quickstart/) ·
-[Supported features](https://graphfusion.github.io/GraphFusion/start/status/)
+[Documentation](https://graphfusion.github.io/) ·
+[Quickstart](https://graphfusion.github.io/start/quickstart/) ·
+[Supported features](https://graphfusion.github.io/start/status/)
 
 ```gql
 MATCH (person:Person {name: 'Alice'})-[:Knows]->(friend)-[:Knows]->(next)
@@ -25,7 +25,7 @@ cargo run -p graphfusion --locked -- run --file examples/social.gql
 ```
 
 Add `--database ./demo-db --create` to keep the graph in a new local database
-directory. Use the [Rust API](https://graphfusion.github.io/GraphFusion/rust/embedding/)
+directory. Use the [Rust API](https://graphfusion.github.io/rust/embedding/)
 to embed GraphFusion and consume Arrow results directly.
 
 ## What works today
@@ -38,7 +38,7 @@ to embed GraphFusion and consume Arrow results directly.
 GraphFusion is under active development. The parser accepts more GQL than the
 runtime executes; reference pages distinguish executable features from syntax-only
 support. Full ISO GQL conformance is not claimed. See the
-[limits](https://graphfusion.github.io/GraphFusion/storage/limits/) before evaluating
+[limits](https://graphfusion.github.io/storage/limits/) before evaluating
 a workload.
 
 ## Development
@@ -56,5 +56,5 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-[Architecture](https://graphfusion.github.io/GraphFusion/development/architecture/) ·
-[Contributing](https://graphfusion.github.io/GraphFusion/development/contributing/)
+[Architecture](https://graphfusion.github.io/development/architecture/) ·
+[Contributing](https://graphfusion.github.io/development/contributing/)

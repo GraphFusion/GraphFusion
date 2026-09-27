@@ -21,4 +21,4 @@ RETURN position, value ORDER BY position;
 
 Supported lists include homogeneous scalar lists, compatible numeric lists, nested lists and lists of graph references produced by paths or collection. Arbitrary heterogeneous union-valued lists are not represented by the query engine.
 
-See [list values](/GraphFusion/expressions/lists/) and [ELEMENTS](/GraphFusion/expressions/elements/).
+See [list values](/expressions/lists/) and [ELEMENTS](/expressions/elements/).

@@ -19,4 +19,4 @@ SESSION SET VALUE $size INTEGER = 2;
 MATCH (p:Person) RETURN p.name AS name ORDER BY name LIMIT $size;
 ```
 
-`LIMIT 0` returns an empty result with its schema. A result limit is not a path-search work limit: the engine may still build many candidate paths before returning a few rows. Use finite quantifiers and [query limits](/GraphFusion/storage/limits/) to bound path work.
+`LIMIT 0` returns an empty result with its schema. A result limit is not a path-search work limit: the engine may still build many candidate paths before returning a few rows. Use finite quantifiers and [query limits](/storage/limits/) to bound path work.

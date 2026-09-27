@@ -18,4 +18,4 @@ MATCH (n) WHERE n.age IS TYPED INTEGER RETURN n;
 
 The parser supports IS NOT TYPED and the IS :: type spelling, including list, record, reference and union types. Runtime queries cannot yet use these predicates to refine types.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

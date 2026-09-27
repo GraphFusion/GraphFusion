@@ -18,4 +18,4 @@ RETURN ABS(-3) AS magnitude, MOD(7, 3) AS remainder;
 
 Numeric ABS and MOD are not executed. There is no executable remainder operator. ABS also has duration grammar, whose runtime representation is not implemented.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

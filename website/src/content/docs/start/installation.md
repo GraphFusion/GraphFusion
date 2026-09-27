@@ -35,6 +35,6 @@ cargo install --path crates/graphfusion --locked
 
 ## Use the library
 
-For development against a checkout, add `graphfusion` as a path dependency in your application's `Cargo.toml`. See [embedding in Rust](/GraphFusion/rust/embedding/) for a complete application. This guide does not assume a published crate or downloadable binary release.
+For development against a checkout, add `graphfusion` as a path dependency in your application's `Cargo.toml`. See [embedding in Rust](/rust/embedding/) for a complete application. This guide does not assume a published crate or downloadable binary release.
 
-[Create a graph →](/GraphFusion/start/quickstart/)
+[Create a graph →](/start/quickstart/)

@@ -21,4 +21,4 @@ MATCH (p:Person) RETURN p AS person ORDER BY person.name;
 
 The engine resolves references through DataFusion joins against the statement's graph snapshot. A reference does not turn into a detached copy of its properties. Updates refresh aliases before later expressions; a scalar captured earlier with LET keeps its already computed value.
 
-Deleted identities cannot be dereferenced later in the same statement. Null references behave as nulls. Driver encoding is described in [Arrow results](/GraphFusion/rust/results/); it is not a supported way to manufacture persistent reference parameters from arbitrary client structs.
+Deleted identities cannot be dereferenced later in the same statement. Null references behave as nulls. Driver encoding is described in [Arrow results](/rust/results/); it is not a supported way to manufacture persistent reference parameters from arbitrary client structs.

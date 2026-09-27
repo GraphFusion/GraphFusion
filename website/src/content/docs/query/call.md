@@ -18,4 +18,4 @@ CALL graph.expand($start) YIELD node AS n RETURN n;
 
 Named calls, procedure reference parameters (`CALL $proc(...)`), OPTIONAL CALL and inline `CALL [(bindings)] { ... }` bodies are represented in the AST. There is no procedure registry or procedure execution API yet. YIELD here projects procedure outputs and is distinct from graph-pattern YIELD.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

@@ -29,6 +29,6 @@ Add `--explain` to inspect the DataFusion plans. It executes the program, includ
 
 ## Reference-page examples
 
-Unless a page creates its own graph, graph examples use the Alice → Bob → Cara graph from the [quickstart](/GraphFusion/start/quickstart/), with ages 30, 40 and 25 and the graph selected in the session. Run them after that setup in the same session, or prepend `USE GRAPH social` when reopening a durable database.
+Unless a page creates its own graph, graph examples use the Alice → Bob → Cara graph from the [quickstart](/start/quickstart/), with ages 30, 40 and 25 and the graph selected in the session. Run them after that setup in the same session, or prepend `USE GRAPH social` when reopening a durable database.
 
 Rust examples are available with `cargo run -p graphfusion --example scalar --locked` and `cargo run -p graphfusion --example social --locked`.

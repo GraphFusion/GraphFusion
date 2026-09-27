@@ -18,4 +18,4 @@ MATCH (n) WHERE EXISTS { (n)-[:Knows]->(:Person) } RETURN n;
 
 Accepted bodies include graph patterns, nested queries and MATCH statement blocks, with brace or parenthesis forms. This is distinct from executable PROPERTY_EXISTS, which tests one property on an element. For current workloads, express supported relationships with MATCH or OPTIONAL MATCH and aggregate their results.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

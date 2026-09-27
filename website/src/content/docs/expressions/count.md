@@ -14,4 +14,4 @@ RETURN COUNT(*) AS rows, COUNT(value) AS present, COUNT(DISTINCT value) AS disti
 
 This returns 4, 3 and 2. Counting an absent optional element returns zero for that group, while COUNT(*) still counts the padded row. An empty global aggregate returns one row with zero.
 
-See [grouping](/GraphFusion/query/group-by/) and [OPTIONAL MATCH](/GraphFusion/patterns/optional-match/) for per-node counts.
+See [grouping](/query/group-by/) and [OPTIONAL MATCH](/patterns/optional-match/) for per-node counts.

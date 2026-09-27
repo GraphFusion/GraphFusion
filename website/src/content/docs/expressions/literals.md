@@ -23,7 +23,7 @@ RETURN 'hello '
 
 Byte literals contain hexadecimal pairs; whitespace is allowed between pairs. Newline-separated chunks are also accepted.
 
-Typed DATE/TIME/DATETIME/DURATION and INTERVAL literals are [syntax only](/GraphFusion/expressions/temporal-literals/). A type recognized by the parser is not necessarily representable in a query result.
+Typed DATE/TIME/DATETIME/DURATION and INTERVAL literals are [syntax only](/expressions/temporal-literals/). A type recognized by the parser is not necessarily representable in a query result.
 
 ## No-escape strings
 

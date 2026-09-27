@@ -20,4 +20,4 @@ Object names are indexed by container, kind and exact decoded spelling. A graph 
 
 Graph types hold node/edge definitions and dependencies. A graph can be open, have an inline type or reference a named graph type. Data operations currently support open graphs; typed definitions can be stored but do not yet enable typed graph scans or writes.
 
-See [paths](/GraphFusion/catalog/paths/), [schemas](/GraphFusion/catalog/schemas/) and [graphs](/GraphFusion/catalog/graphs/).
+See [paths](/catalog/paths/), [schemas](/catalog/schemas/) and [graphs](/catalog/graphs/).

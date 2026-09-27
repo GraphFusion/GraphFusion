@@ -33,4 +33,4 @@ Candidate enumeration currently happens before path ranking. Dense graphs, paral
 - Persistent statement startup reloads recovery metadata and validates Parquet footers.
 - Typed graph data operations, indexes, incremental file deltas and format migrations are not implemented.
 
-The [support matrix](/GraphFusion/start/status/) separates these execution limits from parser coverage.
+The [support matrix](/start/status/) separates these execution limits from parser coverage.

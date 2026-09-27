@@ -18,4 +18,4 @@ RETURN 'cafe' IS NORMALIZED AS plain, 'cafe' IS NOT NFC NORMALIZED AS nfc;
 
 The grammar supports optional normalization forms and NOT. It does not currently perform Unicode normalization checks during query execution.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

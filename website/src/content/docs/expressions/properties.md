@@ -16,4 +16,4 @@ Graph layouts may omit a property. When tables are combined, missing values are 
 
 Aliases, path elements and collected element values preserve their graph source for property lookup. A null element produces null. A deleted non-null identity is invalid for subsequent dereferencing in the same statement.
 
-Use [PROPERTY_EXISTS](/GraphFusion/expressions/property-exists/) to test non-null presence, and [element values](/GraphFusion/patterns/element-values/) for identity and mutation behavior.
+Use [PROPERTY_EXISTS](/expressions/property-exists/) to test non-null presence, and [element values](/patterns/element-values/) for identity and mutation behavior.

@@ -23,7 +23,7 @@ This returns Alice/0, Bob/1 and Cara/2. A zero-hop match applies both endpoint c
 | `*` | Zero or more |
 | `+` | One or more |
 
-An explicit upper bound must be positive. Unbounded forms require the planner to prove a finite complete search for the chosen mode/selector; unsupported cases return an error. [Search limits](/GraphFusion/storage/limits/) are checked against the required bound, rather than silently truncating paths.
+An explicit upper bound must be positive. Unbounded forms require the planner to prove a finite complete search for the chosen mode/selector; unsupported cases return an error. [Search limits](/storage/limits/) are checked against the required bound, rather than silently truncating paths.
 
 The `edges` variable above is an ordered list outside the repeated segment. Within an edge predicate it denotes the current edge. Zero repetitions expose an empty list. Group declarations must be fresh.
 

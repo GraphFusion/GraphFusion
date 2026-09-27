@@ -17,4 +17,4 @@ A bound node appears as a bare reference, such as `(alice)`. New nodes can have 
 
 Creation requires concrete labels: names joined by `&` are accepted, while `!`, `|` and `%` are rejected. Every input row creates its new elements; repeated input rows can therefore insert duplicates. Empty input inserts nothing. A null optional endpoint is an error.
 
-A complete statement publishes atomically after its result pipeline succeeds. A later expression error rolls back that statement's inserts. Multiple semicolon-separated statements auto-commit independently unless enclosed in an [explicit transaction](/GraphFusion/storage/transactions/).
+A complete statement publishes atomically after its result pipeline succeeds. A later expression error rolls back that statement's inserts. Multiple semicolon-separated statements auto-commit independently unless enclosed in an [explicit transaction](/storage/transactions/).

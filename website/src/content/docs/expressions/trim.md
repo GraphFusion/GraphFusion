@@ -18,4 +18,4 @@ RETURN TRIM(BOTH 'x' FROM 'xxnamexx') AS name, BTRIM('xynameyx', 'xy') AS trimme
 
 TRIM supports simple and standard LEADING/TRAILING/BOTH forms. BTRIM/LTRIM/RTRIM support optional trimming character sets, including multi-character forms in the parser. Byte-string forms are also recognized. This is separate from TRIM(list, count).
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

@@ -12,4 +12,4 @@ FOR value IN [10, 20, 30]
 RETURN STDDEV_POP(value) AS population, STDDEV_SAMP(value) AS sample;
 ```
 
-These are numeric aggregates with floating results. Insufficient input for a sample estimate produces null. Empty input produces null, and non-finite aggregate results are errors. See [aggregate behavior](/GraphFusion/expressions/aggregates/).
+These are numeric aggregates with floating results. Insufficient input for a sample estimate produces null. Empty input produces null, and non-finite aggregate results are errors. See [aggregate behavior](/expressions/aggregates/).

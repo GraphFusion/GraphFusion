@@ -34,4 +34,4 @@ The internal row-key storage participant is used to verify joint commit behavior
 
 ## Boundaries for future work
 
-Typed graph execution, additional expressions/procedures, prepared or streaming lifetimes, more complete unbounded path planning, incremental storage, indexes and a normative ISO conformance audit remain future work. They are not prerequisites hidden behind a claim that those features already work. The [support matrix](/GraphFusion/start/status/) tracks the actual surface.
+Typed graph execution, additional expressions/procedures, prepared or streaming lifetimes, more complete unbounded path planning, incremental storage, indexes and a normative ISO conformance audit remain future work. They are not prerequisites hidden behind a claim that those features already work. The [support matrix](/start/status/) tracks the actual surface.

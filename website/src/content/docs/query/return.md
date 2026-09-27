@@ -25,4 +25,4 @@ Use `FINISH` to complete a pipeline without returning its working bindings. Writ
 MATCH (p:Person {name: 'Alice'}) SET p.age = 31 FINISH;
 ```
 
-Inside an explicit transaction, result rows describe the pending transaction snapshot. They do not acknowledge durability until COMMIT succeeds. See [result handling](/GraphFusion/rust/results/).
+Inside an explicit transaction, result rows describe the pending transaction snapshot. They do not acknowledge durability until COMMIT succeeds. See [result handling](/rust/results/).

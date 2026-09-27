@@ -26,7 +26,7 @@ The whole program parses before execution. Catalog/session/query/write statement
 graphfusion import --database DIR --graph EXPR --manifest FILE
 ```
 
-Replaces an existing open graph with validated external Parquet tables. See [manifest and table layout](/GraphFusion/storage/import/).
+Replaces an existing open graph with validated external Parquet tables. See [manifest and table layout](/storage/import/).
 
 ## checkpoint
 

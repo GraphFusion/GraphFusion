@@ -16,4 +16,4 @@ The reference-value grammar supports `[PROPERTY] GRAPH <graph expression>`. Grap
 
 References remain bound to the original graph identity. Replacing or dropping/recreating a graph makes old references stale. Closed graph declarations require an exact definition match; data access to typed graphs remains unimplemented.
 
-See [parameters](/GraphFusion/catalog/parameters/) and [USE GRAPH](/GraphFusion/query/use-graph/).
+See [parameters](/catalog/parameters/) and [USE GRAPH](/query/use-graph/).

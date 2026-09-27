@@ -18,4 +18,4 @@ RETURN VALUE { MATCH (n) RETURN COUNT(*) AS total } AS total;
 
 The parser constrains scalar-query shapes, including aggregate results and supported single-row forms with LIMIT 1. The runtime does not evaluate scalar VALUE subqueries. Independent SELECT FROM { ... } sources are executable.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

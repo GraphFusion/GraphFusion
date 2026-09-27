@@ -12,4 +12,4 @@ MATCH (p:Person)
 RETURN p.name AS name, p IS LABELED Person AS person ORDER BY name;
 ```
 
-The predicate supports direct bindings and reference values, including aliases and elements expanded from path lists. A null element yields null. [Label expressions](/GraphFusion/patterns/labels/) explain conjunction, disjunction, negation and wildcard matching.
+The predicate supports direct bindings and reference values, including aliases and elements expanded from path lists. A null element yields null. [Label expressions](/patterns/labels/) explain conjunction, disjunction, negation and wildcard matching.

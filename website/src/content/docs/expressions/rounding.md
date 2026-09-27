@@ -18,4 +18,4 @@ RETURN FLOOR(1.5) AS down, CEIL(1.5) AS up, CEILING(1.5) AS also_up;
 
 CEIL and CEILING are accepted spellings of the same function kind. These functions are separate from the supported basic arithmetic operators.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

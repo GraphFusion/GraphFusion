@@ -21,4 +21,4 @@ LET person = p
 RETURN person.name AS name;
 ```
 
-Typed `LET VALUE` definitions are accepted by the parser but not executed in query pipelines. The scalar `LET ... IN ... END` expression is also syntax only; it is distinct from this executable clause. Use [session parameter declarations](/GraphFusion/catalog/parameters/) when you need supported type validation.
+Typed `LET VALUE` definitions are accepted by the parser but not executed in query pipelines. The scalar `LET ... IN ... END` expression is also syntax only; it is distinct from this executable clause. Use [session parameter declarations](/catalog/parameters/) when you need supported type validation.

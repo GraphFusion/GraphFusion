@@ -43,4 +43,4 @@ The result is 42. Run the equivalent checked-in example with `cargo run -p graph
 
 `query` rejects mixed programs and writes before executing them. `run` returns Command or Query outputs in order and stops at the first error. Earlier autocommits may survive an error; use an explicit transaction for joint publication.
 
-Use `Database::open(path, OpenOptions { create_if_missing: true })` instead of `new` for persistence. No nested runtime is created by the synchronous command API. [Results](/GraphFusion/rust/results/) explains schemas, batches and provisional transaction state.
+Use `Database::open(path, OpenOptions { create_if_missing: true })` instead of `new` for persistence. No nested runtime is created by the synchronous command API. [Results](/rust/results/) explains schemas, batches and provisional transaction state.

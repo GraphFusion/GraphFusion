@@ -18,4 +18,4 @@ RETURN DURATION('P1D') AS duration, DURATION(RECORD {days: 1, hours: 2}) AS reco
 
 Duration strings and records are preserved in the AST. Arithmetic/calendar semantics and a query result representation remain to be implemented.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

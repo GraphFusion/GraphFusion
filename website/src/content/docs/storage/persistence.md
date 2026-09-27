@@ -22,4 +22,4 @@ Recovery reads the manifest/checkpoint and committed WAL, validates referenced g
 
 The current format is v3. Older formats are rejected; there is no built-in migration path. Do not edit or delete coordinating lock files while a database is open. This documentation does not promise compatibility across future format changes.
 
-[Checkpointing](/GraphFusion/storage/checkpoint/) reclaims obsolete generations when no active snapshot can use them. There is no automatic checkpoint scheduler.
+[Checkpointing](/storage/checkpoint/) reclaims obsolete generations when no active snapshot can use them. There is no automatic checkpoint scheduler.

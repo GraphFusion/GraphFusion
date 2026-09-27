@@ -13,4 +13,4 @@ FOR element IN ELEMENTS(p) WITH ORDINALITY position
 RETURN position, ELEMENT_ID(element) AS id ORDER BY position;
 ```
 
-This produces three rows. The references can be returned, counted and used for supported property and label lookups. Ordinary scalar/list values are not paths and are rejected. [FOR](/GraphFusion/query/for/) explains null-list and ordinal behavior.
+This produces three rows. The references can be returned, counted and used for supported property and label lookups. Ordinary scalar/list values are not paths and are rejected. [FOR](/query/for/) explains null-list and ordinal behavior.

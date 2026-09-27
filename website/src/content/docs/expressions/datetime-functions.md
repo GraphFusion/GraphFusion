@@ -18,4 +18,4 @@ RETURN CURRENT_DATE AS day, CURRENT_TIME AS time, CURRENT_TIMESTAMP AS stamp, LO
 
 DATE, ZONED_TIME, ZONED_DATETIME, LOCAL_TIME and LOCAL_DATETIME constructor forms accept supported string or record syntax. Session time-zone state is a separate feature; setting it does not enable these query functions.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

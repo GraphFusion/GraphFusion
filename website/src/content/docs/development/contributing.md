@@ -19,4 +19,4 @@ Keep parser responsibilities in `gql-parser`. Planning, catalog lookup, executio
 
 Use focused implementation descriptions in commits and pull requests. Maintainers decide when to merge; CI does not merge changes automatically.
 
-[Document a feature](/GraphFusion/development/website/) · [Architecture](/GraphFusion/development/architecture/)
+[Document a feature](/development/website/) · [Architecture](/development/architecture/)

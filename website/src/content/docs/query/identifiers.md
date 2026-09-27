@@ -21,7 +21,7 @@ SESSION SET VALUE $"tenant id" STRING = 'acme';
 RETURN $"tenant id" AS tenant;
 ```
 
-[Catalog paths](/GraphFusion/catalog/paths/) resolve directory/schema names separately from query binding variables.
+[Catalog paths](/catalog/paths/) resolve directory/schema names separately from query binding variables.
 
 ## Escapes and Unicode
 

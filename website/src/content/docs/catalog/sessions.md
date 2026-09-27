@@ -17,4 +17,4 @@ SESSION SET validates into a private copy and publishes the new session state on
 
 Successful session-setting and driver-parameter changes survive database ROLLBACK: they are session state, not transactional graph/catalog data. A failed explicit transaction restricts further operations to ROLLBACK or SESSION CLOSE.
 
-[Parameters](/GraphFusion/catalog/parameters/) · [RESET and CLOSE](/GraphFusion/catalog/reset/) · [Time zones](/GraphFusion/catalog/time-zone/)
+[Parameters](/catalog/parameters/) · [RESET and CLOSE](/catalog/reset/) · [Time zones](/catalog/time-zone/)

@@ -18,4 +18,4 @@ RETURN DATE '2026-06-29' AS day, TIME '12:30:00' AS time, DATETIME '2026-06-29T1
 
 TIMESTAMP is also recognized. SQL interval qualifiers include single fields and ranges such as DAY TO SECOND with precisions. There is no general temporal query execution or timezone conversion implied by this syntax.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

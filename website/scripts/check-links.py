@@ -1,11 +1,11 @@
-"""Check the built project site's links, fragments and referenced local assets."""
+"""Check the built site's links, fragments and referenced local assets."""
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1] / "dist"
 ORIGIN = "https://graphfusion.github.io"
-BASE = "/GraphFusion/"
+BASE = "/"
 
 class Page(HTMLParser):
     def __init__(self, source):
@@ -34,7 +34,7 @@ for source, parsed in pages.items():
             continue
         links += 1
         if not url.path.startswith(BASE):
-            errors.append(f"{relative}: missing project base in {href}")
+            errors.append(f"{relative}: outside site root in {href}")
             continue
         dest = ROOT / unquote(url.path[len(BASE):])
         if dest.is_dir():
@@ -47,4 +47,4 @@ if not (ROOT / "pagefind/pagefind.js").is_file():
     errors.append("Search bundle was not built")
 if errors:
     raise SystemExit("\n".join(sorted(set(errors))))
-print(f"Verified {links} internal links/assets across {len(pages)} HTML pages, including fragments and project base.")
+print(f"Verified {links} internal links/assets across {len(pages)} HTML pages, including fragments.")

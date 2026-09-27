@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-This example creates Alice → Bob → Cara, then finds Alice's friend of a friend. Run it from a source checkout after [building the CLI](/GraphFusion/start/installation/).
+This example creates Alice → Bob → Cara, then finds Alice's friend of a friend. Run it from a source checkout after [building the CLI](/start/installation/).
 
 ## Create and query a graph
 
@@ -52,11 +52,11 @@ SET p.age = p.age + 1
 RETURN p.name AS name, p.age AS age;
 ```
 
-This returns Alice and 31. [INSERT](/GraphFusion/mutations/insert/), [SET](/GraphFusion/mutations/set/) and [DELETE](/GraphFusion/mutations/delete/) explain how statements publish changes.
+This returns Alice and 31. [INSERT](/mutations/insert/), [SET](/mutations/set/) and [DELETE](/mutations/delete/) explain how statements publish changes.
 
 ## Continue
 
-- [MATCH](/GraphFusion/patterns/match/): find connected elements.
-- [Shortest paths](/GraphFusion/patterns/selectors/): search routes.
-- [Transactions](/GraphFusion/storage/transactions/): commit several statements together.
-- [Rust API](/GraphFusion/rust/embedding/): consume Arrow batches in an application.
+- [MATCH](/patterns/match/): find connected elements.
+- [Shortest paths](/patterns/selectors/): search routes.
+- [Transactions](/storage/transactions/): commit several statements together.
+- [Rust API](/rust/embedding/): consume Arrow batches in an application.

@@ -18,4 +18,4 @@ RETURN CHAR_LENGTH('Alice') AS chars, CHARACTER_LENGTH('Bob') AS characters, BYT
 
 Character count and encoded byte count are different operations. These names are parsed into dedicated function forms but are not executable. PATH_LENGTH is an unrelated, executable path function.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.
