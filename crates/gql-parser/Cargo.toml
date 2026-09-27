@@ -16,5 +16,9 @@ categories = ["parser-implementations"]
 name = "graphfusion_gql_parser"
 path = "src/lib.rs"
 
+[[example]]
+name = "parse_file"
+test = true
+
 [lints]
 workspace = true
