@@ -18,4 +18,4 @@ RETURN LEFT('GraphFusion', 5) AS prefix, RIGHT(X'010203', 2) AS bytes;
 
 LEFT(value, length) and RIGHT(value, length) accept value expressions in the AST. Neither string nor byte substring execution is implemented.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

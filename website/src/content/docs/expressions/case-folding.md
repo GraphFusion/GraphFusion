@@ -18,4 +18,4 @@ RETURN UPPER('Alice') AS upper_name, LOWER('Bob') AS lower_name;
 
 These calls have dedicated AST forms but no query binder implementation. Transform values before import when case conversion is needed today.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

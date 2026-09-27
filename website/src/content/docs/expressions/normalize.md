@@ -18,4 +18,4 @@ RETURN NORMALIZE('cafe', NFC) AS composed, NORMALIZE('cafe', NFD) AS decomposed;
 
 The normalization form is optional. Accepted form names are grammar-level support; the database does not normalize strings through this function yet.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

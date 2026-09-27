@@ -18,4 +18,4 @@ RETURN SQRT(9) AS root, POWER(2, 3) AS power, LOG(10, 100) AS logarithm, LOG10(1
 
 LOG takes its base before its value. Function arity is represented by the parser; numeric domain and overflow behavior are not promised without an execution implementation.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

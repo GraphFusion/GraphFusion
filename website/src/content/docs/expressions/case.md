@@ -18,4 +18,4 @@ RETURN CASE WHEN 18 >= 18 THEN 'adult' ELSE 'minor' END AS category;
 
 Both searched CASE and simple CASE with match/predicate operands are parsed. The query engine executes COALESCE and NULLIF, but not general CASE expressions.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

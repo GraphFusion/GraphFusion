@@ -22,4 +22,4 @@ Common pattern forms include:
 | `<-[]->` | Directed edge in either orientation |
 | `-[]-` | Any supported orientation |
 
-Mixed directed/undirected pattern forms are also parsed and executed. Reversing an orientation does not produce a second copy of a self-loop; parallel edges still produce separate matches. Use [IS DIRECTED](/GraphFusion/expressions/directed/) to inspect an edge value.
+Mixed directed/undirected pattern forms are also parsed and executed. Reversing an orientation does not produce a second copy of a self-loop; parallel edges still produce separate matches. Use [IS DIRECTED](/expressions/directed/) to inspect an edge value.

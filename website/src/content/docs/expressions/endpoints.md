@@ -18,4 +18,4 @@ MATCH (a)-[e]->(b) WHERE a IS SOURCE OF e AND b IS DESTINATION OF e RETURN e;
 
 IS NOT SOURCE OF and IS NOT DESTINATION OF are accepted as well. Executable directed MATCH patterns already constrain endpoint roles; use pattern direction for current queries.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

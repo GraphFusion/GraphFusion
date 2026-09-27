@@ -25,4 +25,4 @@ GROUP BY () HAVING COUNT(*) > 0;
 
 SELECT HAVING filters completed groups. Ungrouped input references and nested aggregate calls are rejected. An empty global aggregate still returns one row: COUNT is 0, COLLECT_LIST is an empty list, and numeric aggregates are null.
 
-[Aggregate functions →](/GraphFusion/expressions/aggregates/)
+[Aggregate functions →](/expressions/aggregates/)

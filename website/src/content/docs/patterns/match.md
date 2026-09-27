@@ -22,4 +22,4 @@ WHERE a.age < b.age
 RETURN a.name AS younger, b.name AS older;
 ```
 
-Parallel edges retain distinct identities and can yield duplicate-looking rows. Add DISTINCT only when your application wants to collapse those projected values. [Match modes](/GraphFusion/patterns/match-modes/) control edge reuse.
+Parallel edges retain distinct identities and can yield duplicate-looking rows. Add DISTINCT only when your application wants to collapse those projected values. [Match modes](/patterns/match-modes/) control edge reuse.

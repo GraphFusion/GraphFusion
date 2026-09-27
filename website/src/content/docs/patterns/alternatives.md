@@ -17,4 +17,4 @@ The duplicated alternative still returns Bob once. Replacing `|` with `|+|` retu
 
 Branches align variables by name and pad absent bindings with typed nulls. Incompatible element kinds or group/singleton exposures are rejected. Equal incoming rows remain separate; deduplication does not collapse the entire input table.
 
-A variable absent from one branch is conditional. Its implicit reuse inside the same MATCH is restricted, but it can appear in expressions or in a later MATCH. See [questioned paths](/GraphFusion/patterns/questioned/) for another source of conditional bindings.
+A variable absent from one branch is conditional. Its implicit reuse inside the same MATCH is restricted, but it can appear in expressions or in a later MATCH. See [questioned paths](/patterns/questioned/) for another source of conditional bindings.

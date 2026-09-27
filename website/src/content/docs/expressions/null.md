@@ -15,4 +15,4 @@ RETURN NULL IS NULL AS missing, NULL = NULL AS equality;
 
 The engine retains typed nulls where context or a declared parameter provides a type. Null-only values are compatible with supported typed expressions; arbitrary incompatible families are still rejected.
 
-[COALESCE](/GraphFusion/expressions/coalesce/) supplies a fallback. [PROPERTY_EXISTS](/GraphFusion/expressions/property-exists/) checks whether a particular element property has a non-null value.
+[COALESCE](/expressions/coalesce/) supplies a fallback. [PROPERTY_EXISTS](/expressions/property-exists/) checks whether a particular element property has a non-null value.

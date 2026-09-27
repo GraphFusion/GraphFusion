@@ -27,4 +27,4 @@ Counts must be positive signed integer literals or integer parameters. Selection
 
 An inline or parenthesized predicate restricts candidates before an enclosing selector. Final MATCH WHERE filters already selected paths. If it removes a shortest result, selection does not restart to find a longer path.
 
-The current executor enumerates eligible finite candidates before ranking. A shortest-path request can therefore be expensive on a dense graph. Unbounded repeatable WALK is supported for a single homogeneous quantified edge with suitable history-independent predicates and selective prefixes; more general unbounded patterns require finite bounds. See [limits](/GraphFusion/storage/limits/).
+The current executor enumerates eligible finite candidates before ranking. A shortest-path request can therefore be expensive on a dense graph. Unbounded repeatable WALK is supported for a single homogeneous quantified edge with suitable history-independent predicates and selective prefixes; more general unbounded patterns require finite bounds. See [limits](/storage/limits/).

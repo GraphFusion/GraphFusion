@@ -20,4 +20,4 @@ DROP GRAPH retires its storage. Checkpoint reclaims obsolete files after snapsho
 
 `LIKE` can copy a graph's type definition. Graph data copying through `AS COPY OF <graph>` is not implemented. Do not interpret accepted copy grammar as a data-cloning operation.
 
-[Graph type definitions →](/GraphFusion/catalog/graph-types/)
+[Graph type definitions →](/catalog/graph-types/)

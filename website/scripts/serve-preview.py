@@ -1,17 +1,17 @@
-"""Serve the static build at its actual GitHub project base path for browser tests."""
+"""Serve the root site and legacy project redirects for browser tests."""
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-DIST = Path(__file__).resolve().parents[1] / "dist"
+WEBSITE = Path(__file__).resolve().parents[1]
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(DIST), **kwargs)
+        super().__init__(*args, directory=str(WEBSITE / 'dist'), **kwargs)
     def do_GET(self):
-        if not urlsplit(self.path).path.startswith('/GraphFusion/'):
-            self.send_error(404)
-            return
-        self.path = self.path[len('/GraphFusion'):]
+        legacy = urlsplit(self.path).path.startswith('/GraphFusion/')
+        self.directory = str(WEBSITE / ('legacy-dist' if legacy else 'dist'))
+        if legacy:
+            self.path = self.path[len('/GraphFusion'):]
         super().do_GET()
     def log_message(self, *args):
         pass

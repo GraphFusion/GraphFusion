@@ -29,4 +29,4 @@ Write commit validates recorded graph and catalog dependencies against the lates
 
 Results inside a transaction are provisional (`transaction_pending = true`). The separate COMMIT result acknowledges durability. A `CommitUnknown` error requires reopening and inspecting recovered state before deciding whether to retry; rollback cannot undo an outcome that may already be durable.
 
-The one-shot CLI requires the transaction to finish before its file/query ends. Earlier autocommits survive a later failure. See [error handling](/GraphFusion/storage/errors/).
+The one-shot CLI requires the transaction to finish before its file/query ends. Earlier autocommits survive a later failure. See [error handling](/storage/errors/).

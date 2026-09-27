@@ -18,4 +18,4 @@ RETURN SIN(0) AS sine, COS(0) AS cosine, TAN(0) AS tangent, COT(1) AS cotangent,
 
 These numeric function names are accepted in value expressions. Their presence in the grammar is not a claim that DataFusion functions are automatically exposed under GQL names.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

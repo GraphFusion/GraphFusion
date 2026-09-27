@@ -23,6 +23,6 @@ The parser represents `[PROPERTY] GRAPH <graph expression>` and `[BINDING] TABLE
 
 From Rust, `set_parameter("minimum", Value::Integer(30))` supplies a decoded name without `$`. Only supported scalar/list families bind into ordinary query value expressions; a session Value variant does not imply general query support for that variant.
 
-Regular, extended numeric and delimited parameter names are documented under [identifiers](/GraphFusion/query/identifiers/).
+Regular, extended numeric and delimited parameter names are documented under [identifiers](/query/identifiers/).
 
-[Graph reference values](/GraphFusion/catalog/graph-references/) · [Binding-table references](/GraphFusion/catalog/binding-tables/)
+[Graph reference values](/catalog/graph-references/) · [Binding-table references](/catalog/binding-tables/)

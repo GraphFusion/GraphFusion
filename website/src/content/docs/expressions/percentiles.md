@@ -15,4 +15,4 @@ RETURN PERCENTILE_CONT(value, 0.5) AS continuous,
 
 The continuous result interpolates (25 here) and has Float64 type. The discrete result chooses an input value (20 here) and preserves its numeric type, including exact Int64 values. Null inputs are omitted; ALL/DISTINCT controls duplicate contribution.
 
-Out-of-range or row-dependent fractions are errors. Use [GROUP BY](/GraphFusion/query/group-by/) for per-group percentiles.
+Out-of-range or row-dependent fractions are errors. Use [GROUP BY](/query/group-by/) for per-group percentiles.

@@ -26,3 +26,4 @@ target
 /website/.astro/
 /website/test-results/
 /website/playwright-report/
+/website/legacy-dist/

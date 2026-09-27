@@ -21,4 +21,4 @@ REMOVE p IS Admin
 RETURN p IS LABELED Admin AS admin;
 ```
 
-Null optional targets are skipped. SET/REMOVE changes remain private until the whole statement succeeds, or until COMMIT inside an explicit transaction. See [write results](/GraphFusion/mutations/results/) for affected-element counts.
+Null optional targets are skipped. SET/REMOVE changes remain private until the whole statement succeeds, or until COMMIT inside an explicit transaction. See [write results](/mutations/results/) for affected-element counts.

@@ -22,4 +22,4 @@ Storing a typed graph definition does not yet enable its data path. Typed graph 
 
 Closed graph parameter types currently require an exact bound-definition match. Type details such as FLOAT precision/scale and NOT NULL participate in that definition; external graph-type imports and data copying are unsupported.
 
-[Value type declarations →](/GraphFusion/catalog/value-types/)
+[Value type declarations →](/catalog/value-types/)

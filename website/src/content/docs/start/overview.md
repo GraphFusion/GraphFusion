@@ -27,10 +27,10 @@ A graph contains labeled nodes and edges with properties. You write patterns suc
 - Run isolated sessions and explicit transactions, in memory or in a local database directory.
 - Import Arrow/Parquet graph tables and consume Arrow result batches from Rust.
 
-GraphFusion is under active development. The parser recognizes more of GQL than the execution engine supports. Pages marked **Syntax only** describe accepted grammar, not runnable database features. [Supported features](/GraphFusion/start/status/) lists the boundaries. Full ISO GQL conformance is not claimed.
+GraphFusion is under active development. The parser recognizes more of GQL than the execution engine supports. Pages marked **Syntax only** describe accepted grammar, not runnable database features. [Supported features](/start/status/) lists the boundaries. Full ISO GQL conformance is not claimed.
 
 ## When to use it
 
 Start here if you want to experiment with GQL over columnar graph data, embed graph queries in a Rust application, or contribute to a DataFusion-based graph engine. Expect materialized results, graph-wide rewrites for updates and explicit resource limits. There is no network server, distributed execution service or stable on-disk migration path yet.
 
-[Run your first graph query →](/GraphFusion/start/quickstart/)
+[Run your first graph query →](/start/quickstart/)

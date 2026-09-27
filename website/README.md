@@ -1,6 +1,6 @@
 # GraphFusion documentation
 
-Astro Starlight source for https://graphfusion.github.io/GraphFusion/.
+Astro Starlight source for https://graphfusion.github.io/.
 
 ```sh
 npm ci

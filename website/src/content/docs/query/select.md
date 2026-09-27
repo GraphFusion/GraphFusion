@@ -25,4 +25,4 @@ HAVING COUNT(*) > 1;
 
 `WHERE` filters source rows; `HAVING` filters aggregate groups. `ALL`/`DISTINCT`, `GROUP BY ()`, output aliases and ordering are supported. A nested query cannot reference bindings from the outer query: correlated evaluation is not implemented.
 
-See [grouping](/GraphFusion/query/group-by/) and [nested queries](/GraphFusion/query/nested/).
+See [grouping](/query/group-by/) and [nested queries](/query/nested/).

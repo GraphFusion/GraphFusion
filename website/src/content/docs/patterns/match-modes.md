@@ -19,6 +19,6 @@ MATCH REPEATABLE ELEMENTS p = WALK (a {name: 'Alice'})-[:Knows]-{1,3}(b)
 RETURN b.name AS destination, PATH_LENGTH(p) AS hops ORDER BY hops, destination;
 ```
 
-The singular spellings `DIFFERENT EDGE` and `REPEATABLE ELEMENT` are accepted. Every new MATCH starts a new reuse scope. A [path mode](/GraphFusion/patterns/path-modes/) adds its own constraints even under REPEATABLE ELEMENTS.
+The singular spellings `DIFFERENT EDGE` and `REPEATABLE ELEMENT` are accepted. Every new MATCH starts a new reuse scope. A [path mode](/patterns/path-modes/) adds its own constraints even under REPEATABLE ELEMENTS.
 
 The default is an implementation compatibility choice, pending a complete normative GQL audit. Multiple paths using selective prefixes in a DIFFERENT EDGES clause are currently rejected: cross-path uniqueness and selection cannot safely be applied in an arbitrary order.

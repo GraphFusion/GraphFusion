@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "astro dev --host 127.0.0.1",
     "check": "astro check",
-    "build": "astro build && python3 scripts/check-links.py",
+    "build": "astro build && python3 scripts/check-links.py && python3 scripts/build-redirects.py",
     "preview": "astro preview --host 127.0.0.1",
     "test:examples": "python3 scripts/check-examples.py",
     "test:browser": "playwright test"

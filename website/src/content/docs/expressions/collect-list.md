@@ -14,4 +14,4 @@ RETURN COLLECT_LIST(DISTINCT value) AS values;
 
 The list contains 1 and 2, but its order is not guaranteed. Do not depend on the displayed order of an aggregate list.
 
-Whole elements can be collected while preserving graph identity, then exported through an independent nested query and expanded with FOR for property access. See [element values](/GraphFusion/patterns/element-values/).
+Whole elements can be collected while preserving graph identity, then exported through an independent nested query and expanded with FOR for property access. See [element values](/patterns/element-values/).

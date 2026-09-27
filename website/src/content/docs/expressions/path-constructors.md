@@ -18,4 +18,4 @@ MATCH (a)-[e]->(b) RETURN PATH [a, e, b] AS path;
 
 The constructor records alternating element expressions in the AST. Use a matched path variable such as `MATCH p = (a)-[e]->(b) RETURN p` to obtain an executable path value today.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

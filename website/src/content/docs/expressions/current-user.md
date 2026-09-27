@@ -18,4 +18,4 @@ RETURN CURRENT_USER AS user;
 
 GraphFusion has no authentication service or user context exposed through this expression. It is a recognized predefined value specification, not the operating-system username returned at runtime.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

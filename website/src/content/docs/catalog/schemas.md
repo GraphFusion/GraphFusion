@@ -18,4 +18,4 @@ DROP SCHEMA app;
 
 A schema must be empty before it can be dropped. The bootstrap `/main` schema cannot be dropped. Current/home schema settings belong to a session; other sessions retain their own context.
 
-Creating deeper directory hierarchies uses the administrative `Database::create_directory` API before creating the schema. See [catalog objects](/GraphFusion/catalog/objects/).
+Creating deeper directory hierarchies uses the administrative `Database::create_directory` API before creating the schema. See [catalog objects](/catalog/objects/).

@@ -4,7 +4,7 @@ export default defineConfig({
   use: { baseURL: process.env.DOCS_URL || 'http://127.0.0.1:4321', trace: 'retain-on-failure' },
   webServer: process.env.DOCS_URL ? undefined : {
     command: 'python3 scripts/serve-preview.py',
-    url: 'http://127.0.0.1:4321/GraphFusion/',
+    url: 'http://127.0.0.1:4321/',
     reuseExistingServer: !process.env.CI,
   },
   projects: [

@@ -18,4 +18,4 @@ RETURN RECORD {name: 'Alice', age: 30} AS person, {active: TRUE} AS flags;
 
 RECORD is optional before a record constructor, and records may nest. Query projection and arbitrary record.field evaluation are not implemented. Restricted session initializers do support record values and type validation; that separate evaluator does not make general record queries executable.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

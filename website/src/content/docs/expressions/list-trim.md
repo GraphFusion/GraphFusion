@@ -18,4 +18,4 @@ RETURN TRIM([1, 2, 3], 1) AS trimmed;
 
 This two-argument list form is distinct from string TRIM. List construction and FOR expansion are executable, but list trimming is not.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.

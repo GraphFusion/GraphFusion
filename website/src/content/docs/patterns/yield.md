@@ -18,4 +18,4 @@ MATCH (n)-[e]->(m) YIELD n, e RETURN n;
 
 The parser records the explicit graph-pattern variable list. Runtime graph-pattern YIELD and KEEP are not implemented. An ordinary RETURN can project bound graph elements after an executable MATCH.
 
-See [supported features](/GraphFusion/start/status/) for executable alternatives.
+See [supported features](/start/status/) for executable alternatives.
