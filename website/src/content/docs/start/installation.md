@@ -1,19 +1,26 @@
 ---
 title: "Build and install"
-description: "Build the GraphFusion CLI and Rust examples from the repository."
+description: "Install GraphFusion from crates.io or build the CLI and examples from source."
 sidebar:
   order: 2
 ---
 
-GraphFusion currently builds from source. The repository's lockfile selects the tested dependency versions.
+GraphFusion 0.1.0 is available as a Rust library and CLI on crates.io. Use the packaged lockfile when installing the CLI to select the tested dependency versions.
 
 ## Requirements
 
-- Git and a Rust installation managed by rustup.
-- The development toolchain specified by `rust-toolchain.toml` (currently Rust 1.98).
+- Rust 1.94 or newer, managed by rustup.
+- For repository development: Git and the toolchain specified by `rust-toolchain.toml` (currently Rust 1.98).
 - Linux or macOS for durable databases. Persistence relies on local filesystem locking, atomic rename and directory synchronization.
 
 The minimum supported Rust version is 1.94. The pinned development version also fixes formatting and lint behavior; it is separate from the minimum compiler supported by the library.
+
+## Install from crates.io
+
+```sh
+cargo install graphfusion --version 0.1.0 --locked
+graphfusion run --query 'RETURN 6 * 7 AS answer'
+```
 
 ## Build the CLI
 
@@ -35,6 +42,6 @@ cargo install --path crates/graphfusion --locked
 
 ## Use the library
 
-For development against a checkout, add `graphfusion` as a path dependency in your application's `Cargo.toml`. See [embedding in Rust](/rust/embedding/) for a complete application. This guide does not assume a published crate or downloadable binary release.
+Add `graphfusion = "0.1.0"` to your application's `Cargo.toml`. For development against a checkout, use a path dependency instead. See [embedding in Rust](/rust/embedding/) for a complete application.
 
 [Create a graph →](/start/quickstart/)

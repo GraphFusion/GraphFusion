@@ -7,13 +7,16 @@ sidebar:
 
 The library provides a database handle and independent mutable sessions. The caller supplies the async runtime.
 
-For an application beside your checkout, use a path dependency (adjust the path for your layout):
+Add the published library and an async runtime to your application:
 
 ```toml
 [dependencies]
-graphfusion = { path = "../GraphFusion/crates/graphfusion" }
+graphfusion = "0.1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+For development against a local checkout, replace the version with
+`graphfusion = { path = "../GraphFusion/crates/graphfusion" }`, adjusting the path for your layout.
 
 ```rust
 use graphfusion::{arrow::util::pretty::pretty_format_batches, Database, Value};
