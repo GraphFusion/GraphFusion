@@ -5,11 +5,11 @@ The GQL lexer, parser, and abstract syntax tree used by
 
 ```toml
 [dependencies]
-gql-parser = "0.2.0"
+gql-parser = "0.1.1"
 ```
 
 ```rust
-let program = gql_parser::parse("RETURN 42 AS answer").unwrap();
+let program = graphfusion_gql_parser::parse("RETURN 42 AS answer").unwrap();
 assert_eq!(program.statements.len(), 1);
 ```
 
@@ -18,8 +18,7 @@ runtime support. Use the `graphfusion` crate to execute supported GQL programs.
 See the [documentation](https://graphfusion.github.io/) for the supported runtime
 surface and its limits.
 
-Version 0.2 uses the Rust library name `gql_parser` (previously
-`graphfusion_gql_parser`) and includes AST and grammar changes. Parser versions
-are independent of the GraphFusion database version.
+The Rust library name is `graphfusion_gql_parser`, matching the original 0.1.0
+release. Both workspace crates use the same version.
 
 Rust 1.94 or newer is required. Licensed under Apache-2.0.

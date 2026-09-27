@@ -4,7 +4,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {
-    Parse(gql_parser::Error),
+    Parse(graphfusion_gql_parser::Error),
     DataFusion(Box<datafusion::error::DataFusionError>),
     InvalidQuery(String),
     Io(io::Error),
@@ -68,8 +68,8 @@ impl From<io::Error> for Error {
         Self::Io(e)
     }
 }
-impl From<gql_parser::Error> for Error {
-    fn from(e: gql_parser::Error) -> Self {
+impl From<graphfusion_gql_parser::Error> for Error {
+    fn from(e: graphfusion_gql_parser::Error) -> Self {
         Self::Parse(e)
     }
 }

@@ -17,14 +17,14 @@ RETURN next.name AS friend_of_friend;
 
 ## Try it
 
-Install the 0.1.0 CLI from crates.io:
+Install the 0.1.1 CLI from crates.io:
 
 ```sh
-cargo install graphfusion --version 0.1.0 --locked
+cargo install graphfusion --version 0.1.1 --locked
 graphfusion run --query 'RETURN 6 * 7 AS answer'
 ```
 
-For the Rust library, add `graphfusion = "0.1.0"` to your dependencies.
+For the Rust library, add `graphfusion = "0.1.1"` to your dependencies.
 
 From a repository checkout, run the complete social-graph example. It creates
 Alice → Bob → Cara, updates Alice, and finds Cara:

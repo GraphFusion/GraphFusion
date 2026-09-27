@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-GraphFusion 0.1.0 is available as a Rust library and CLI on crates.io. Use the packaged lockfile when installing the CLI to select the tested dependency versions.
+GraphFusion 0.1.1 is available as a Rust library and CLI on crates.io. Use the packaged lockfile when installing the CLI to select the tested dependency versions.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ The minimum supported Rust version is 1.94. The pinned development version also 
 ## Install from crates.io
 
 ```sh
-cargo install graphfusion --version 0.1.0 --locked
+cargo install graphfusion --version 0.1.1 --locked
 graphfusion run --query 'RETURN 6 * 7 AS answer'
 ```
 
@@ -42,6 +42,6 @@ cargo install --path crates/graphfusion --locked
 
 ## Use the library
 
-Add `graphfusion = "0.1.0"` to your application's `Cargo.toml`. For development against a checkout, use a path dependency instead. See [embedding in Rust](/rust/embedding/) for a complete application.
+Add `graphfusion = "0.1.1"` to your application's `Cargo.toml`. For development against a checkout, use a path dependency instead. See [embedding in Rust](/rust/embedding/) for a complete application.
 
 [Create a graph →](/start/quickstart/)

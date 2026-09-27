@@ -1,6 +1,6 @@
 [package]
 name = "gql-parser"
-version = "0.2.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ keywords = ["gql", "graph", "parser"]
 categories = ["parser-implementations"]
 
 [lib]
-name = "gql_parser"
+name = "graphfusion_gql_parser"
 path = "src/lib.rs"
 
 [lints]

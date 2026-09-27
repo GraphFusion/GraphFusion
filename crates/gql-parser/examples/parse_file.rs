@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for file in files {
         let input = std::fs::read_to_string(&file)?;
-        gql_parser::parse(&input).map_err(|error| format!("{file}: {error}"))?;
+        graphfusion_gql_parser::parse(&input).map_err(|error| format!("{file}: {error}"))?;
     }
     Ok(())
 }
