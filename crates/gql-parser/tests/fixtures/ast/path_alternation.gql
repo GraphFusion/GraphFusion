@@ -1,0 +1,1 @@
+MATCH p = ((a)->(b)){1,2}->(c) | ((x)->(y)) RETURN p

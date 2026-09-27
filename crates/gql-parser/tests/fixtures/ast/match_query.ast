@@ -1,0 +1,168 @@
+Program
+├── at_schema: None
+├── definitions: []
+└── statements: List (len=1)
+    └── [0]: Statement::Query
+        └── value: QueryStatement
+            ├── at_schema: None
+            ├── use_graph: None
+            ├── body: QueryBody
+            │   ├── clauses: List (len=1)
+            │   │   └── [0]: QueryClause::Match
+            │   │       └── value: MatchClause
+            │   │           ├── optional: false
+            │   │           ├── mode: None
+            │   │           ├── patterns: List (len=1)
+            │   │           │   └── [0]: PathPattern
+            │   │           │       ├── variable: None
+            │   │           │       ├── prefix: None
+            │   │           │       ├── parenthesized: None
+            │   │           │       ├── start: NodePattern
+            │   │           │       │   ├── variable: Identifier
+            │   │           │       │   │   └── value: "p"
+            │   │           │       │   ├── temporary: false
+            │   │           │       │   ├── labels: List (len=1)
+            │   │           │       │   │   └── [0]: Identifier
+            │   │           │       │   │       └── value: "Person"
+            │   │           │       │   ├── label_expression: LabelExpression::Label
+            │   │           │       │   │   └── value: Identifier
+            │   │           │       │   │       └── value: "Person"
+            │   │           │       │   ├── properties: MapLiteral
+            │   │           │       │   │   └── entries: List (len=1)
+            │   │           │       │   │       └── [0]
+            │   │           │       │   │           ├── key: Identifier
+            │   │           │       │   │           │   └── value: "name"
+            │   │           │       │   │           └── value: Expr::Literal
+            │   │           │       │   │               └── value: Literal::String
+            │   │           │       │   │                   └── value: "Alice"
+            │   │           │       │   ├── where_clause: None
+            │   │           │       │   └── quantifier: None
+            │   │           │       ├── chains: List (len=1)
+            │   │           │       │   └── [0]: PathPatternChain
+            │   │           │       │       ├── relationship: RelationshipPattern
+            │   │           │       │       │   ├── direction: Direction::Right
+            │   │           │       │       │   ├── variable: Identifier
+            │   │           │       │       │   │   └── value: "r"
+            │   │           │       │       │   ├── temporary: false
+            │   │           │       │       │   ├── labels: List (len=1)
+            │   │           │       │       │   │   └── [0]: Identifier
+            │   │           │       │       │   │       └── value: "KNOWS"
+            │   │           │       │       │   ├── label_expression: LabelExpression::Label
+            │   │           │       │       │   │   └── value: Identifier
+            │   │           │       │       │   │       └── value: "KNOWS"
+            │   │           │       │       │   ├── properties: None
+            │   │           │       │       │   ├── where_clause: None
+            │   │           │       │       │   └── quantifier: None
+            │   │           │       │       └── node: NodePattern
+            │   │           │       │           ├── variable: Identifier
+            │   │           │       │           │   └── value: "f"
+            │   │           │       │           ├── temporary: false
+            │   │           │       │           ├── labels: List (len=1)
+            │   │           │       │           │   └── [0]: Identifier
+            │   │           │       │           │       └── value: "Person"
+            │   │           │       │           ├── label_expression: LabelExpression::Label
+            │   │           │       │           │   └── value: Identifier
+            │   │           │       │           │       └── value: "Person"
+            │   │           │       │           ├── properties: None
+            │   │           │       │           ├── where_clause: None
+            │   │           │       │           └── quantifier: None
+            │   │           │       ├── factors: List (len=3)
+            │   │           │       │   ├── [0]: PathPatternFactor::Node
+            │   │           │       │   │   └── value: NodePattern
+            │   │           │       │   │       ├── variable: Identifier
+            │   │           │       │   │       │   └── value: "p"
+            │   │           │       │   │       ├── temporary: false
+            │   │           │       │   │       ├── labels: List (len=1)
+            │   │           │       │   │       │   └── [0]: Identifier
+            │   │           │       │   │       │       └── value: "Person"
+            │   │           │       │   │       ├── label_expression: LabelExpression::Label
+            │   │           │       │   │       │   └── value: Identifier
+            │   │           │       │   │       │       └── value: "Person"
+            │   │           │       │   │       ├── properties: MapLiteral
+            │   │           │       │   │       │   └── entries: List (len=1)
+            │   │           │       │   │       │       └── [0]
+            │   │           │       │   │       │           ├── key: Identifier
+            │   │           │       │   │       │           │   └── value: "name"
+            │   │           │       │   │       │           └── value: Expr::Literal
+            │   │           │       │   │       │               └── value: Literal::String
+            │   │           │       │   │       │                   └── value: "Alice"
+            │   │           │       │   │       ├── where_clause: None
+            │   │           │       │   │       └── quantifier: None
+            │   │           │       │   ├── [1]: PathPatternFactor::Relationship
+            │   │           │       │   │   └── value: RelationshipPattern
+            │   │           │       │   │       ├── direction: Direction::Right
+            │   │           │       │   │       ├── variable: Identifier
+            │   │           │       │   │       │   └── value: "r"
+            │   │           │       │   │       ├── temporary: false
+            │   │           │       │   │       ├── labels: List (len=1)
+            │   │           │       │   │       │   └── [0]: Identifier
+            │   │           │       │   │       │       └── value: "KNOWS"
+            │   │           │       │   │       ├── label_expression: LabelExpression::Label
+            │   │           │       │   │       │   └── value: Identifier
+            │   │           │       │   │       │       └── value: "KNOWS"
+            │   │           │       │   │       ├── properties: None
+            │   │           │       │   │       ├── where_clause: None
+            │   │           │       │   │       └── quantifier: None
+            │   │           │       │   └── [2]: PathPatternFactor::Node
+            │   │           │       │       └── value: NodePattern
+            │   │           │       │           ├── variable: Identifier
+            │   │           │       │           │   └── value: "f"
+            │   │           │       │           ├── temporary: false
+            │   │           │       │           ├── labels: List (len=1)
+            │   │           │       │           │   └── [0]: Identifier
+            │   │           │       │           │       └── value: "Person"
+            │   │           │       │           ├── label_expression: LabelExpression::Label
+            │   │           │       │           │   └── value: Identifier
+            │   │           │       │           │       └── value: "Person"
+            │   │           │       │           ├── properties: None
+            │   │           │       │           ├── where_clause: None
+            │   │           │       │           └── quantifier: None
+            │   │           │       ├── alternation: None
+            │   │           │       └── alternatives: []
+            │   │           ├── keep: None
+            │   │           ├── where_clause: Expr::Binary
+            │   │           │   ├── left: Expr::Property
+            │   │           │   │   ├── base: Expr::Identifier
+            │   │           │   │   │   └── value: Identifier
+            │   │           │   │   │       └── value: "f"
+            │   │           │   │   └── key: Identifier
+            │   │           │   │       └── value: "age"
+            │   │           │   ├── op: BinaryOp::Ge
+            │   │           │   └── right: Expr::Literal
+            │   │           │       └── value: Literal::Integer
+            │   │           │           └── value: 18
+            │   │           └── yield_clause: None
+            │   ├── result_clause: ResultClause
+            │   │   ├── kind: ResultKind::Return
+            │   │   ├── quantifier: SetQuantifier::Distinct
+            │   │   ├── distinct: true
+            │   │   └── items: List (len=1)
+            │   │       └── [0]: ResultItem
+            │   │           ├── expr: Expr::Property
+            │   │           │   ├── base: Expr::Identifier
+            │   │           │   │   └── value: Identifier
+            │   │           │   │       └── value: "f"
+            │   │           │   └── key: Identifier
+            │   │           │       └── value: "name"
+            │   │           └── alias: Identifier
+            │   │               └── value: "friend"
+            │   ├── select_from: []
+            │   ├── select_query: None
+            │   ├── select_where: None
+            │   ├── group_by: []
+            │   ├── empty_grouping_set: false
+            │   ├── having: None
+            │   ├── order_by: List (len=1)
+            │   │   └── [0]: OrderByItem
+            │   │       ├── expr: Expr::Property
+            │   │       │   ├── base: Expr::Identifier
+            │   │       │   │   └── value: Identifier
+            │   │       │   │       └── value: "f"
+            │   │       │   └── key: Identifier
+            │   │       │       └── value: "name"
+            │   │       ├── direction: SortDirection::Desc
+            │   │       └── null_ordering: None
+            │   ├── offset: None
+            │   └── limit: UnsignedIntegerSpecification::Literal
+            │       └── value: 10
+            └── set_operations: []

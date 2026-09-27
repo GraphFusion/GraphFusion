@@ -1,0 +1,45 @@
+Program
+├── at_schema: None
+├── definitions: []
+└── statements: List (len=1)
+    └── [0]: Statement::CreateGraphType
+        └── value: CreateGraphTypeStatement
+            ├── if_not_exists: false
+            ├── or_replace: false
+            ├── property_graph: false
+            ├── name: GraphTypeName
+            │   ├── absolute: false
+            │   ├── current_schema: false
+            │   ├── home_schema: false
+            │   ├── parent_levels: 0
+            │   └── parts: List (len=1)
+            │       └── [0]: Identifier
+            │           └── value: "social"
+            └── source: CreateGraphTypeSource::Nested
+                └── value: GraphTypeBody
+                    └── elements: List (len=1)
+                        └── [0]: GraphTypeElement::Node
+                            └── value: NodeTypeDefinition
+                                ├── name: Identifier
+                                │   └── value: "Person"
+                                ├── labels: []
+                                └── properties: List (len=2)
+                                    ├── [0]: PropertyTypeDefinition
+                                    │   ├── name: Identifier
+                                    │   │   └── value: "name"
+                                    │   └── value_type: ValueType::NotNull
+                                    │       └── value: ValueType::CharacterString
+                                    │           ├── kind: CharacterStringTypeKind::String
+                                    │           └── max_length: None
+                                    └── [1]: PropertyTypeDefinition
+                                        ├── name: Identifier
+                                        │   └── value: "meta"
+                                        └── value_type: ValueType::Record
+                                            └── value: List (len=1)
+                                                └── [0]: FieldType
+                                                    ├── name: Identifier
+                                                    │   └── value: "tags"
+                                                    └── value_type: ValueType::List
+                                                        └── value: ValueType::CharacterString
+                                                            ├── kind: CharacterStringTypeKind::String
+                                                            └── max_length: None

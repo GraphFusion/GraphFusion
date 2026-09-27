@@ -1,0 +1,256 @@
+Program
+├── at_schema: None
+├── definitions: []
+└── statements: List (len=1)
+    └── [0]: Statement::Query
+        └── value: QueryStatement
+            ├── at_schema: None
+            ├── use_graph: None
+            ├── body: QueryBody
+            │   ├── clauses: List (len=1)
+            │   │   └── [0]: QueryClause::Match
+            │   │       └── value: MatchClause
+            │   │           ├── optional: false
+            │   │           ├── mode: None
+            │   │           ├── patterns: List (len=1)
+            │   │           │   └── [0]: PathPattern
+            │   │           │       ├── variable: Identifier
+            │   │           │       │   └── value: "p"
+            │   │           │       ├── prefix: None
+            │   │           │       ├── parenthesized: None
+            │   │           │       ├── start: NodePattern
+            │   │           │       │   ├── variable: Identifier
+            │   │           │       │   │   └── value: "a"
+            │   │           │       │   ├── temporary: false
+            │   │           │       │   ├── labels: []
+            │   │           │       │   ├── label_expression: None
+            │   │           │       │   ├── properties: None
+            │   │           │       │   ├── where_clause: None
+            │   │           │       │   └── quantifier: None
+            │   │           │       ├── chains: List (len=1)
+            │   │           │       │   └── [0]: PathPatternChain
+            │   │           │       │       ├── relationship: RelationshipPattern
+            │   │           │       │       │   ├── direction: Direction::Right
+            │   │           │       │       │   ├── variable: None
+            │   │           │       │       │   ├── temporary: false
+            │   │           │       │       │   ├── labels: []
+            │   │           │       │       │   ├── label_expression: None
+            │   │           │       │       │   ├── properties: None
+            │   │           │       │       │   ├── where_clause: None
+            │   │           │       │       │   └── quantifier: None
+            │   │           │       │       └── node: NodePattern
+            │   │           │       │           ├── variable: Identifier
+            │   │           │       │           │   └── value: "c"
+            │   │           │       │           ├── temporary: false
+            │   │           │       │           ├── labels: []
+            │   │           │       │           ├── label_expression: None
+            │   │           │       │           ├── properties: None
+            │   │           │       │           ├── where_clause: None
+            │   │           │       │           └── quantifier: None
+            │   │           │       ├── factors: List (len=3)
+            │   │           │       │   ├── [0]: PathPatternFactor::Parenthesized
+            │   │           │       │   │   └── value: ParenthesizedPathPatternExpression
+            │   │           │       │   │       ├── variable: None
+            │   │           │       │   │       ├── prefix: None
+            │   │           │       │   │       ├── pattern: PathPattern
+            │   │           │       │   │       │   ├── variable: None
+            │   │           │       │   │       │   ├── prefix: None
+            │   │           │       │   │       │   ├── parenthesized: None
+            │   │           │       │   │       │   ├── start: NodePattern
+            │   │           │       │   │       │   │   ├── variable: Identifier
+            │   │           │       │   │       │   │   │   └── value: "a"
+            │   │           │       │   │       │   │   ├── temporary: false
+            │   │           │       │   │       │   │   ├── labels: []
+            │   │           │       │   │       │   │   ├── label_expression: None
+            │   │           │       │   │       │   │   ├── properties: None
+            │   │           │       │   │       │   │   ├── where_clause: None
+            │   │           │       │   │       │   │   └── quantifier: None
+            │   │           │       │   │       │   ├── chains: List (len=1)
+            │   │           │       │   │       │   │   └── [0]: PathPatternChain
+            │   │           │       │   │       │   │       ├── relationship: RelationshipPattern
+            │   │           │       │   │       │   │       │   ├── direction: Direction::Right
+            │   │           │       │   │       │   │       │   ├── variable: None
+            │   │           │       │   │       │   │       │   ├── temporary: false
+            │   │           │       │   │       │   │       │   ├── labels: []
+            │   │           │       │   │       │   │       │   ├── label_expression: None
+            │   │           │       │   │       │   │       │   ├── properties: None
+            │   │           │       │   │       │   │       │   ├── where_clause: None
+            │   │           │       │   │       │   │       │   └── quantifier: None
+            │   │           │       │   │       │   │       └── node: NodePattern
+            │   │           │       │   │       │   │           ├── variable: Identifier
+            │   │           │       │   │       │   │           │   └── value: "b"
+            │   │           │       │   │       │   │           ├── temporary: false
+            │   │           │       │   │       │   │           ├── labels: []
+            │   │           │       │   │       │   │           ├── label_expression: None
+            │   │           │       │   │       │   │           ├── properties: None
+            │   │           │       │   │       │   │           ├── where_clause: None
+            │   │           │       │   │       │   │           └── quantifier: None
+            │   │           │       │   │       │   ├── factors: List (len=3)
+            │   │           │       │   │       │   │   ├── [0]: PathPatternFactor::Node
+            │   │           │       │   │       │   │   │   └── value: NodePattern
+            │   │           │       │   │       │   │   │       ├── variable: Identifier
+            │   │           │       │   │       │   │   │       │   └── value: "a"
+            │   │           │       │   │       │   │   │       ├── temporary: false
+            │   │           │       │   │       │   │   │       ├── labels: []
+            │   │           │       │   │       │   │   │       ├── label_expression: None
+            │   │           │       │   │       │   │   │       ├── properties: None
+            │   │           │       │   │       │   │   │       ├── where_clause: None
+            │   │           │       │   │       │   │   │       └── quantifier: None
+            │   │           │       │   │       │   │   ├── [1]: PathPatternFactor::Relationship
+            │   │           │       │   │       │   │   │   └── value: RelationshipPattern
+            │   │           │       │   │       │   │   │       ├── direction: Direction::Right
+            │   │           │       │   │       │   │   │       ├── variable: None
+            │   │           │       │   │       │   │   │       ├── temporary: false
+            │   │           │       │   │       │   │   │       ├── labels: []
+            │   │           │       │   │       │   │   │       ├── label_expression: None
+            │   │           │       │   │       │   │   │       ├── properties: None
+            │   │           │       │   │       │   │   │       ├── where_clause: None
+            │   │           │       │   │       │   │   │       └── quantifier: None
+            │   │           │       │   │       │   │   └── [2]: PathPatternFactor::Node
+            │   │           │       │   │       │   │       └── value: NodePattern
+            │   │           │       │   │       │   │           ├── variable: Identifier
+            │   │           │       │   │       │   │           │   └── value: "b"
+            │   │           │       │   │       │   │           ├── temporary: false
+            │   │           │       │   │       │   │           ├── labels: []
+            │   │           │       │   │       │   │           ├── label_expression: None
+            │   │           │       │   │       │   │           ├── properties: None
+            │   │           │       │   │       │   │           ├── where_clause: None
+            │   │           │       │   │       │   │           └── quantifier: None
+            │   │           │       │   │       │   ├── alternation: None
+            │   │           │       │   │       │   └── alternatives: []
+            │   │           │       │   │       ├── where_clause: None
+            │   │           │       │   │       ├── quantifier: PathPatternQuantifier::Range
+            │   │           │       │   │       │   ├── min: 1
+            │   │           │       │   │       │   └── max: 2
+            │   │           │       │   │       └── questioned: false
+            │   │           │       │   ├── [1]: PathPatternFactor::Relationship
+            │   │           │       │   │   └── value: RelationshipPattern
+            │   │           │       │   │       ├── direction: Direction::Right
+            │   │           │       │   │       ├── variable: None
+            │   │           │       │   │       ├── temporary: false
+            │   │           │       │   │       ├── labels: []
+            │   │           │       │   │       ├── label_expression: None
+            │   │           │       │   │       ├── properties: None
+            │   │           │       │   │       ├── where_clause: None
+            │   │           │       │   │       └── quantifier: None
+            │   │           │       │   └── [2]: PathPatternFactor::Node
+            │   │           │       │       └── value: NodePattern
+            │   │           │       │           ├── variable: Identifier
+            │   │           │       │           │   └── value: "c"
+            │   │           │       │           ├── temporary: false
+            │   │           │       │           ├── labels: []
+            │   │           │       │           ├── label_expression: None
+            │   │           │       │           ├── properties: None
+            │   │           │       │           ├── where_clause: None
+            │   │           │       │           └── quantifier: None
+            │   │           │       ├── alternation: PathPatternAlternation::Union
+            │   │           │       └── alternatives: List (len=1)
+            │   │           │           └── [0]: PathPatternTerm
+            │   │           │               ├── start: NodePattern
+            │   │           │               │   ├── variable: Identifier
+            │   │           │               │   │   └── value: "x"
+            │   │           │               │   ├── temporary: false
+            │   │           │               │   ├── labels: []
+            │   │           │               │   ├── label_expression: None
+            │   │           │               │   ├── properties: None
+            │   │           │               │   ├── where_clause: None
+            │   │           │               │   └── quantifier: None
+            │   │           │               ├── chains: []
+            │   │           │               └── factors: List (len=1)
+            │   │           │                   └── [0]: PathPatternFactor::Parenthesized
+            │   │           │                       └── value: ParenthesizedPathPatternExpression
+            │   │           │                           ├── variable: None
+            │   │           │                           ├── prefix: None
+            │   │           │                           ├── pattern: PathPattern
+            │   │           │                           │   ├── variable: None
+            │   │           │                           │   ├── prefix: None
+            │   │           │                           │   ├── parenthesized: None
+            │   │           │                           │   ├── start: NodePattern
+            │   │           │                           │   │   ├── variable: Identifier
+            │   │           │                           │   │   │   └── value: "x"
+            │   │           │                           │   │   ├── temporary: false
+            │   │           │                           │   │   ├── labels: []
+            │   │           │                           │   │   ├── label_expression: None
+            │   │           │                           │   │   ├── properties: None
+            │   │           │                           │   │   ├── where_clause: None
+            │   │           │                           │   │   └── quantifier: None
+            │   │           │                           │   ├── chains: List (len=1)
+            │   │           │                           │   │   └── [0]: PathPatternChain
+            │   │           │                           │   │       ├── relationship: RelationshipPattern
+            │   │           │                           │   │       │   ├── direction: Direction::Right
+            │   │           │                           │   │       │   ├── variable: None
+            │   │           │                           │   │       │   ├── temporary: false
+            │   │           │                           │   │       │   ├── labels: []
+            │   │           │                           │   │       │   ├── label_expression: None
+            │   │           │                           │   │       │   ├── properties: None
+            │   │           │                           │   │       │   ├── where_clause: None
+            │   │           │                           │   │       │   └── quantifier: None
+            │   │           │                           │   │       └── node: NodePattern
+            │   │           │                           │   │           ├── variable: Identifier
+            │   │           │                           │   │           │   └── value: "y"
+            │   │           │                           │   │           ├── temporary: false
+            │   │           │                           │   │           ├── labels: []
+            │   │           │                           │   │           ├── label_expression: None
+            │   │           │                           │   │           ├── properties: None
+            │   │           │                           │   │           ├── where_clause: None
+            │   │           │                           │   │           └── quantifier: None
+            │   │           │                           │   ├── factors: List (len=3)
+            │   │           │                           │   │   ├── [0]: PathPatternFactor::Node
+            │   │           │                           │   │   │   └── value: NodePattern
+            │   │           │                           │   │   │       ├── variable: Identifier
+            │   │           │                           │   │   │       │   └── value: "x"
+            │   │           │                           │   │   │       ├── temporary: false
+            │   │           │                           │   │   │       ├── labels: []
+            │   │           │                           │   │   │       ├── label_expression: None
+            │   │           │                           │   │   │       ├── properties: None
+            │   │           │                           │   │   │       ├── where_clause: None
+            │   │           │                           │   │   │       └── quantifier: None
+            │   │           │                           │   │   ├── [1]: PathPatternFactor::Relationship
+            │   │           │                           │   │   │   └── value: RelationshipPattern
+            │   │           │                           │   │   │       ├── direction: Direction::Right
+            │   │           │                           │   │   │       ├── variable: None
+            │   │           │                           │   │   │       ├── temporary: false
+            │   │           │                           │   │   │       ├── labels: []
+            │   │           │                           │   │   │       ├── label_expression: None
+            │   │           │                           │   │   │       ├── properties: None
+            │   │           │                           │   │   │       ├── where_clause: None
+            │   │           │                           │   │   │       └── quantifier: None
+            │   │           │                           │   │   └── [2]: PathPatternFactor::Node
+            │   │           │                           │   │       └── value: NodePattern
+            │   │           │                           │   │           ├── variable: Identifier
+            │   │           │                           │   │           │   └── value: "y"
+            │   │           │                           │   │           ├── temporary: false
+            │   │           │                           │   │           ├── labels: []
+            │   │           │                           │   │           ├── label_expression: None
+            │   │           │                           │   │           ├── properties: None
+            │   │           │                           │   │           ├── where_clause: None
+            │   │           │                           │   │           └── quantifier: None
+            │   │           │                           │   ├── alternation: None
+            │   │           │                           │   └── alternatives: []
+            │   │           │                           ├── where_clause: None
+            │   │           │                           ├── quantifier: None
+            │   │           │                           └── questioned: false
+            │   │           ├── keep: None
+            │   │           ├── where_clause: None
+            │   │           └── yield_clause: None
+            │   ├── result_clause: ResultClause
+            │   │   ├── kind: ResultKind::Return
+            │   │   ├── quantifier: SetQuantifier::All
+            │   │   ├── distinct: false
+            │   │   └── items: List (len=1)
+            │   │       └── [0]: ResultItem
+            │   │           ├── expr: Expr::Identifier
+            │   │           │   └── value: Identifier
+            │   │           │       └── value: "p"
+            │   │           └── alias: Identifier
+            │   │               └── value: "p"
+            │   ├── select_from: []
+            │   ├── select_query: None
+            │   ├── select_where: None
+            │   ├── group_by: []
+            │   ├── empty_grouping_set: false
+            │   ├── having: None
+            │   ├── order_by: []
+            │   ├── offset: None
+            │   └── limit: None
+            └── set_operations: []

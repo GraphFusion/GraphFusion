@@ -1,0 +1,90 @@
+Program
+├── at_schema: None
+├── definitions: []
+└── statements: List (len=1)
+    └── [0]: Statement::Query
+        └── value: QueryStatement
+            ├── at_schema: None
+            ├── use_graph: None
+            ├── body: QueryBody
+            │   ├── clauses: List (len=1)
+            │   │   └── [0]: QueryClause::Call
+            │   │       └── value: CallClause
+            │   │           ├── optional: false
+            │   │           ├── call: ProcedureCall::Inline
+            │   │           │   └── value: InlineProcedureCall
+            │   │           │       ├── variable_scope: []
+            │   │           │       └── body: Program
+            │   │           │           ├── at_schema: SchemaReference::Name
+            │   │           │           │   └── value: SchemaName
+            │   │           │           │       ├── absolute: false
+            │   │           │           │       ├── current_schema: false
+            │   │           │           │       ├── home_schema: false
+            │   │           │           │       ├── parent_levels: 0
+            │   │           │           │       └── parts: List (len=2)
+            │   │           │           │           ├── [0]: Identifier
+            │   │           │           │           │   └── value: "app"
+            │   │           │           │           └── [1]: Identifier
+            │   │           │           │               └── value: "main"
+            │   │           │           ├── definitions: List (len=1)
+            │   │           │           │   └── [0]: BindingVariableDefinition::Value
+            │   │           │           │       └── value: ValueVariableDefinition
+            │   │           │           │           ├── name: Identifier
+            │   │           │           │           │   └── value: "fallback"
+            │   │           │           │           ├── typed: false
+            │   │           │           │           ├── value_type: ValueType::CharacterString
+            │   │           │           │           │   ├── kind: CharacterStringTypeKind::String
+            │   │           │           │           │   └── max_length: None
+            │   │           │           │           └── initializer: Expr::Literal
+            │   │           │           │               └── value: Literal::String
+            │   │           │           │                   └── value: "unknown"
+            │   │           │           └── statements: List (len=1)
+            │   │           │               └── [0]: Statement::Query
+            │   │           │                   └── value: QueryStatement
+            │   │           │                       ├── at_schema: None
+            │   │           │                       ├── use_graph: None
+            │   │           │                       ├── body: QueryBody
+            │   │           │                       │   ├── clauses: []
+            │   │           │                       │   ├── result_clause: ResultClause
+            │   │           │                       │   │   ├── kind: ResultKind::Return
+            │   │           │                       │   │   ├── quantifier: SetQuantifier::All
+            │   │           │                       │   │   ├── distinct: false
+            │   │           │                       │   │   └── items: List (len=1)
+            │   │           │                       │   │       └── [0]: ResultItem
+            │   │           │                       │   │           ├── expr: Expr::Identifier
+            │   │           │                       │   │           │   └── value: Identifier
+            │   │           │                       │   │           │       └── value: "fallback"
+            │   │           │                       │   │           └── alias: Identifier
+            │   │           │                       │   │               └── value: "fallback"
+            │   │           │                       │   ├── select_from: []
+            │   │           │                       │   ├── select_query: None
+            │   │           │                       │   ├── select_where: None
+            │   │           │                       │   ├── group_by: []
+            │   │           │                       │   ├── empty_grouping_set: false
+            │   │           │                       │   ├── having: None
+            │   │           │                       │   ├── order_by: []
+            │   │           │                       │   ├── offset: None
+            │   │           │                       │   └── limit: None
+            │   │           │                       └── set_operations: []
+            │   │           └── yield_clause: None
+            │   ├── result_clause: ResultClause
+            │   │   ├── kind: ResultKind::Return
+            │   │   ├── quantifier: SetQuantifier::All
+            │   │   ├── distinct: false
+            │   │   └── items: List (len=1)
+            │   │       └── [0]: ResultItem
+            │   │           ├── expr: Expr::Identifier
+            │   │           │   └── value: Identifier
+            │   │           │       └── value: "fallback"
+            │   │           └── alias: Identifier
+            │   │               └── value: "fallback"
+            │   ├── select_from: []
+            │   ├── select_query: None
+            │   ├── select_where: None
+            │   ├── group_by: []
+            │   ├── empty_grouping_set: false
+            │   ├── having: None
+            │   ├── order_by: []
+            │   ├── offset: None
+            │   └── limit: None
+            └── set_operations: []

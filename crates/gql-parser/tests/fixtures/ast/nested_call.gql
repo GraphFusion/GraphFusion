@@ -1,0 +1,1 @@
+CALL () { AT SCHEMA app.main VALUE fallback STRING = 'unknown' RETURN fallback } RETURN fallback

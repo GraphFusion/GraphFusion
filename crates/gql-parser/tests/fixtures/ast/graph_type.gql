@@ -1,0 +1,1 @@
+CREATE GRAPH TYPE social AS { NODE Person {name STRING NOT NULL, meta RECORD {tags LIST<STRING>}} }

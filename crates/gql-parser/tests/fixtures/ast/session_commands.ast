@@ -1,0 +1,25 @@
+Program
+├── at_schema: None
+├── definitions: []
+└── statements: List (len=3)
+    ├── [0]: Statement::SessionSet
+    │   └── value: SessionSetCommand
+    │       └── target: SessionSetTarget::ValueParameter
+    │           └── value: SessionSetValueParameter
+    │               ├── if_not_exists: true
+    │               ├── name: "limit"
+    │               ├── typed: false
+    │               ├── value_type: ValueType::ExactNumeric
+    │               │   ├── kind: ExactNumericTypeKind::Integer
+    │               │   ├── signed: true
+    │               │   ├── precision: None
+    │               │   └── scale: None
+    │               └── initializer: Expr::Literal
+    │                   └── value: Literal::Integer
+    │                       └── value: 10
+    ├── [1]: Statement::SessionReset
+    │   └── value: SessionResetCommand
+    │       └── target: SessionResetTarget::Parameter
+    │           └── value: "limit"
+    └── [2]: Statement::SessionClose
+        └── value: SessionCloseCommand

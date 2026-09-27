@@ -1,0 +1,1 @@
+MATCH (p:Person {name: 'Alice'})-[r:KNOWS]->(f:Person) WHERE f.age >= 18 RETURN DISTINCT f.name AS friend ORDER BY f.name DESC LIMIT 10
