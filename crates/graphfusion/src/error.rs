@@ -1,4 +1,4 @@
-use std::{fmt, io};
+use std::{fmt, io, path::PathBuf};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -22,6 +22,7 @@ pub enum Error {
     TransactionFailed,
     ReadOnlyTransaction,
     Busy,
+    DatabaseInUse(PathBuf),
     CommitUnknown(io::Error),
     Poisoned,
 }
@@ -49,10 +50,11 @@ impl fmt::Display for Error {
                 write!(f, "writes are forbidden in a READ ONLY transaction")
             }
             Self::Busy => write!(f, "active statements or transactions prevent checkpoint"),
+            Self::DatabaseInUse(path) => write!(f, "database is already open in another process: {}", path.display()),
             Self::CommitUnknown(e) => {
                 write!(f, "commit outcome is unknown; reopen before retrying: {e}")
             }
-            Self::Poisoned => write!(f, "database coordinator is poisoned"),
+            Self::Poisoned => write!(f, "database coordinator is poisoned; drop all database and session handles before reopening"),
         }
     }
 }

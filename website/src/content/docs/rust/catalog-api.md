@@ -11,6 +11,6 @@ sidebar:
 
 `Database::statistics()` reports commits, conflicts, lock-wait time, recovery/checkpoint time, busy checkpoints and log bytes. Counts are process-local rather than a cluster-wide monitoring history.
 
-`Database::checkpoint()` requests an idle checkpoint and may return Busy while a statement or transaction in any cooperating process holds a snapshot. See [checkpointing](/storage/checkpoint/).
+`Database::checkpoint()` requests an idle checkpoint and may return Busy while a statement or transaction in the owning process holds a snapshot. See [checkpointing](/storage/checkpoint/).
 
 Generate Rust API documentation from the checkout with `cargo doc --workspace --no-deps --locked --open`. This uses the exact code revision you are building instead of assuming a published crate version.

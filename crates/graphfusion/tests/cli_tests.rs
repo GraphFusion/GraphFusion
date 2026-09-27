@@ -6,13 +6,34 @@ use graphfusion::arrow::{
 };
 use std::{
     fs,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::Arc,
 };
 
 struct Fixture(PathBuf);
 impl Fixture {
+    fn repl(&self, input: &str) -> Output {
+        self.interactive(&["db"], input)
+    }
+    fn interactive(&self, args: &[&str], input: &str) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_graphfusion"))
+            .args(args)
+            .current_dir(&self.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -81,6 +102,243 @@ impl Fixture {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
+    }
+}
+
+#[test]
+fn repl_keeps_graph_parameters_and_transactions_between_inputs() {
+    let fixture = Fixture::new();
+    let output = fixture.repl("\\help\nCREATE GRAPH g ANY GRAPH;\nSESSION SET GRAPH g;\nSESSION SET VALUE $name STRING = 'Alice;--still text';\nSTART TRANSACTION;\nINSERT (:Person {name: $name});\nMATCH (p:Person)\nRETURN p.name AS name; -- comment;\nCOMMIT;\n\\graphs\n\\checkpoint\n\\q\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Alice;--still text"), "{stdout}");
+    assert!(stdout.contains("pending_snapshot="), "{stdout}");
+    assert!(stdout.contains("transaction=committed"), "{stdout}");
+    assert!(stdout.contains("OK checkpoint"), "{stdout}");
+    let persisted = fixture.run(
+        "run",
+        &["--query", "USE GRAPH g MATCH (n) RETURN n.name AS name"],
+    );
+    assert!(persisted.contains("Alice;--still text"));
+}
+
+#[test]
+fn interactive_entry_defaults_to_memory_and_opens_or_creates_a_directory() {
+    let fixture = Fixture::new();
+    let initial_files = fs::read_dir(&fixture.0).unwrap().count();
+    let memory_args: &[&[&str]] = &[&[], &[":memory:"], &["--database", ":memory:"]];
+    for args in memory_args {
+        let output = fixture.interactive(args, "RETURN 42 AS answer;\n\\quit\n");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("42"));
+    }
+    assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), initial_files);
+    let created = fixture.repl("CREATE GRAPH g ANY GRAPH;\n\\quit\n");
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(fixture.0.join("db/MANIFEST").is_file());
+    let reopened = fixture.repl("USE GRAPH g RETURN 42 AS answer;\n\\quit\n");
+    assert!(
+        reopened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("42"));
+}
+
+#[test]
+fn interactive_paths_support_options_spaces_and_command_names() {
+    let fixture = Fixture::new();
+    let cases: &[(&[&str], &str)] = &[
+        (&["--explain", "with spaces"], "with spaces"),
+        (&["with spaces", "--explain"], "with spaces"),
+        (
+            &["--database", "named directory", "--explain"],
+            "named directory",
+        ),
+        (&["--", "-data"], "-data"),
+        (&["--", "run"], "run"),
+        (&["./run"], "run"),
+        (&["--database", "run"], "run"),
+    ];
+    for (args, directory) in cases {
+        let output = fixture.interactive(args, "RETURN 42 AS answer;\n\\quit\n");
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("42"), "{stdout}");
+        if args.contains(&"--explain") {
+            assert!(stdout.contains("Logical plan:"), "{stdout}");
+        }
+        assert!(fixture.0.join(directory).join("MANIFEST").is_file());
+    }
+}
+
+#[test]
+fn invalid_interactive_arguments_and_help_do_not_create_databases() {
+    let fixture = Fixture::new();
+    let initial_files = fs::read_dir(&fixture.0).unwrap().count();
+    let invalid: &[&[&str]] = &[
+        &["db", "second"],
+        &["db", "--database", "second"],
+        &["--database", "db", "second"],
+        &["db", "--unknown"],
+        &["db", "--create"],
+        &["--database"],
+        &["--database", "--explain"],
+        &["db", "--explain", "--explain"],
+        &["db", "--file", "missing"],
+        &[""],
+    ];
+    for args in invalid {
+        let output = fixture.interactive(args, "");
+        assert!(!output.status.success(), "{args:?}");
+        assert_eq!(
+            fs::read_dir(&fixture.0).unwrap().count(),
+            initial_files,
+            "{args:?}"
+        );
+    }
+    for help in ["-h", "--help"] {
+        let output = fixture.interactive(&["db", help], "");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("graphfusion [DIR]"));
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), initial_files);
+    }
+}
+
+#[test]
+fn idle_repl_holds_database_until_exit() {
+    let fixture = Fixture::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_graphfusion"))
+        .arg(fixture.0.join("db"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "CREATE GRAPH ready ANY GRAPH;").unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let rejected = fixture.invoke("run", &["--query", "USE GRAPH ready RETURN 1 AS n"]);
+    writeln!(input, "\\quit").unwrap();
+    drop(input);
+    let exited = child.wait_with_output().unwrap();
+    assert!(ready.contains("OK commit="), "{ready}");
+    assert!(
+        exited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exited.stderr)
+    );
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("already open in another process"));
+    fixture.run("run", &["--query", "USE GRAPH ready RETURN 1 AS n"]);
+}
+
+#[test]
+fn piped_repl_preserves_multiline_string_contents_exactly() {
+    let fixture = Fixture::new();
+    let output = fixture.repl("CREATE GRAPH g ANY GRAPH;\nSESSION SET GRAPH g;\nINSERT (:N {text: 'first\nsecond;still string'});\n\\quit\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fixture.run(
+        "run",
+        &[
+            "--query",
+            "USE GRAPH g MATCH (n) RETURN n.text = 'first\nsecond;still string' AS exact",
+        ],
+    );
+    assert!(result.contains("| true  |"), "{result}");
+}
+
+#[test]
+fn repl_recovers_from_errors_and_requires_rollback_after_transaction_failure() {
+    let fixture = Fixture::new();
+    let output = fixture.repl("START TRANSACTION;\nCREATE GRAPH uncommitted ANY GRAPH;\nRETURN missing;\n\\status\nCOMMIT;\nROLLBACK;\nSTART TRANSACTION;\nCREATE GRAPH lexical_error ANY GRAPH;\nRETURN @;\nCOMMIT;\nROLLBACK;\nCREATE GRAPH committed ANY GRAPH;\nRETURN 42 AS answer;\n\\quit\n");
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("transaction=Failed"), "{stdout}");
+    assert!(stdout.contains("42"), "{stdout}");
+    assert!(stderr.contains("ROLLBACK is required"), "{stderr}");
+    fixture.run("run", &["--query", "USE GRAPH committed RETURN 1 AS n"]);
+    assert!(!fixture
+        .invoke("run", &["--query", "USE GRAPH lexical_error RETURN 1 AS n"])
+        .status
+        .success());
+    assert!(!fixture
+        .invoke("run", &["--query", "USE GRAPH uncommitted RETURN 1 AS n"])
+        .status
+        .success());
+}
+
+#[test]
+fn repl_exit_and_eof_rollback_and_discard_unterminated_input() {
+    for ending in ["\\q\n", ""] {
+        let fixture = Fixture::new();
+        let output = fixture.repl(&format!(
+            "START TRANSACTION; CREATE GRAPH uncommitted ANY GRAPH;\n{ending}"
+        ));
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("transaction rolled back"));
+        assert!(!fixture
+            .invoke("run", &["--query", "USE GRAPH uncommitted RETURN 1 AS n"])
+            .status
+            .success());
+    }
+    let fixture = Fixture::new();
+    let output = fixture.repl("CREATE GRAPH unfinished ANY GRAPH");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unfinished input discarded"));
+    assert!(!fixture
+        .invoke("run", &["--query", "USE GRAPH unfinished RETURN 1 AS n"])
+        .status
+        .success());
+}
+
+#[test]
+fn repl_reads_files_clears_input_and_handles_multiline_strings() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.join("my setup.gql"),
+        "CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {name: 'from file'});",
+    )
+    .unwrap();
+    let output = fixture.repl("\\read my setup.gql\nMATCH (n) RETURN n.name AS name;\nRETURN 'unfinished\n\\clear\n/* incomplete;\ncomment; */ RETURN 'multi\nline;value' AS text;\nRETURN 7 AS n;\n\\explain on\nRETURN 42 AS answer;\n\\q\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "from file",
+        "line;value",
+        "7",
+        "42",
+        "Logical plan:",
+        "Physical plan:",
+    ] {
+        assert!(stdout.contains(expected), "{stdout}");
     }
 }
 impl Drop for Fixture {

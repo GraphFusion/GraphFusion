@@ -14,7 +14,7 @@ cargo run -p graphfusion --locked -- run --database ./demo-db --create \
 
 Durable graph changes stage immutable Parquet files and publish their metadata with catalog changes in one checksummed logical WAL commit. Readers keep a consistent catalog/storage snapshot while a statement materializes results. Explicit transactions retain their snapshot between calls.
 
-The supported environment is Linux/macOS on a local filesystem with OS file locks, atomic rename and file/directory synchronization. Cooperating processes can share the same database path. Network filesystems, object storage and inherited open handles after fork are not supported.
+The supported environment is Linux/macOS on a local filesystem with OS file locks, atomic rename and file/directory synchronization. Only one process may open a database directory at a time; a second process receives `Error::DatabaseInUse` immediately. Within the owning process, repeated opens of the same canonical path share one coordinator, and cloned database handles with independent sessions support concurrent threads. The exclusive OS lock remains held until the last database, session or transaction handle is dropped, and is released if the process exits or is killed. Network filesystems, object storage and inherited open handles after fork are not supported.
 
 ## Recovery and format
 

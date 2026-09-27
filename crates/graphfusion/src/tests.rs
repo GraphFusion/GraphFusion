@@ -675,6 +675,46 @@ fn multiple_threads_commit_disjoint_changes() {
     );
 }
 
+struct ThreadWorker {
+    thread: Option<std::thread::JoinHandle<String>>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+impl ThreadWorker {
+    fn start(dir: &TestDir, mode: &str, name: &str) -> Self {
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let (path, mode, name) = (dir.0.clone(), mode.to_owned(), name.to_owned());
+        let thread = std::thread::spawn(move || {
+            let db = Database::open(path, OpenOptions::default()).unwrap();
+            worker(db, &mode, &name, || {
+                ready.send(()).unwrap();
+                let _ = proceed.recv();
+            })
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap();
+        Self {
+            thread: Some(thread),
+            release: Some(release),
+        }
+    }
+    fn release(&mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+    }
+    fn finish(mut self) -> String {
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+impl Drop for ThreadWorker {
+    fn drop(&mut self) {
+        self.release.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 struct Worker {
     child: Child,
     output: BufReader<ChildStdout>,
@@ -727,19 +767,19 @@ fn child_command(dir: &TestDir, mode: &str) -> Command {
 }
 
 #[test]
-fn multiprocess_writers_and_refresh() {
+fn multithread_writers_share_state_and_conflict() {
     let dir = TestDir::new();
     let db = dir.open();
-    let mut a = Worker::start(&dir, "create", "a");
-    let mut b = Worker::start(&dir, "create", "b");
+    let mut a = ThreadWorker::start(&dir, "create", "a");
+    let mut b = ThreadWorker::start(&dir, "create", "b");
     a.release();
     b.release();
     assert!(a.finish().contains("GF_COMMITTED"));
     assert!(b.finish().contains("GF_COMMITTED"));
     assert!(graph_id(&db, "a").is_some());
     assert!(graph_id(&db, "b").is_some());
-    let mut a = Worker::start(&dir, "create", "same");
-    let mut b = Worker::start(&dir, "create", "same");
+    let mut a = ThreadWorker::start(&dir, "create", "same");
+    let mut b = ThreadWorker::start(&dir, "create", "same");
     a.release();
     b.release();
     let outcomes = [a.finish(), b.finish()];
@@ -761,21 +801,80 @@ fn multiprocess_writers_and_refresh() {
 }
 
 #[test]
-fn cross_process_reader_pins_data_and_kill_releases_locks() {
+fn database_ownership_includes_idle_sessions_and_path_aliases() {
+    let dir = TestDir::new();
+    let db = dir.open();
+    let alias = TestDir::new();
+    fs::remove_dir(&alias.0).unwrap();
+    std::os::unix::fs::symlink(&dir.0, &alias.0).unwrap();
+    let reopened = Database::open(&alias.0, OpenOptions::default()).unwrap();
+    assert!(Arc::ptr_eq(&db.inner, &reopened.inner));
+    let session = db.session();
+    drop(db);
+    drop(reopened);
+    // Even an idle session owns the directory after all explicit Database handles drop.
+    let rejected = child_command(&dir, "expect_in_use").output().unwrap();
+    assert!(
+        rejected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    drop(session);
+    let mut owner = Worker::start(&dir, "hold", "");
+    assert!(matches!(
+        Database::open(&dir.0, OpenOptions::default()),
+        Err(Error::DatabaseInUse(_))
+    ));
+    assert!(matches!(
+        Database::open(&alias.0, OpenOptions::default()),
+        Err(Error::DatabaseInUse(_))
+    ));
+    owner.release();
+    owner.finish();
+    // Exiting normally releases the OS lock; the lock file itself remains reusable.
+    dir.open().checkpoint().unwrap();
+    std::fs::remove_file(&alias.0).unwrap();
+}
+
+#[test]
+fn concurrent_open_and_last_handle_drop_never_reject_this_process() {
+    let dir = TestDir::new();
+    drop(dir.open());
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let path = &dir.0;
+            scope.spawn(move || {
+                for _ in 0..100 {
+                    let db = Database::open(path, OpenOptions::default()).unwrap();
+                    std::thread::yield_now();
+                    drop(db);
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn thread_reader_pins_data_and_process_kill_releases_ownership() {
     let dir = TestDir::new();
     let db = dir.open();
     let (doomed, _) = seed(&db);
-    let mut reader = Worker::start(&dir, "reader", "");
+    let mut reader = ThreadWorker::start(&dir, "reader", "");
     db.session().execute("DROP GRAPH doomed").unwrap();
     assert!(matches!(db.checkpoint(), Err(Error::Busy)));
     reader.release();
     assert!(reader.finish().contains("GF_OLD_OK"));
     db.checkpoint().unwrap();
     assert!(graph_id(&db, "doomed").is_none());
+    drop(db);
     let mut writer = Worker::start(&dir, "create", "uncommitted");
-    assert!(matches!(db.checkpoint(), Err(Error::Busy)));
+    assert!(matches!(
+        Database::open(&dir.0, OpenOptions::default()),
+        Err(Error::DatabaseInUse(_))
+    ));
     writer.child.kill().unwrap();
     writer.child.wait().unwrap();
+    let db = dir.open();
     db.checkpoint().unwrap();
     assert!(graph_id(&db, "uncommitted").is_none());
     assert_ne!(create_graph(&db, "doomed"), doomed);
@@ -794,10 +893,12 @@ fn commit_crash_matrix_never_splits_catalog_and_data() {
         let db = dir.open();
         let (_, keeper) = seed(&db);
         db.checkpoint().unwrap();
+        drop(db);
         let result = child_command(&dir, "drop_and_write")
             .env("GRAPHFUSION_TEST_CRASH", point)
             .output()
             .unwrap();
+        let db = dir.open();
         assert_eq!(
             result.status.code(),
             Some(86),
@@ -839,10 +940,12 @@ fn checkpoint_crash_matrix_retains_joint_state() {
         tx.write_row(keeper, "row", Some(b"after".to_vec()))
             .unwrap();
         tx.commit().unwrap();
+        drop(db);
         let result = child_command(&dir, "checkpoint")
             .env("GRAPHFUSION_TEST_CRASH", point)
             .output()
             .unwrap();
+        let db = dir.open();
         assert_eq!(
             result.status.code(),
             Some(86),
@@ -1121,10 +1224,12 @@ fn indeterminate_io_commit_requires_reopen_and_recovers_joint_state() {
     let dir = TestDir::new();
     let db = dir.open();
     let (_, keeper) = seed(&db);
+    drop(db);
     let result = child_command(&dir, "io_error")
         .env("GRAPHFUSION_TEST_IO", "wal_sync")
         .output()
         .unwrap();
+    let db = dir.open();
     assert!(
         result.status.success(),
         "{}",
@@ -1150,23 +1255,35 @@ fn child_worker() {
         assert!(matches!(db, Err(Error::Io(_))), "{db:?}");
         return;
     }
-    let db = db.unwrap();
-    match mode.as_str() {
+    if mode == "expect_in_use" {
+        assert!(matches!(db, Err(Error::DatabaseInUse(_))), "{db:?}");
+        return;
+    }
+    println!(
+        "{}",
+        worker(
+            db.unwrap(),
+            &mode,
+            &std::env::var("GF_NAME").unwrap_or_default(),
+            child_barrier
+        )
+    );
+}
+
+fn worker(db: Database, mode: &str, name: &str, barrier: impl FnOnce()) -> String {
+    let mut outcome = String::new();
+    match mode {
         "recovery_write" => {
             create_graph(&db, "after_recovery");
         }
         "create" => {
             let mut tx = StatementTxn::begin(&db).unwrap();
-            tx.create_graph(
-                MAIN_SCHEMA,
-                &std::env::var("GF_NAME").unwrap(),
-                GraphShape::Open,
-            )
-            .unwrap();
-            child_barrier();
+            tx.create_graph(MAIN_SCHEMA, name, GraphShape::Open)
+                .unwrap();
+            barrier();
             match tx.commit() {
-                Ok(_) => println!("GF_COMMITTED"),
-                Err(Error::Conflict(_)) => println!("GF_CONFLICT"),
+                Ok(_) => outcome.push_str("GF_COMMITTED"),
+                Err(Error::Conflict(_)) => outcome.push_str("GF_CONFLICT"),
                 Err(e) => panic!("{e}"),
             }
         }
@@ -1176,12 +1293,12 @@ fn child_worker() {
                 .lookup(MAIN_SCHEMA, ObjectKind::Graph, "doomed")
                 .unwrap()
                 .id;
-            child_barrier();
+            barrier();
             assert_eq!(
                 tx.read_row(graph, "row").unwrap(),
                 Some(b"old graph data".to_vec())
             );
-            println!("GF_OLD_OK");
+            outcome.push_str("GF_OLD_OK");
         }
         "parquet_import" => {
             let mut tx = StatementTxn::begin(&db).unwrap();
@@ -1199,21 +1316,21 @@ fn child_worker() {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let mut s = db.session();
             s.execute("SESSION SET GRAPH g; START TRANSACTION").unwrap();
-            let value = std::env::var("GF_NAME").unwrap().parse::<i64>().unwrap();
+            let value = name.parse::<i64>().unwrap();
             s.set_parameter("v", Value::Integer(value)).unwrap();
             runtime.block_on(s.run("INSERT (:N {v: $v})")).unwrap();
             s.execute(&format!("CREATE GRAPH marker{value} ANY GRAPH"))
                 .unwrap();
-            child_barrier();
+            barrier();
             match s.execute("COMMIT") {
-                Ok(_) => println!("GF_COMMITTED"),
+                Ok(_) => outcome.push_str("GF_COMMITTED"),
                 Err(Error::Conflict(_)) => {
                     assert!(matches!(
                         s.transaction_status(),
                         TransactionStatus::Failed { .. }
                     ));
                     s.execute("ROLLBACK").unwrap();
-                    println!("GF_CONFLICT");
+                    outcome.push_str("GF_CONFLICT");
                 }
                 Err(e) => panic!("{e}"),
             }
@@ -1230,7 +1347,7 @@ fn child_worker() {
                     .row_count(),
                 1
             );
-            child_barrier();
+            barrier();
             assert_eq!(
                 runtime
                     .block_on(s.query("MATCH (n) RETURN ELEMENT_ID(n) AS id"))
@@ -1246,7 +1363,7 @@ fn child_worker() {
                     .row_count(),
                 2
             );
-            println!("GF_OLD_OK");
+            outcome.push_str("GF_OLD_OK");
         }
         "explicit_crash" | "explicit_io" => {
             let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1292,7 +1409,7 @@ fn child_worker() {
             let mut tx = StatementTxn::begin(&db).unwrap();
             let graph = tx.lookup(MAIN_SCHEMA, ObjectKind::Graph, "g").unwrap().id;
             let data = tx.graph_data(graph).unwrap();
-            child_barrier();
+            barrier();
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let batches = runtime.block_on(async {
                 datafusion::prelude::SessionContext::new()
@@ -1316,7 +1433,7 @@ fn child_worker() {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(ids, [1]);
-            println!("GF_OLD_OK");
+            outcome.push_str("GF_OLD_OK");
         }
         "drop_and_write" | "io_error" => {
             let mut tx = StatementTxn::begin(&db).unwrap();
@@ -1334,6 +1451,11 @@ fn child_worker() {
             if mode == "io_error" {
                 assert!(matches!(tx.commit(), Err(Error::CommitUnknown(_))));
                 assert!(matches!(db.with_catalog(|_| ()), Err(Error::Poisoned)));
+                assert!(matches!(
+                    Database::open(std::env::var("GF_DIR").unwrap(), OpenOptions::default()),
+                    Err(Error::Poisoned)
+                ));
+                drop(db);
                 let recovered =
                     Database::open(std::env::var("GF_DIR").unwrap(), OpenOptions::default())
                         .unwrap();
@@ -1342,11 +1464,14 @@ fn child_worker() {
                 tx.commit().unwrap();
             }
         }
+        "hold" => barrier(),
         "initialize" => (),
         "checkpoint" => db.checkpoint().unwrap(),
         _ => panic!("unknown worker mode"),
     }
+    outcome
 }
+
 fn parquet_files(dir: &TestDir) -> Vec<PathBuf> {
     fs::read_dir(&dir.0)
         .unwrap()
@@ -1401,10 +1526,15 @@ async fn parquet_crash_matrix_atomically_publishes_catalog_and_graph() {
             .unwrap();
         session.replace_graph_data(arrow_graph(vec![1])).unwrap();
         db.checkpoint().unwrap();
+        drop(session);
+        drop(db);
         let result = child_command(&dir, "parquet_import")
             .env("GRAPHFUSION_TEST_CRASH", point)
             .output()
             .unwrap();
+        let db = dir.open();
+        let mut session = db.session();
+        session.execute("SESSION SET GRAPH g").unwrap();
         assert_eq!(
             result.status.code(),
             Some(86),
@@ -1428,7 +1558,7 @@ async fn parquet_crash_matrix_atomically_publishes_catalog_and_graph() {
 }
 
 #[test]
-fn parquet_reader_in_another_process_pins_replaced_and_dropped_files() {
+fn parquet_reader_in_another_thread_pins_replaced_and_dropped_files() {
     let dir = TestDir::new();
     let db = dir.open();
     let mut session = db.session();
@@ -1436,7 +1566,7 @@ fn parquet_reader_in_another_process_pins_replaced_and_dropped_files() {
         .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
         .unwrap();
     session.replace_graph_data(arrow_graph(vec![1])).unwrap();
-    let mut reader = Worker::start(&dir, "parquet_reader", "");
+    let mut reader = ThreadWorker::start(&dir, "parquet_reader", "");
     session.replace_graph_data(arrow_graph(vec![2, 3])).unwrap();
     session.execute("DROP GRAPH g").unwrap();
     assert_eq!(parquet_files(&dir).len(), 2);
@@ -1467,10 +1597,12 @@ async fn parquet_checkpoint_crash_matrix_and_conflict_orphan_reclamation() {
         a.commit().unwrap();
         assert!(matches!(b.commit(), Err(Error::Conflict(_))));
         assert_eq!(parquet_files(&dir).len(), 2);
+        drop(db);
         let result = child_command(&dir, "checkpoint")
             .env("GRAPHFUSION_TEST_CRASH", point)
             .output()
             .unwrap();
+        let db = dir.open();
         assert_eq!(
             result.status.code(),
             Some(86),
@@ -1605,10 +1737,15 @@ async fn gql_write_crashes_recover_graph_and_identity_counter_together() {
             .unwrap();
         s.replace_graph_data(arrow_graph(vec![1])).unwrap();
         db.checkpoint().unwrap();
+        drop(s);
+        drop(db);
         let child = child_command(&dir, "gql_write")
             .env("GRAPHFUSION_TEST_CRASH", point)
             .output()
             .unwrap();
+        let db = dir.open();
+        let mut s = db.session();
+        s.execute("SESSION SET GRAPH g").unwrap();
         assert_eq!(
             child.status.code(),
             Some(86),
@@ -1732,15 +1869,15 @@ async fn cancelling_pending_datafusion_scan_aborts_explicit_transaction() {
 }
 
 #[tokio::test]
-async fn explicit_transactions_isolate_and_conflict_across_processes() {
+async fn explicit_transactions_isolate_and_conflict_across_threads() {
     let dir = TestDir::new();
     let db = dir.open();
     let mut s = db.session();
     s.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {v: 1})")
         .await
         .unwrap();
-    let mut a = Worker::start(&dir, "explicit_writer", "2");
-    let mut b = Worker::start(&dir, "explicit_writer", "3");
+    let mut a = ThreadWorker::start(&dir, "explicit_writer", "2");
+    let mut b = ThreadWorker::start(&dir, "explicit_writer", "3");
     assert_eq!(
         s.query("MATCH (n) RETURN n.v AS v")
             .await
@@ -1765,9 +1902,9 @@ async fn explicit_transactions_isolate_and_conflict_across_processes() {
         2
     );
     db.checkpoint().unwrap();
-    let mut abandoned = Worker::start(&dir, "explicit_writer", "4");
-    abandoned.child.kill().unwrap();
-    abandoned.child.wait().unwrap();
+    let mut abandoned = db.session();
+    abandoned.run("SESSION SET GRAPH g; START TRANSACTION; INSERT (:N {v: 4}); CREATE GRAPH marker4 ANY GRAPH").await.unwrap();
+    drop(abandoned);
     assert!(graph_id(&db, "marker4").is_none());
     assert_eq!(
         s.query("MATCH (n) RETURN n.v AS v")
@@ -1780,7 +1917,7 @@ async fn explicit_transactions_isolate_and_conflict_across_processes() {
 }
 
 #[test]
-fn explicit_reader_pins_old_parquet_files_across_process_replacement() {
+fn explicit_reader_pins_old_parquet_files_across_thread_replacement() {
     let dir = TestDir::new();
     let db = dir.open();
     let mut s = db.session();
@@ -1788,7 +1925,7 @@ fn explicit_reader_pins_old_parquet_files_across_process_replacement() {
         .unwrap();
     s.replace_graph_data(arrow_graph(vec![1])).unwrap();
     db.checkpoint().unwrap();
-    let mut reader = Worker::start(&dir, "explicit_reader", "");
+    let mut reader = ThreadWorker::start(&dir, "explicit_reader", "");
     s.replace_graph_data(arrow_graph(vec![2, 3])).unwrap();
     assert!(matches!(db.checkpoint(), Err(Error::Busy)));
     reader.release();
@@ -1814,6 +1951,8 @@ async fn explicit_transaction_crashes_never_split_statements_or_graphs() {
             .unwrap();
         s.replace_graph_data(arrow_graph(vec![1])).unwrap();
         db.checkpoint().unwrap();
+        drop(s);
+        drop(db);
         let mut command = child_command(
             &dir,
             if point == "io" {
@@ -1828,6 +1967,9 @@ async fn explicit_transaction_crashes_never_split_statements_or_graphs() {
             command.env("GRAPHFUSION_TEST_CRASH", point);
         }
         let child = command.output().unwrap();
+        let db = dir.open();
+        let mut s = db.session();
+        s.execute("SESSION SET GRAPH g").unwrap();
         assert_eq!(
             child.status.code(),
             Some(if point == "io" { 0 } else { 86 }),

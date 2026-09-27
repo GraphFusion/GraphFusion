@@ -27,6 +27,6 @@ There are no nested transactions or savepoints. Starting while active is an erro
 
 Write commit validates recorded graph and catalog dependencies against the latest committed state. Graph checks are at graph granularity: independent nodes in one graph may conflict. Disjoint graph writes can merge if their read dependencies remain valid. Catalog validation includes absent names, membership and dependency scans.
 
-Results inside a transaction are provisional (`transaction_pending = true`). The separate COMMIT result acknowledges durability. A `CommitUnknown` error requires reopening and inspecting recovered state before deciding whether to retry; rollback cannot undo an outcome that may already be durable.
+Results inside a transaction are provisional (`transaction_pending = true`). The separate COMMIT result acknowledges durability. A `CommitUnknown` error requires dropping all database/session handles and reopening and inspecting recovered state before deciding whether to retry; rollback cannot undo an outcome that may already be durable.
 
-The one-shot CLI requires the transaction to finish before its file/query ends. Earlier autocommits survive a later failure. See [error handling](/storage/errors/).
+The interactive REPL retains a transaction between inputs until COMMIT, ROLLBACK or exit; an error leaves the transaction failed and requires ROLLBACK. Exiting rolls back uncommitted work. The one-shot `run` CLI requires the transaction to finish before its file/query ends. Earlier autocommits survive a later failure. See [error handling](/storage/errors/).

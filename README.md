@@ -26,7 +26,18 @@ graphfusion run --query 'RETURN 6 * 7 AS answer'
 
 For the Rust library, add `graphfusion = "0.1.1"` to your dependencies.
 
-From a repository checkout, run the complete social-graph example. It creates
+From a repository checkout, start an interactive database REPL (0.2.0 development):
+
+```sh
+cargo run -p graphfusion --locked -- ./demo-db
+```
+
+At the prompt, enter `\read examples/social.gql`, then query the graph with
+`MATCH (p:Person) RETURN p.name AS name;`. Use `\help` for REPL commands and
+`\quit` to exit. One process owns each database directory; the Rust API supports
+concurrent sessions on multiple threads within that process.
+
+To run a file and exit, use the complete social-graph example. It creates
 Alice → Bob → Cara, updates Alice, and finds Cara:
 
 ```sh

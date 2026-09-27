@@ -13,7 +13,8 @@ Unsupported syntax at execution, invalid definitions/types, resource limits and 
 | Conflict | Re-read state and decide whether the entire operation can be retried |
 | Busy checkpoint | Retry when active statements/transactions have released snapshots |
 | Failed explicit transaction | ROLLBACK or SESSION CLOSE before further work |
-| CommitUnknown | Reopen the database and inspect recovered state before retrying |
+| DatabaseInUse | Close the process holding the database, or use independent sessions in that process |
+| CommitUnknown / Poisoned | Drop all database/session handles, reopen and inspect recovered state before retrying |
 
 Graph conflict detection is coarse: two updates to different nodes in one graph can conflict. Automatic retry of INSERT or another non-idempotent operation can duplicate work after an uncertain outcome, so the engine does not do it implicitly.
 

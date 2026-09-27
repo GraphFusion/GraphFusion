@@ -7,6 +7,18 @@ sidebar:
 
 This example creates Alice → Bob → Cara, then finds Alice's friend of a friend. Run it from a source checkout after [building the CLI](/start/installation/).
 
+## Start an interactive session
+
+From the 0.2.0 source checkout:
+
+```sh
+cargo run -p graphfusion --locked -- ./demo-db
+```
+
+At the prompt, load the bundled example once with `\read examples/social.gql`. Then enter `MATCH (p:Person) RETURN p.name AS name, p.age AS age;`. End each GQL input with a semicolon; use `\help` for commands and `\quit` to exit. Reopen with the same command and enter `SESSION SET GRAPH social;` to select the existing graph. Do not reload the create script into a database that already contains it.
+
+The steps below demonstrate the separate one-shot `run` command. Use a different database directory if you already created `demo-db` in the REPL, and close the REPL before opening its database from another process.
+
 ## Create and query a graph
 
 Save the following as `first-graph.gql`:

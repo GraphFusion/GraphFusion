@@ -1,6 +1,6 @@
 use crate::{
     catalog::*,
-    persistence::{FileGuard, LogRecord},
+    persistence::LogRecord,
     storage::{StorageChange, StorageSnapshot},
     Database, Error, Result,
 };
@@ -114,7 +114,6 @@ impl PublishedState {
 pub(crate) struct StatementTxn {
     db: Database,
     read_only: bool,
-    _lease: Option<FileGuard>,
     pub base: Arc<PublishedState>,
     view: CatalogSnapshot,
     changes: Vec<CatalogChange>,
@@ -135,12 +134,6 @@ impl Drop for StatementTxn {
 impl StatementTxn {
     pub fn begin(db: &Database) -> Result<Self> {
         db.check_healthy()?;
-        let lease = db
-            .inner
-            .disk
-            .as_ref()
-            .map(|d| d.lifecycle(false))
-            .transpose()?;
         let mut state = db.inner.state.lock().map_err(|_| Error::Poisoned)?;
         db.check_healthy()?;
         let _commit = db
@@ -161,7 +154,6 @@ impl StatementTxn {
         Ok(Self {
             db: db.clone(),
             read_only: false,
-            _lease: lease,
             base: state.clone(),
             view: (*state.catalog).clone(),
             changes: Vec::new(),
