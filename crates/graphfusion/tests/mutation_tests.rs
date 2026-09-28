@@ -200,10 +200,11 @@ async fn delete_restrict_detach_and_explicit_edges_enforce_endpoints() {
         "INSERT (a:N {name: 'A'})-[:E]->(b:N {name: 'B'}), (b)-[:U]-(b)",
     )
     .await;
-    assert!(s
+    let blocked = s
         .run("MATCH (a {name: 'A'}) NODETACH DELETE a")
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(blocked.to_string().contains("DETACH DELETE"), "{blocked}");
     assert_eq!(
         s.query("MATCH (n) RETURN n.name AS name")
             .await
@@ -390,4 +391,27 @@ async fn deleting_edges_keeps_surviving_node_bindings_and_rejects_stale_aliases(
     )
     .await;
     assert_eq!(rows(&result), vec![vec!["2"]]);
+}
+
+#[tokio::test]
+async fn repeated_inserts_do_not_rewrite_one_file_per_previous_row() {
+    let dir = Durable::new();
+    let db = dir.open();
+    let mut s = session(&db);
+    for i in 0..8 {
+        run(&mut s, &format!("INSERT (:N {{i: {i}}})")).await;
+    }
+    let files = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".parquet"))
+        .count();
+    assert!(files <= 8, "parquet files: {files}");
+    drop(s);
+    drop(db);
+    let db = dir.open();
+    let mut s = db.session();
+    s.execute("SESSION SET GRAPH g").unwrap();
+    let result = s.query("MATCH (n:N) RETURN COUNT(*) AS c").await.unwrap();
+    assert_eq!(rows(&result), vec![vec!["8"]]);
 }

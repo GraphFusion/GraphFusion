@@ -34,7 +34,13 @@ pub struct Parser {
     pos: usize,
     lexer_error: Option<Error>,
     stop_in_as_delimiter: bool,
+    depth: u32,
 }
+
+// Test threads use a 2MB stack. Each nested construct keeps the descent
+// frames live, and dropping the partial tree needs a similar amount again.
+const MAX_PARSE_DEPTH: u32 = 32;
+const MAX_EXPR_CHAIN: u32 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GraphTypeElementContext {
@@ -110,16 +116,15 @@ impl Parser {
             pos: 0,
             lexer_error,
             stop_in_as_delimiter: false,
+            depth: 0,
         }
     }
 
     pub fn parse_program(mut self) -> Result<Program> {
-        let program = self.parse_program_body(TokenKind::Eof)?;
-        if let Some(err) = self.lexer_error {
-            Err(err)
-        } else {
-            Ok(program)
+        if let Some(err) = self.lexer_error.take() {
+            return Err(err);
         }
+        self.parse_program_body(TokenKind::Eof)
     }
 
     fn parse_program_body(&mut self, terminator: TokenKind) -> Result<Program> {
@@ -987,6 +992,13 @@ impl Parser {
     }
 
     fn parse_nested_query_specification(&mut self) -> Result<QueryStatement> {
+        self.enter()?;
+        let query = self.parse_braced_query();
+        self.exit();
+        query
+    }
+
+    fn parse_braced_query(&mut self) -> Result<QueryStatement> {
         self.expect(TokenKind::LBrace)?;
         let query = self.parse_query_statement()?;
         self.expect(TokenKind::RBrace)?;
@@ -1553,7 +1565,7 @@ impl Parser {
     fn parse_parameter_name(&mut self) -> Result<String> {
         if self.at(TokenKind::Parameter) {
             let token = self.bump();
-            Ok(token.text.trim_start_matches('$').to_owned())
+            Ok(parameter_name(&token.text))
         } else {
             Ok(self.parse_identifier()?.value)
         }
@@ -1930,9 +1942,7 @@ impl Parser {
         }
         if self.at(TokenKind::Parameter) {
             let token = self.bump();
-            return Ok(GraphExpression::Parameter(
-                token.text.trim_start_matches('$').to_owned(),
-            ));
+            return Ok(GraphExpression::Parameter(parameter_name(&token.text)));
         }
         if self.eat(TokenKind::CurrentGraph).is_some() {
             return Ok(GraphExpression::CurrentGraph);
@@ -1989,9 +1999,9 @@ impl Parser {
         }
         if self.at(TokenKind::Parameter) {
             let token = self.bump();
-            return Ok(BindingTableExpression::Parameter(
-                token.text.trim_start_matches('$').to_owned(),
-            ));
+            return Ok(BindingTableExpression::Parameter(parameter_name(
+                &token.text,
+            )));
         }
         if self.starts_object_expression_primary_special_case(self.peek_kind()) {
             return Ok(BindingTableExpression::Variable(Box::new(
@@ -2030,9 +2040,7 @@ impl Parser {
     fn parse_schema_reference(&mut self) -> Result<SchemaReference> {
         if self.at(TokenKind::Parameter) {
             let token = self.bump();
-            return Ok(SchemaReference::Parameter(
-                token.text.trim_start_matches('$').to_owned(),
-            ));
+            return Ok(SchemaReference::Parameter(parameter_name(&token.text)));
         }
         if self.eat(TokenKind::CurrentSchema).is_some() {
             return Ok(SchemaReference::CurrentSchema);
@@ -2081,9 +2089,7 @@ impl Parser {
     fn parse_procedure_reference(&mut self) -> Result<ProcedureReference> {
         if self.at(TokenKind::Parameter) {
             let token = self.bump();
-            return Ok(ProcedureReference::Parameter(
-                token.text.trim_start_matches('$').to_owned(),
-            ));
+            return Ok(ProcedureReference::Parameter(parameter_name(&token.text)));
         }
         Ok(ProcedureReference::Name(self.parse_procedure_name()?))
     }
@@ -2275,9 +2281,7 @@ impl Parser {
     fn parse_graph_type_reference(&mut self) -> Result<GraphTypeReference> {
         if self.at(TokenKind::Parameter) {
             let token = self.bump();
-            return Ok(GraphTypeReference::Parameter(
-                token.text.trim_start_matches('$').to_owned(),
-            ));
+            return Ok(GraphTypeReference::Parameter(parameter_name(&token.text)));
         }
         Ok(GraphTypeReference::Name(self.parse_graph_type_name()?))
     }
@@ -4178,7 +4182,7 @@ impl Parser {
         if self.at(TokenKind::Parameter) {
             let token = self.bump();
             return Ok(Some(UnsignedIntegerSpecification::Parameter(
-                token.text.trim_start_matches('$').to_owned(),
+                parameter_name(&token.text),
             )));
         }
         Ok(None)
@@ -4650,6 +4654,14 @@ impl Parser {
             } else {
                 None
             };
+            if let Some(max) = max {
+                if min.unwrap_or(0) > max {
+                    return Err(Error::Message {
+                        offset: self.peek().offset,
+                        message: "path quantifier lower bound exceeds upper bound".to_owned(),
+                    });
+                }
+            }
             PathPatternQuantifier::Range { min, max }
         } else {
             let value = min.ok_or_else(|| {
@@ -4691,7 +4703,10 @@ impl Parser {
 
     fn parse_label_or(&mut self) -> Result<LabelExpression> {
         let mut expr = self.parse_label_and()?;
+        let mut chain = 1u32;
         while self.eat(TokenKind::Pipe).is_some() {
+            chain += 1;
+            self.check_chain(chain)?;
             let right = self.parse_label_and()?;
             expr = LabelExpression::Or(Box::new(expr), Box::new(right));
         }
@@ -4700,7 +4715,10 @@ impl Parser {
 
     fn parse_label_and(&mut self) -> Result<LabelExpression> {
         let mut expr = self.parse_label_unary()?;
+        let mut chain = 1u32;
         while self.eat(TokenKind::Ampersand).is_some() {
+            chain += 1;
+            self.check_chain(chain)?;
             let right = self.parse_label_unary()?;
             expr = LabelExpression::And(Box::new(expr), Box::new(right));
         }
@@ -4708,6 +4726,13 @@ impl Parser {
     }
 
     fn parse_label_unary(&mut self) -> Result<LabelExpression> {
+        self.enter()?;
+        let expr = self.parse_label_unary_body();
+        self.exit();
+        expr
+    }
+
+    fn parse_label_unary_body(&mut self) -> Result<LabelExpression> {
         if self.at(TokenKind::Not) {
             return Err(Error::Message {
                 offset: self.peek().offset,
@@ -4729,11 +4754,15 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_or()
+        self.enter()?;
+        let expr = self.parse_or();
+        self.exit();
+        expr
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
         let mut expr = self.parse_and()?;
+        let mut chain = 1u32;
         loop {
             let op = if self.eat(TokenKind::Or).is_some() {
                 BinaryOp::Or
@@ -4742,6 +4771,8 @@ impl Parser {
             } else {
                 break;
             };
+            chain += 1;
+            self.check_chain(chain)?;
             let right = self.parse_and()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
@@ -4753,9 +4784,12 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr> {
-        let mut expr = self.parse_comparison()?;
+        let mut expr = self.parse_not()?;
+        let mut chain = 1u32;
         while self.eat(TokenKind::And).is_some() {
-            let right = self.parse_comparison()?;
+            chain += 1;
+            self.check_chain(chain)?;
+            let right = self.parse_not()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 op: BinaryOp::And,
@@ -4765,8 +4799,22 @@ impl Parser {
         Ok(expr)
     }
 
+    fn parse_not(&mut self) -> Result<Expr> {
+        if self.eat(TokenKind::Not).is_some() {
+            self.enter()?;
+            let expr = self.parse_not();
+            self.exit();
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(expr?),
+            });
+        }
+        self.parse_comparison()
+    }
+
     fn parse_comparison(&mut self) -> Result<Expr> {
         let mut expr = self.parse_concat()?;
+        let mut chain = 1u32;
         loop {
             if self.eat(TokenKind::Colon).is_some() {
                 let variable = self.expr_to_element_variable(expr, "labeled")?;
@@ -4794,6 +4842,8 @@ impl Parser {
                 }
                 _ => break,
             };
+            chain += 1;
+            self.check_chain(chain)?;
             self.bump();
             let right = self.parse_concat()?;
             expr = Expr::Binary {
@@ -4896,7 +4946,10 @@ impl Parser {
 
     fn parse_concat(&mut self) -> Result<Expr> {
         let mut expr = self.parse_additive()?;
+        let mut chain = 1u32;
         while self.eat(TokenKind::DoublePipe).is_some() {
+            chain += 1;
+            self.check_chain(chain)?;
             let right = self.parse_additive()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
@@ -4909,6 +4962,7 @@ impl Parser {
 
     fn parse_additive(&mut self) -> Result<Expr> {
         let mut expr = self.parse_multiplicative()?;
+        let mut chain = 1u32;
         loop {
             let op = if self.eat(TokenKind::Plus).is_some() {
                 BinaryOp::Add
@@ -4917,6 +4971,8 @@ impl Parser {
             } else {
                 break;
             };
+            chain += 1;
+            self.check_chain(chain)?;
             let right = self.parse_multiplicative()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
@@ -4929,6 +4985,7 @@ impl Parser {
 
     fn parse_multiplicative(&mut self) -> Result<Expr> {
         let mut expr = self.parse_unary()?;
+        let mut chain = 1u32;
         loop {
             let op = if self.eat(TokenKind::Star).is_some() {
                 BinaryOp::Mul
@@ -4937,6 +4994,8 @@ impl Parser {
             } else {
                 break;
             };
+            chain += 1;
+            self.check_chain(chain)?;
             let right = self.parse_unary()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
@@ -4948,22 +5007,27 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
-        if self.eat(TokenKind::Not).is_some() {
-            return Ok(Expr::Unary {
-                op: UnaryOp::Not,
-                expr: Box::new(self.parse_unary()?),
-            });
-        }
         if self.eat(TokenKind::Plus).is_some() {
+            self.enter()?;
+            let expr = self.parse_unary();
+            self.exit();
             return Ok(Expr::Unary {
                 op: UnaryOp::Pos,
-                expr: Box::new(self.parse_unary()?),
+                expr: Box::new(expr?),
             });
         }
         if self.eat(TokenKind::Minus).is_some() {
+            // The positive magnitude does not fit in i64; the negation does.
+            if self.at(TokenKind::Integer) && self.peek().text == "9223372036854775808" {
+                self.bump();
+                return Ok(Expr::Literal(Literal::Integer(i64::MIN)));
+            }
+            self.enter()?;
+            let expr = self.parse_unary();
+            self.exit();
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
-                expr: Box::new(self.parse_unary()?),
+                expr: Box::new(expr?),
             });
         }
         self.parse_postfix()
@@ -5212,9 +5276,7 @@ impl Parser {
                     Ok(Expr::Identifier(ident))
                 }
             }
-            TokenKind::Parameter => Ok(Expr::Parameter(
-                token.text.trim_start_matches('$').to_owned(),
-            )),
+            TokenKind::Parameter => Ok(Expr::Parameter(parameter_name(&token.text))),
             TokenKind::String => Ok(Expr::Literal(Literal::String(token.text))),
             TokenKind::ByteString => self.parse_byte_string_literal(token),
             TokenKind::Integer => {
@@ -6366,6 +6428,35 @@ impl Parser {
     fn eof_error(&self) -> Error {
         self.lexer_error.clone().unwrap_or(Error::UnexpectedEof)
     }
+
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(Error::Message {
+                offset: self.peek().offset,
+                message: "input is nested too deeply".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn exit(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn check_chain(&self, len: u32) -> Result<()> {
+        if len > MAX_EXPR_CHAIN {
+            return Err(Error::Message {
+                offset: self.peek().offset,
+                message: "expression is too long".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn parameter_name(text: &str) -> String {
+    text.strip_prefix('$').unwrap_or(text).to_owned()
 }
 
 fn apply_path_pattern_factor_to_term(

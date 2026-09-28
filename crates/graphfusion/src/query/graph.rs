@@ -349,6 +349,10 @@ pub(super) fn scan(
         properties,
     };
     scope.next += 1;
+    // Each scan needs its own qualifier. Joining two leaves that are both
+    // named `__gf_scan` makes `__gf_id` ambiguous once a graph has one table
+    // per element kind.
+    let scan_name = format!("__gf_scan_{}", scope.next);
     let mut branches = Vec::new();
     for (table, directed) in tables {
         let orientations = match direction {
@@ -376,7 +380,7 @@ pub(super) fn scan(
         };
         for reverse in orientations {
             let mut scan = LogicalPlanBuilder::scan(
-                "__gf_scan",
+                &scan_name,
                 provider_as_source(table.provider.clone()),
                 None,
             )?;

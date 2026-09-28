@@ -177,11 +177,28 @@ pub(super) async fn run() -> CliResult<()> {
             None => Database::new(),
         };
         let mut session = db.session();
-        let outputs = session.run(&input).await?;
+        let explain = options.contains_key("--explain");
+        let mut rest = input.as_str();
+        while !rest.is_empty() {
+            match repl::next_statement(rest) {
+                Ok(Some(end)) => {
+                    let (statement, tail) = rest.split_at(end);
+                    rest = tail;
+                    if repl::is_empty(statement) {
+                        continue;
+                    }
+                    print_outputs(session.run(statement).await?, explain)?;
+                }
+                Ok(None) if repl::is_empty(rest) => break,
+                _ => {
+                    print_outputs(session.run(rest).await?, explain)?;
+                    break;
+                }
+            }
+        }
         if session.transaction_status() != TransactionStatus::Idle {
             return Err("unfinished explicit transaction rolled back; end the file/query with COMMIT or ROLLBACK".into());
         }
-        print_outputs(outputs, options.contains_key("--explain"))?;
     } else if command == Command::Import {
         let database = required(&options, "--database")?;
         let graph = required(&options, "--graph")?;

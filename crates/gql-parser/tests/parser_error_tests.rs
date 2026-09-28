@@ -33,8 +33,8 @@ error_cases! {
         error: Error::Message { offset: 11, message: "invalid string escape '\\q'".into() },
     }
     forwards_numeric_lexer_error {
-        input: "RETURN 0x8000000000000000 AS x",
-        error: Error::BadNumber { offset: 7, token_text: "0x8000000000000000".into() },
+        input: "RETURN 0x8000000000000001 AS x",
+        error: Error::BadNumber { offset: 7, token_text: "0x8000000000000001".into() },
     }
     unexpected_token_after_unicode_identifier {
         input: "MATCH (中] RETURN 中",

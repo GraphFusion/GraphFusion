@@ -260,8 +260,30 @@ impl StatementTxn {
             next: next_element_id,
         });
         if self.db.inner.disk.is_some() {
+            let previous = self
+                .base
+                .storage
+                .generations
+                .get(&storage)
+                .and_then(|generation| generation.parquet.clone());
+            let reuse = |table: &crate::graph::Table| {
+                let id = table.file_id?;
+                let manifest = previous.as_ref()?;
+                manifest
+                    .tables()
+                    .find(|existing| existing.id == id)
+                    .filter(|existing| {
+                        existing.labels == table.labels
+                            && existing.schema.as_ref() == table.schema.as_ref()
+                            && existing.rows == table.row_count
+                    })
+            };
             let mut manifest = crate::parquet::GraphManifest::default();
             for table in &data.nodes {
+                if let Some(existing) = reuse(&table.0) {
+                    manifest.nodes.push(existing.clone());
+                    continue;
+                }
                 let id = self.allocate_id()?;
                 manifest.nodes.push(
                     self.db
@@ -273,6 +295,13 @@ impl StatementTxn {
                 );
             }
             for edge in &data.edges {
+                if let Some(existing) = reuse(&edge.table) {
+                    manifest.edges.push(crate::parquet::EdgeManifest {
+                        table: existing.clone(),
+                        directed: edge.directed,
+                    });
+                    continue;
+                }
                 let id = self.allocate_id()?;
                 manifest.edges.push(crate::parquet::EdgeManifest {
                     table: self

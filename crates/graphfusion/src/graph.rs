@@ -35,6 +35,8 @@ pub(crate) struct Table {
     pub batches: Vec<RecordBatch>,
     pub provider: Arc<dyn TableProvider>,
     pub row_count: usize,
+    /// Parquet object id still holding these exact rows. Cleared when the rows change.
+    pub file_id: Option<u64>,
 }
 impl NodeTable {
     /// Reads an external Parquet table and validates it for a subsequent graph import.
@@ -159,7 +161,37 @@ impl Table {
             row_count: batches.iter().map(RecordBatch::num_rows).sum(),
             batches,
             provider,
+            file_id: None,
         })
+    }
+
+    pub(crate) fn append_rows(&mut self, extra: Table) -> Result<()> {
+        let loaded = self
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        if loaded != self.row_count {
+            return Err(Error::Corrupt(
+                "cannot append to an unloaded graph table".into(),
+            ));
+        }
+        if self.labels != extra.labels || self.schema.as_ref() != extra.schema.as_ref() {
+            return Err(Error::InvalidDefinition(
+                "incompatible graph table append".into(),
+            ));
+        }
+        let mut batches = self.batches.clone();
+        batches.extend(extra.batches);
+        let provider = Arc::new(MemTable::try_new(
+            self.schema.clone(),
+            vec![batches.clone()],
+        )?);
+        self.batches = batches;
+        self.row_count = self.batches.iter().map(RecordBatch::num_rows).sum();
+        self.provider = provider;
+        self.file_id = None;
+        Ok(())
     }
     pub fn ids<'a>(&'a self, column: &'a str) -> impl Iterator<Item = u64> + 'a {
         self.batches.iter().flat_map(move |batch| {

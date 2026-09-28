@@ -171,6 +171,46 @@ impl Drop for TestDir {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+
+#[test]
+fn reopen_existing_database_when_an_ancestor_is_not_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestDir::new();
+    let parent = root.0.join("locked");
+    let nested = parent.join("db");
+    fs::create_dir_all(&parent).unwrap();
+    {
+        let db = Database::open(
+            &nested,
+            OpenOptions {
+                create_if_missing: true,
+            },
+        )
+        .unwrap();
+        db.session().execute("CREATE GRAPH g ANY GRAPH").unwrap();
+    }
+    let mut perms = fs::metadata(&parent).unwrap().permissions();
+    perms.set_mode(0o311);
+    fs::set_permissions(&parent, perms).unwrap();
+    let readable = fs::read_dir(&parent).is_ok();
+    let opened = if readable {
+        Ok(())
+    } else {
+        Database::open(
+            &nested,
+            OpenOptions {
+                create_if_missing: true,
+            },
+        )
+        .map(|_| ())
+    };
+    let mut perms = fs::metadata(&parent).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&parent, perms).unwrap();
+    if !readable {
+        opened.unwrap();
+    }
+}
 fn graph_id(db: &Database, name: &str) -> Option<u64> {
     db.with_catalog(|c| c.lookup(MAIN_SCHEMA, ObjectKind::Graph, name).map(|e| e.id))
         .unwrap()
