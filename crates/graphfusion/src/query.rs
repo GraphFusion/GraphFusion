@@ -95,7 +95,16 @@ pub(crate) async fn execute_statement(
             ),
         ))
         .build()?;
-    let ctx = SessionContext::new_with_config_rt(Default::default(), std::sync::Arc::new(runtime));
+    // DataFusion's leaf-projection pushdown joins a qualified table-scan schema
+    // (`__gf_scan_N.__gf_id`) with the unqualified `__gf_id` on our scan
+    // projection and rejects the plan as ambiguous. That shows up as soon as a
+    // graph has a single table for an element kind.
+    let mut config = datafusion::execution::config::SessionConfig::new();
+    config
+        .options_mut()
+        .optimizer
+        .enable_leaf_expression_pushdown = false;
+    let ctx = SessionContext::new_with_config_rt(config, std::sync::Arc::new(runtime));
     let mut writes = mutations::Writes::default();
     let mut trace = execution::Trace::default();
     let plan = plan(

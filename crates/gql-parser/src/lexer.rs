@@ -317,6 +317,7 @@ impl<'a> Lexer<'a> {
             let mut text = String::from(".");
             self.bump();
             self.digits_with_underscores(start, 10, false, &mut text)?;
+            self.consume_exponent(start, &mut text)?;
             let kind = self.consume_numeric_suffix(TokenKind::Decimal, start)?;
             return Ok(Token::new(kind, text, start));
         }
@@ -336,31 +337,27 @@ impl<'a> Lexer<'a> {
         let mut text = String::new();
         self.digits_with_underscores(start, 10, false, &mut text)?;
         let mut kind = TokenKind::Integer;
-        if self.peek_char() == Some('.')
-            && !matches!(self.peek_next_char(), Some(ch) if is_identifier_start(ch) || ch == '.')
-        {
-            kind = TokenKind::Decimal;
-            self.bump();
-            text.push('.');
-            if matches!(self.peek_char(), Some(ch) if ch.is_ascii_digit()) {
-                self.digits_with_underscores(start, 10, false, &mut text)?;
-            }
-        }
-        if matches!(self.peek_char(), Some('e' | 'E')) {
-            kind = TokenKind::Decimal;
-            self.bump();
-            text.push('e');
-            if matches!(self.peek_char(), Some('+' | '-')) {
-                text.push(self.bump().expect("peeked sign"));
-            }
-            let exp_start = self.offset;
-            self.digits_with_underscores(start, 10, false, &mut text)?;
-            if exp_start == self.offset {
+        if self.peek_char() == Some('.') {
+            if self.fraction_continues_number() {
+                kind = TokenKind::Decimal;
+                self.bump();
+                text.push('.');
+                if matches!(self.peek_char(), Some(ch) if ch.is_ascii_digit()) {
+                    self.digits_with_underscores(start, 10, false, &mut text)?;
+                }
+            } else if self.peek_next_char().is_some_and(is_identifier_start) {
+                // `1.e5` is an exponent. A name glued on (`1.exp`) is a bad number.
+                self.bump();
+                self.eat_while(is_identifier_continue);
                 return Err(Error::BadNumber {
                     offset: start,
                     token_text: self.input[start..self.offset].to_owned(),
                 });
             }
+        }
+        if matches!(self.peek_char(), Some('e' | 'E')) {
+            kind = TokenKind::Decimal;
+            self.consume_exponent(start, &mut text)?;
         }
         kind = self.consume_numeric_suffix(kind, start)?;
         if matches!(self.peek_char(), Some('_')) {
@@ -371,6 +368,48 @@ impl<'a> Lexer<'a> {
             });
         }
         Ok(Token::new(kind, text, start))
+    }
+
+    fn fraction_continues_number(&self) -> bool {
+        match self.peek_next_char() {
+            Some(ch) if ch.is_ascii_digit() => true,
+            Some('.') => false,
+            // `1.e5` is an exponent. `1.exp` is rejected by the caller.
+            Some('e' | 'E') => self.exponent_digits_follow(2),
+            Some(ch) if is_identifier_start(ch) => false,
+            _ => true,
+        }
+    }
+
+    fn exponent_digits_follow(&self, from: usize) -> bool {
+        match self.input[self.offset..].chars().nth(from) {
+            Some('+' | '-') => self.input[self.offset..]
+                .chars()
+                .nth(from + 1)
+                .is_some_and(|ch| ch.is_ascii_digit()),
+            Some(ch) if ch.is_ascii_digit() => true,
+            _ => false,
+        }
+    }
+
+    fn consume_exponent(&mut self, start: usize, text: &mut String) -> Result<()> {
+        if !matches!(self.peek_char(), Some('e' | 'E')) {
+            return Ok(());
+        }
+        self.bump();
+        text.push('e');
+        if matches!(self.peek_char(), Some('+' | '-')) {
+            text.push(self.bump().expect("peeked sign"));
+        }
+        let exp_start = self.offset;
+        self.digits_with_underscores(start, 10, false, text)?;
+        if exp_start == self.offset {
+            return Err(Error::BadNumber {
+                offset: start,
+                token_text: self.input[start..self.offset].to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn consume_numeric_suffix(&mut self, kind: TokenKind, start: usize) -> Result<TokenKind> {
@@ -401,11 +440,25 @@ impl<'a> Lexer<'a> {
                 token_text: self.input[start..self.offset].to_owned(),
             });
         }
-        let value = i64::from_str_radix(&digits, radix).map_err(|_| Error::BadNumber {
-            offset: start,
-            token_text: self.input[start..self.offset].to_owned(),
-        })?;
-        Ok(Token::new(TokenKind::Integer, value.to_string(), start))
+        let value = match i64::from_str_radix(&digits, radix) {
+            Ok(value) => value.to_string(),
+            Err(_) => {
+                let unsigned =
+                    u64::from_str_radix(&digits, radix).map_err(|_| Error::BadNumber {
+                        offset: start,
+                        token_text: self.input[start..self.offset].to_owned(),
+                    })?;
+                // Only the negation of this magnitude fits in i64.
+                if unsigned != 1_u64 << 63 {
+                    return Err(Error::BadNumber {
+                        offset: start,
+                        token_text: self.input[start..self.offset].to_owned(),
+                    });
+                }
+                "9223372036854775808".to_owned()
+            }
+        };
+        Ok(Token::new(TokenKind::Integer, value, start))
     }
 
     fn digits_with_underscores(
@@ -455,13 +508,13 @@ impl<'a> Lexer<'a> {
             self.bump();
             let quote = self.peek_char().expect("peeked parameter quote");
             let value = self.quoted_sequence(start, quote, false)?;
-            return Ok(Token::new(TokenKind::Parameter, value, start));
+            return Ok(Token::new(TokenKind::Parameter, format!("${value}"), start));
         }
 
         if matches!(self.peek_char(), Some('"' | '`')) {
             let quote = self.peek_char().expect("peeked parameter quote");
             let value = self.quoted_sequence(start, quote, true)?;
-            return Ok(Token::new(TokenKind::Parameter, value, start));
+            return Ok(Token::new(TokenKind::Parameter, format!("${value}"), start));
         }
 
         if matches!(self.peek_char(), Some(ch) if is_identifier_continue(ch)) {

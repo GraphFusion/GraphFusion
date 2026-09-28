@@ -123,11 +123,21 @@ impl Database {
         }
         let path = path.as_ref();
         if options.create_if_missing {
+            let existed = path.exists();
             fs::create_dir_all(path)?;
-            // Persist newly created directory entries before acknowledging durable commits.
-            let absolute = fs::canonicalize(path)?;
-            for parent in absolute.ancestors().skip(1) {
-                fs::File::open(parent)?.sync_all()?;
+            // Persist a newly created directory entry. An existing database does not need
+            // its ancestors opened, so a non-readable parent still allows a reopen.
+            if !existed {
+                let absolute = fs::canonicalize(path)?;
+                for parent in absolute.ancestors().skip(1) {
+                    match fs::File::open(parent) {
+                        Ok(file) => file.sync_all()?,
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
             }
         }
         let directory = fs::canonicalize(path)?;

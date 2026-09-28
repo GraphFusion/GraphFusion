@@ -2,6 +2,12 @@
 
 ## 0.2.0 — Unreleased
 
+- Fix parser crashes and literal handling: cap nesting, give `NOT` comparison
+  precedence, accept `i64::MIN` and decimal exponents, reject a name glued
+  onto a number, and keep quoted parameter
+  names. Repeated graph writes append to the existing table and keep unchanged
+  Parquet files. `run` prints statements that already committed, and a non-readable
+  parent directory no longer blocks reopening a database.
 - Add `graphfusion run --dump-ast` to inspect GQL query and file syntax trees
   without executing statements or opening a persistent database.
 - Launch an interactive session with `graphfusion [DIR]`; open or create a local

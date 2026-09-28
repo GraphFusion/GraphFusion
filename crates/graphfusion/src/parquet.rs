@@ -78,6 +78,7 @@ impl TableManifest {
                 .with_schema(self.schema.clone()),
         )?);
         table.row_count = self.rows;
+        table.file_id = Some(self.id);
         Ok(table)
     }
     fn check_file(&self, disk: &Disk) -> Result<()> {

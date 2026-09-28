@@ -1169,4 +1169,16 @@ invalid_cases! {
         input: "CREATE GRAPH TYPE bad AS COPY OF 'relative/path'",
         error_contains: "external object reference",
     }
+
+    quantifier_rejects_inverted_range {
+        input: "MATCH (a)-[e]->{3,1}(b) RETURN a",
+        error_contains: "lower bound exceeds upper bound",
+    }
+}
+
+#[test]
+fn deeply_nested_parentheses_are_rejected() {
+    let input = format!("RETURN {}1{} AS x", "(".repeat(64), ")".repeat(64));
+    let err = parse(&input).expect_err("deep nesting should fail");
+    assert!(err.to_string().contains("nested too deeply"), "{err}");
 }

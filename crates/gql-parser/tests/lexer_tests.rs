@@ -129,7 +129,7 @@ token_cases! {
     }
     delimited_parameters_decode_their_names {
         input: r#"$"a\n" $@`b\t`"#,
-        tokens: [(Parameter, "a\n", 0), (Parameter, r"b\t", 7)],
+        tokens: [(Parameter, "$a\n", 0), (Parameter, r"$b\t", 7)],
     }
     byte_string_chunks {
         input: "X'CA'\n'FE 00'",
@@ -200,13 +200,17 @@ error_cases! {
         input: " 1e+",
         error: Error::BadNumber { offset: 1, token_text: "1e+".into() },
     }
+    number_rejects_glued_name {
+        input: " 1.exp",
+        error: Error::BadNumber { offset: 1, token_text: "1.exp".into() },
+    }
     radix_requires_digits {
         input: " 0x",
         error: Error::BadNumber { offset: 1, token_text: "0x".into() },
     }
     radix_integer_rejects_overflow {
-        input: " 0x8000000000000000",
-        error: Error::BadNumber { offset: 1, token_text: "0x8000000000000000".into() },
+        input: " 0x8000000000000001",
+        error: Error::BadNumber { offset: 1, token_text: "0x8000000000000001".into() },
     }
     parameter_requires_name {
         input: " $ ",

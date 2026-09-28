@@ -170,9 +170,12 @@ pub(super) async fn apply(
             .sum::<usize>()
             != node.0.row_count
         {
-            node.0 = table(source(&node.0)?, node.0.labels.clone(), false, ctx, trace)
+            let file_id = node.0.file_id;
+            let mut loaded = table(source(&node.0)?, node.0.labels.clone(), false, ctx, trace)
                 .await?
                 .ok_or_else(|| Error::Corrupt("graph row count changed".into()))?;
+            loaded.file_id = file_id;
+            node.0 = loaded;
         }
     }
     for edge in &mut data.edges {
@@ -184,7 +187,8 @@ pub(super) async fn apply(
             .sum::<usize>()
             != edge.table.row_count
         {
-            edge.table = table(
+            let file_id = edge.table.file_id;
+            let mut loaded = table(
                 source(&edge.table)?,
                 edge.table.labels.clone(),
                 true,
@@ -193,6 +197,8 @@ pub(super) async fn apply(
             )
             .await?
             .ok_or_else(|| Error::Corrupt("graph row count changed".into()))?;
+            loaded.file_id = file_id;
+            edge.table = loaded;
         }
     }
     plan = freeze(plan, ctx, trace, None).await?;
@@ -483,7 +489,19 @@ async fn insert_element(
     .await?
     {
         if kind == ElementKind::Node {
-            next.nodes.push(NodeTable(table));
+            if let Some(existing) = next.nodes.iter_mut().find(|node| {
+                node.0.labels == table.labels && node.0.schema.as_ref() == table.schema.as_ref()
+            }) {
+                existing.0.append_rows(table)?;
+            } else {
+                next.nodes.push(NodeTable(table));
+            }
+        } else if let Some(existing) = next.edges.iter_mut().find(|edge| {
+            edge.directed == directed
+                && edge.table.labels == table.labels
+                && edge.table.schema.as_ref() == table.schema.as_ref()
+        }) {
+            existing.table.append_rows(table)?;
         } else {
             next.edges.push(EdgeTable { table, directed });
         }
@@ -810,6 +828,20 @@ async fn delete_graph(
                 table,
                 directed: edge.directed,
             });
+        }
+    }
+    if !delete.detach {
+        let node_ids: BTreeSet<u64> = new_nodes.iter().flat_map(|node| node.0.ids(ID)).collect();
+        let dangling = new_edges.iter().any(|edge| {
+            edge.table
+                .ids(SOURCE)
+                .chain(edge.table.ids(DESTINATION))
+                .any(|id| !node_ids.contains(&id))
+        });
+        if dangling {
+            return Err(Error::InvalidQuery(
+                "DELETE cannot remove a node that still has edges; use DETACH DELETE".into(),
+            ));
         }
     }
     let next = GraphData::try_new(new_nodes, new_edges)?;

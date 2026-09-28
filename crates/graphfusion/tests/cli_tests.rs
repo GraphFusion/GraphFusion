@@ -643,6 +643,34 @@ fn cli_errors_do_not_replace_graphs_or_hide_partial_commit_semantics() {
 }
 
 #[test]
+fn run_prints_committed_statements_before_a_later_error() {
+    let fixture = Fixture::new();
+    let output = fixture.invoke(
+        "run",
+        &[
+            "--create",
+            "--query",
+            "CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {i: 1}); RETURN 1 / 0 AS x",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "expected the last statement to fail"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("affected_elements=1"),
+        "committed insert was not printed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let again = fixture.run(
+        "run",
+        &["--query", "SESSION SET GRAPH g; MATCH (n) RETURN n.i AS i"],
+    );
+    assert!(again.contains('1'), "{again}");
+}
+
+#[test]
 fn cli_usage_and_in_memory_program() {
     let output = Command::new(env!("CARGO_BIN_EXE_graphfusion"))
         .arg("--help")

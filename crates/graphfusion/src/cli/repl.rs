@@ -110,7 +110,7 @@ pub async fn run(db: Database, path: Option<&str>, mut explain: bool) -> CliResu
                     Ok(())
                 }
                 ("\\read", path) if !path.is_empty() => match std::fs::read_to_string(path) {
-                    Ok(program) => execute(&mut session, &program, explain).await,
+                    Ok(program) => execute(&mut session, &program, explain, terminal).await,
                     Err(error) => Err(error.into()),
                 },
                 _ => Err("unknown REPL command or arguments; use \\help".into()),
@@ -129,7 +129,7 @@ pub async fn run(db: Database, path: Option<&str>, mut explain: bool) -> CliResu
                         let statement: String = buffer.drain(..end).collect();
                         if !is_empty(&statement) {
                             report(
-                                execute(&mut session, &statement, explain).await,
+                                execute(&mut session, &statement, explain, terminal).await,
                                 &mut failed,
                             );
                         }
@@ -146,7 +146,10 @@ pub async fn run(db: Database, path: Option<&str>, mut explain: bool) -> CliResu
                     Err(_) => {
                         // Route lexical failures through Session as well, so a
                         // bad input fails an explicit transaction consistently.
-                        report(execute(&mut session, &buffer, explain).await, &mut failed);
+                        report(
+                            execute(&mut session, &buffer, explain, terminal).await,
+                            &mut failed,
+                        );
                         buffer.clear();
                         break;
                     }
@@ -184,7 +187,18 @@ fn prompt(session: &Session, pending: bool) -> &'static str {
     }
 }
 
-async fn execute(session: &mut Session, input: &str, explain: bool) -> CliResult<()> {
+async fn execute(
+    session: &mut Session,
+    input: &str,
+    explain: bool,
+    terminal: bool,
+) -> CliResult<()> {
+    // A piped session must keep the default SIGINT behavior. tokio's handler
+    // swallows later interrupts after the first statement.
+    if !terminal {
+        let outputs = session.run(input).await?;
+        return print_outputs(outputs, explain);
+    }
     let outputs = tokio::select! {
         biased;
         signal = tokio::signal::ctrl_c() => {
@@ -205,7 +219,7 @@ fn report(result: CliResult<()>, failed: &mut bool) {
 
 /// Returns the byte boundary of the first top-level terminator. Lexical errors
 /// that may be completed on a following line keep the buffer open.
-fn next_statement(input: &str) -> gql::Result<Option<usize>> {
+pub(super) fn next_statement(input: &str) -> gql::Result<Option<usize>> {
     let mut depth = 0usize;
     for token in Lexer::new(input) {
         let token = match token {
@@ -226,7 +240,7 @@ fn next_statement(input: &str) -> gql::Result<Option<usize>> {
     Ok(None)
 }
 
-fn is_empty(input: &str) -> bool {
+pub(super) fn is_empty(input: &str) -> bool {
     Lexer::new(input).all(|token| matches!(token, Ok(t) if t.kind == TokenKind::Semicolon))
 }
 
