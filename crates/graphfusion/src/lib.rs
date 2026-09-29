@@ -22,7 +22,7 @@ pub use session::{
     StatementResult, TransactionAction, TransactionStatus, Value,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -61,9 +61,56 @@ pub struct Statistics {
 struct Inner {
     disk: Option<Disk>,
     state: Mutex<Arc<PublishedState>>,
+    branches: Mutex<MemoryBranches>,
     active: AtomicUsize,
     unhealthy: AtomicBool,
     metrics: Metrics,
+}
+#[derive(Debug, Default)]
+struct MemoryBranches {
+    next_id: u64,
+    commits: BTreeMap<u64, StoredBranchCommit>,
+    refs: BTreeMap<String, u64>,
+}
+#[derive(Debug)]
+struct StoredBranchCommit {
+    #[allow(dead_code)]
+    parent: Option<u64>,
+    state: Arc<PublishedState>,
+}
+impl MemoryBranches {
+    fn publish_main(&mut self, state: &PublishedState) -> Result<()> {
+        let parent = self.refs.get("main").copied();
+        if let Some(id) = parent {
+            if self.commits.get(&id).map(|commit| commit.state.commit_seq) == Some(state.commit_seq)
+            {
+                return Ok(());
+            }
+        }
+        let id = self.allocate()?;
+        self.commits.insert(
+            id,
+            StoredBranchCommit {
+                parent,
+                state: Arc::new(state.clone()),
+            },
+        );
+        self.refs.insert("main".into(), id);
+        Ok(())
+    }
+    fn allocate(&mut self) -> Result<u64> {
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidDefinition("commit ids exhausted".into()))?;
+        Ok(self.next_id)
+    }
+}
+/// A named ref pointing at an immutable catalog commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    pub name: String,
+    pub commit: u64,
 }
 #[derive(Clone, Debug)]
 pub struct Database {
@@ -105,6 +152,7 @@ impl Database {
             inner: Arc::new(Inner {
                 disk: None,
                 state: Mutex::new(Arc::new(PublishedState::initial())),
+                branches: Mutex::new(MemoryBranches::default()),
                 active: AtomicUsize::new(0),
                 unhealthy: AtomicBool::new(false),
                 metrics: Metrics::default(),
@@ -173,6 +221,7 @@ impl Database {
         let inner = Arc::new(Inner {
             disk: Some(disk),
             state: Mutex::new(Arc::new(state)),
+            branches: Mutex::new(MemoryBranches::default()),
             active: AtomicUsize::new(0),
             unhealthy: AtomicBool::new(false),
             metrics: Metrics::default(),
@@ -191,6 +240,109 @@ impl Database {
     }
     pub fn session(&self) -> Session {
         Session::new(self.clone())
+    }
+    /// Points a new branch at the current `main` snapshot. Later commits on that
+    /// branch write a new immutable snapshot and move only its ref.
+    pub fn create_branch(&self, name: &str) -> Result<u64> {
+        validate_branch_name(name)?;
+        if name == "main" {
+            return Err(Error::AlreadyExists(name.into()));
+        }
+        let state = self.inner.state.lock().map_err(|_| Error::Poisoned)?;
+        self.check_healthy()?;
+        if let Some(disk) = &self.inner.disk {
+            let _commit = disk.commit_lock()?;
+            if disk.read_ref(name)?.is_some() {
+                return Err(Error::AlreadyExists(name.into()));
+            }
+            let (loaded, _) = disk.load()?;
+            let id = disk.ensure_main_snapshot(&loaded)?;
+            disk.write_ref(name, id)?;
+            return Ok(id);
+        }
+        let mut branches = self.inner.branches.lock().map_err(|_| Error::Poisoned)?;
+        if branches.refs.contains_key(name) {
+            return Err(Error::AlreadyExists(name.into()));
+        }
+        branches.publish_main(&state)?;
+        let id = *branches
+            .refs
+            .get("main")
+            .ok_or_else(|| Error::Corrupt("main branch snapshot missing".into()))?;
+        branches.refs.insert(name.to_owned(), id);
+        Ok(id)
+    }
+    pub fn branches(&self) -> Result<Vec<Branch>> {
+        let mut listed = if let Some(disk) = &self.inner.disk {
+            disk.list_refs()?
+        } else {
+            let branches = self.inner.branches.lock().map_err(|_| Error::Poisoned)?;
+            branches
+                .refs
+                .iter()
+                .map(|(name, commit)| (name.clone(), *commit))
+                .collect()
+        };
+        if !listed.iter().any(|(name, _)| name == "main") {
+            listed.push(("main".into(), 0));
+        }
+        listed.sort();
+        Ok(listed
+            .into_iter()
+            .map(|(name, commit)| Branch { name, commit })
+            .collect())
+    }
+    pub(crate) fn read_branch(&self, name: &str) -> Result<(u64, Arc<PublishedState>)> {
+        if let Some(disk) = &self.inner.disk {
+            let id = disk
+                .read_ref(name)?
+                .ok_or_else(|| Error::NotFound(name.into()))?;
+            return Ok((id, Arc::new(disk.read_commit(id)?.state)));
+        }
+        let branches = self.inner.branches.lock().map_err(|_| Error::Poisoned)?;
+        let id = *branches
+            .refs
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.into()))?;
+        let state = branches
+            .commits
+            .get(&id)
+            .ok_or_else(|| Error::Corrupt(format!("missing commit {id}")))?
+            .state
+            .clone();
+        Ok((id, state))
+    }
+    pub(crate) fn note_main_commit(&self, state: &PublishedState) -> Result<()> {
+        self.inner
+            .branches
+            .lock()
+            .map_err(|_| Error::Poisoned)?
+            .publish_main(state)
+    }
+    pub(crate) fn publish_branch_commit(
+        &self,
+        name: &str,
+        expected: u64,
+        state: PublishedState,
+    ) -> Result<()> {
+        let mut branches = self.inner.branches.lock().map_err(|_| Error::Poisoned)?;
+        let current = *branches
+            .refs
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.into()))?;
+        if current != expected {
+            return Err(Error::Conflict("branch moved".into()));
+        }
+        let id = branches.allocate()?;
+        branches.commits.insert(
+            id,
+            StoredBranchCommit {
+                parent: Some(expected),
+                state: Arc::new(state),
+            },
+        );
+        branches.refs.insert(name.to_owned(), id);
+        Ok(())
     }
     /// Inspects one consistent catalog snapshot, without opening a cross-statement transaction.
     pub fn with_catalog<T>(
@@ -288,5 +440,23 @@ impl Database {
         Ok(())
     }
 }
+
+fn validate_branch_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidDefinition(format!(
+            "invalid branch name {name}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests;

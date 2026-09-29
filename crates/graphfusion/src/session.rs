@@ -93,6 +93,7 @@ pub struct Session {
     state: SessionState,
     initial: SessionState,
     transaction: Option<transactions::ExplicitTransaction>,
+    branch: String,
 }
 
 impl Session {
@@ -103,10 +104,28 @@ impl Session {
             initial: state.clone(),
             state,
             transaction: None,
+            branch: "main".into(),
         }
     }
     pub fn state(&self) -> &SessionState {
         &self.state
+    }
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+    /// Subsequent statements read and commit this branch. `main` stays on the database WAL.
+    pub fn set_branch(&mut self, name: &str) -> Result<()> {
+        if self.state.closed {
+            return Err(Error::SessionClosed);
+        }
+        if self.transaction.is_some() {
+            return Err(Error::TransactionActive);
+        }
+        if name != "main" {
+            self.db.read_branch(name)?;
+        }
+        self.branch = name.to_owned();
+        Ok(())
     }
     /// Session-local execution limits, effective for the next statement.
     pub fn set_query_limits(&mut self, limits: QueryLimits) -> Result<()> {

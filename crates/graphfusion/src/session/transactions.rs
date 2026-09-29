@@ -67,7 +67,7 @@ impl Session {
             ));
         }
         let read_only = start.access_mode == Some(ast::TransactionAccessMode::ReadOnly);
-        let mut tx = StatementTxn::begin(&self.db)?;
+        let mut tx = StatementTxn::begin_on(&self.db, &self.branch)?;
         tx.set_read_only(read_only);
         let snapshot_seq = tx.base.commit_seq;
         self.transaction = Some(ExplicitTransaction {
@@ -137,7 +137,7 @@ impl Session {
         let (tx, explicit) = if let Some(mut transaction) = self.transaction.take() {
             (transaction.tx.take().unwrap(), Some(transaction))
         } else {
-            (StatementTxn::begin(&self.db)?, None)
+            (StatementTxn::begin_on(&self.db, &self.branch)?, None)
         };
         Ok(Work {
             session: self,

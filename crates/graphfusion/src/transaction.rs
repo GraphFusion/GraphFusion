@@ -125,6 +125,8 @@ pub(crate) struct StatementTxn {
     rows_written: BTreeMap<(ObjectId, String), Option<CommitSeq>>,
     graph_versions: BTreeMap<ObjectId, CommitSeq>,
     ids: std::ops::Range<ObjectId>,
+    branch: String,
+    tip: Option<u64>,
 }
 impl Drop for StatementTxn {
     fn drop(&mut self) {
@@ -133,6 +135,12 @@ impl Drop for StatementTxn {
 }
 impl StatementTxn {
     pub fn begin(db: &Database) -> Result<Self> {
+        Self::begin_on(db, "main")
+    }
+    pub fn begin_on(db: &Database, branch: &str) -> Result<Self> {
+        if branch != "main" {
+            return Self::begin_branch(db, branch);
+        }
         db.check_healthy()?;
         let mut state = db.inner.state.lock().map_err(|_| Error::Poisoned)?;
         db.check_healthy()?;
@@ -165,6 +173,32 @@ impl StatementTxn {
             rows_written: BTreeMap::new(),
             graph_versions: BTreeMap::new(),
             ids: 0..0,
+            branch: "main".into(),
+            tip: None,
+        })
+    }
+    fn begin_branch(db: &Database, branch: &str) -> Result<Self> {
+        db.check_healthy()?;
+        let (tip, base) = db.read_branch(branch)?;
+        let _state = db.inner.state.lock().map_err(|_| Error::Poisoned)?;
+        db.check_healthy()?;
+        db.inner.active.fetch_add(1, Ordering::SeqCst);
+        Ok(Self {
+            db: db.clone(),
+            read_only: false,
+            view: (*base.catalog).clone(),
+            base,
+            changes: Vec::new(),
+            storage_changes: Vec::new(),
+            objects_read: BTreeMap::new(),
+            names_read: BTreeMap::new(),
+            members_read: BTreeMap::new(),
+            references_read: BTreeMap::new(),
+            rows_written: BTreeMap::new(),
+            graph_versions: BTreeMap::new(),
+            ids: 0..0,
+            branch: branch.to_owned(),
+            tip: Some(tip),
         })
     }
     pub fn set_read_only(&mut self, read_only: bool) {
@@ -491,6 +525,9 @@ impl StatementTxn {
     }
     pub fn commit(self) -> Result<CommitSeq> {
         self.db.check_healthy()?;
+        if self.branch != "main" {
+            return self.commit_branch();
+        }
         if self.changes.is_empty() && self.storage_changes.is_empty() {
             return Ok(self.base.commit_seq);
         }
@@ -543,7 +580,64 @@ impl StatementTxn {
         }
         crate::persistence::failpoint("before_publish");
         let seq = candidate.commit_seq;
+        if let Some(disk) = &self.db.inner.disk {
+            disk.publish_main_snapshot(&candidate)?;
+        } else {
+            self.db.note_main_commit(&candidate)?;
+        }
         *state = candidate;
+        self.db
+            .inner
+            .metrics
+            .commits
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(seq)
+    }
+    fn commit_branch(self) -> Result<CommitSeq> {
+        if self.changes.is_empty() && self.storage_changes.is_empty() {
+            return Ok(self.base.commit_seq);
+        }
+        let expected = self
+            .tip
+            .ok_or_else(|| Error::Corrupt("branch has no snapshot".into()))?;
+        let state = self.db.inner.state.lock().map_err(|_| Error::Poisoned)?;
+        self.db.check_healthy()?;
+        let _commit = self
+            .db
+            .inner
+            .disk
+            .as_ref()
+            .map(|d| d.commit_lock())
+            .transpose()?;
+        let mut base = (*self.base).clone();
+        if base.next_id < state.next_id {
+            base.next_id = state.next_id;
+        }
+        drop(state);
+        let record = CommitRecord {
+            seq: base
+                .commit_seq
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidDefinition("commit sequence exhausted".into()))?,
+            catalog: self.changes.clone(),
+            storage: self.storage_changes.clone(),
+        };
+        let candidate = base.apply(&record)?;
+        let seq = candidate.commit_seq;
+        if let Some(disk) = &self.db.inner.disk {
+            let current = disk
+                .read_ref(&self.branch)?
+                .ok_or_else(|| Error::NotFound(self.branch.clone()))?;
+            if current != expected {
+                return Err(Error::Conflict("branch moved".into()));
+            }
+            let id = disk.allocate_commit_id()?;
+            disk.write_commit(id, Some(expected), &candidate)?;
+            disk.write_ref(&self.branch, id)?;
+        } else {
+            self.db
+                .publish_branch_commit(&self.branch, expected, candidate)?;
+        }
         self.db
             .inner
             .metrics

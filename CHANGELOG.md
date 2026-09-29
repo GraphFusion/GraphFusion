@@ -2,6 +2,9 @@
 
 ## 0.2.0 — Unreleased
 
+- Record immutable commit snapshots and named branch refs. A branch starts at
+  the current `main` snapshot; later commits move only that ref, and checkpoint
+  keeps Parquet files still referenced by another branch.
 - Fix parser crashes and literal handling: cap nesting, give `NOT` comparison
   precedence, accept `i64::MIN` and decimal exponents, reject a name glued
   onto a number, and keep quoted parameter

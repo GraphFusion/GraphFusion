@@ -2060,3 +2060,88 @@ async fn explicit_transaction_crashes_never_split_statements_or_graphs() {
         db.checkpoint().unwrap();
     }
 }
+
+#[tokio::test]
+async fn branches_diverge_and_survive_checkpoint() {
+    let dir = TestDir::new();
+    let db = dir.open();
+    let mut main = db.session();
+    main.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {v: 1})")
+        .await
+        .unwrap();
+    let fork = db.create_branch("dev").unwrap();
+    assert!(fork >= 1);
+    assert!(dir.0.join("refs").join("dev").is_file());
+    assert!(dir.0.join("commits").join(format!("{fork}.snap")).is_file());
+    main.run("INSERT (:N {v: 2})").await.unwrap();
+    let mut dev = db.session();
+    dev.set_branch("dev").unwrap();
+    dev.execute("SESSION SET GRAPH g").unwrap();
+    assert_eq!(
+        property_values(&dev.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![1]
+    );
+    dev.run("INSERT (:N {v: 3})").await.unwrap();
+    assert_eq!(
+        property_values(&dev.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![1, 3]
+    );
+    assert_eq!(
+        property_values(&main.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![1, 2]
+    );
+    let mut stalled = db.session();
+    stalled.set_branch("dev").unwrap();
+    stalled.execute("SESSION SET GRAPH g").unwrap();
+    stalled.execute("START TRANSACTION").unwrap();
+    stalled.run("INSERT (:N {v: 9})").await.unwrap();
+    dev.run("INSERT (:N {v: 4})").await.unwrap();
+    assert!(matches!(stalled.execute("COMMIT"), Err(Error::Conflict(_))));
+    db.checkpoint().unwrap();
+    assert_eq!(
+        property_values(&dev.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![1, 3, 4]
+    );
+    drop(main);
+    drop(dev);
+    drop(stalled);
+    drop(db);
+    let db = dir.open();
+    let mut dev = db.session();
+    dev.set_branch("dev").unwrap();
+    dev.execute("SESSION SET GRAPH g").unwrap();
+    assert_eq!(
+        property_values(&dev.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![1, 3, 4]
+    );
+    let mut main = db.session();
+    main.execute("SESSION SET GRAPH g").unwrap();
+    assert_eq!(
+        property_values(&main.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![1, 2]
+    );
+    let names: Vec<_> = db
+        .branches()
+        .unwrap()
+        .into_iter()
+        .map(|branch| branch.name)
+        .collect();
+    assert_eq!(names, vec!["dev".to_owned(), "main".to_owned()]);
+}
+
+fn property_values(result: &QueryResult) -> Vec<i64> {
+    use arrow::array::Int64Array;
+    let mut values = Vec::new();
+    for batch in &result.batches {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for row in 0..column.len() {
+            values.push(column.value(row));
+        }
+    }
+    values.sort_unstable();
+    values
+}

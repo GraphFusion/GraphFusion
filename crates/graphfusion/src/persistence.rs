@@ -289,7 +289,7 @@ impl Disk {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidDefinition("checkpoint generation exhausted".into()))?;
         self.install_checkpoint(state, old.database_id, generation, obsolete)?;
-        self.reclaim_graph_files(state);
+        self.reclaim_graph_files(state)?;
         Ok(())
     }
 
@@ -372,6 +372,162 @@ impl Disk {
         self.directory
             .join(format!("{prefix}-{generation}.{suffix}"))
     }
+
+    pub(crate) fn publish_main_snapshot(&self, state: &PublishedState) -> Result<()> {
+        let parent = self.read_ref("main")?;
+        if let Some(id) = parent {
+            if self.read_commit(id)?.state.commit_seq == state.commit_seq {
+                return Ok(());
+            }
+        }
+        let id = self.allocate_commit_id()?;
+        self.write_commit(id, parent, state)?;
+        self.write_ref("main", id)
+    }
+
+    pub(crate) fn ensure_main_snapshot(&self, state: &PublishedState) -> Result<u64> {
+        if let Some(id) = self.read_ref("main")? {
+            if self.read_commit(id)?.state.commit_seq == state.commit_seq {
+                return Ok(id);
+            }
+        }
+        self.publish_main_snapshot(state)?;
+        self.read_ref("main")?
+            .ok_or_else(|| Error::Corrupt("main branch snapshot missing".into()))
+    }
+
+    pub(crate) fn read_ref(&self, name: &str) -> Result<Option<u64>> {
+        let path = self.refs_dir().join(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(read_document(&path)?))
+    }
+
+    pub(crate) fn list_refs(&self) -> Result<Vec<(String, u64)>> {
+        let dir = self.refs_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut refs = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.ends_with(".tmp") || name.starts_with('.') {
+                continue;
+            }
+            refs.push((name.to_owned(), read_document(&entry.path())?));
+        }
+        refs.sort();
+        Ok(refs)
+    }
+
+    pub(crate) fn write_ref(&self, name: &str, commit: u64) -> Result<()> {
+        let dir = self.refs_dir();
+        fs::create_dir_all(&dir)?;
+        let temporary = dir.join(format!("{name}.tmp"));
+        write_document(&temporary, &commit)?;
+        sync_directory(&dir)?;
+        fs::rename(&temporary, dir.join(name))?;
+        sync_directory(&dir)?;
+        Ok(())
+    }
+
+    pub(crate) fn read_commit(&self, id: u64) -> Result<StoredCommit> {
+        read_document(&self.commit_path(id))
+    }
+
+    pub(crate) fn write_commit(
+        &self,
+        id: u64,
+        parent: Option<u64>,
+        state: &PublishedState,
+    ) -> Result<()> {
+        let dir = self.commits_dir();
+        fs::create_dir_all(&dir)?;
+        let path = self.commit_path(id);
+        if path.exists() {
+            return Err(Error::Corrupt(format!("commit {id} already exists")));
+        }
+        write_document(
+            &path,
+            &StoredCommit {
+                parent,
+                state: state.clone(),
+            },
+        )?;
+        sync_directory(&dir)?;
+        Ok(())
+    }
+
+    pub(crate) fn allocate_commit_id(&self) -> Result<u64> {
+        let mut max = 0u64;
+        let dir = self.commits_dir();
+        if dir.exists() {
+            for entry in fs::read_dir(&dir)? {
+                let name = entry?.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if let Some(id) = name
+                    .strip_suffix(".snap")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    max = max.max(id);
+                }
+            }
+        }
+        max.checked_add(1)
+            .ok_or_else(|| Error::InvalidDefinition("commit ids exhausted".into()))
+    }
+
+    /// Parquet files still named by a non-main branch, including ancestors of its tip.
+    pub(crate) fn branch_data_files(&self) -> Result<std::collections::BTreeSet<String>> {
+        let mut files = std::collections::BTreeSet::new();
+        for (name, mut id) in self.list_refs()? {
+            if name == "main" {
+                continue;
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            loop {
+                if !seen.insert(id) {
+                    return Err(Error::Corrupt(format!("commit cycle at {id}")));
+                }
+                let stored = self.read_commit(id)?;
+                for generation in stored.state.storage.generations.values() {
+                    if let Some(manifest) = &generation.parquet {
+                        for table in manifest.tables() {
+                            files.insert(format!("graph-{}.parquet", table.id));
+                        }
+                    }
+                }
+                match stored.parent {
+                    Some(parent) => id = parent,
+                    None => break,
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    fn refs_dir(&self) -> PathBuf {
+        self.directory.join("refs")
+    }
+    fn commits_dir(&self) -> PathBuf {
+        self.directory.join("commits")
+    }
+    fn commit_path(&self, id: u64) -> PathBuf {
+        self.commits_dir().join(format!("{id}.snap"))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct StoredCommit {
+    pub parent: Option<u64>,
+    pub state: PublishedState,
 }
 
 fn lock_file(path: &Path) -> Result<File> {

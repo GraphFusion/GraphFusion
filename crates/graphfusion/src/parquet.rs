@@ -194,8 +194,8 @@ impl Disk {
         Ok(())
     }
     /// Called only after a durable checkpoint, under the exclusive lifecycle lease.
-    pub fn reclaim_graph_files(&self, state: &PublishedState) {
-        let live: BTreeSet<_> = state
+    pub fn reclaim_graph_files(&self, state: &PublishedState) -> Result<()> {
+        let mut live: BTreeSet<_> = state
             .storage
             .generations
             .values()
@@ -203,8 +203,9 @@ impl Disk {
             .flat_map(|m| m.tables())
             .map(|t| t.name())
             .collect();
+        live.extend(self.branch_data_files()?);
         let Ok(entries) = fs::read_dir(&self.directory) else {
-            return;
+            return Ok(());
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -223,5 +224,6 @@ impl Disk {
         }
         // Failed removals remain discoverable at the next checkpoint.
         let _ = sync_directory(&self.directory);
+        Ok(())
     }
 }
