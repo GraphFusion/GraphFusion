@@ -267,7 +267,7 @@ impl Disk {
         write.map_err(Error::CommitUnknown)
     }
 
-    pub fn checkpoint(&self, state: &PublishedState, old_generation: u64) -> Result<()> {
+    pub fn checkpoint(&self, state: &PublishedState, old_generation: u64) -> Result<u64> {
         let old: Manifest = read_document(&self.directory.join("MANIFEST"))?;
         if old.generation != old_generation {
             return Err(Error::Corrupt(
@@ -290,7 +290,7 @@ impl Disk {
             .ok_or_else(|| Error::InvalidDefinition("checkpoint generation exhausted".into()))?;
         self.install_checkpoint(state, old.database_id, generation, obsolete)?;
         self.reclaim_graph_files(state)?;
-        Ok(())
+        Ok(generation)
     }
 
     fn install_checkpoint(

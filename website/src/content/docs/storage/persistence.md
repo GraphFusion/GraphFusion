@@ -20,6 +20,8 @@ The supported environment is Linux/macOS on a local filesystem with OS file lock
 
 Recovery reads the manifest/checkpoint and committed WAL, validates referenced graph files, and restores a consistent generation before accepting work. Staged files that were never published do not become visible graph data.
 
-The current format is v3. Older formats are rejected; there is no built-in migration path. Do not edit or delete coordinating lock files while a database is open. This documentation does not promise compatibility across future format changes.
+After opening the directory, the owning process shares its published `main` snapshot between statements. Commits and ID reservations update this state under the coordinator's lock; successful checkpoints advance its WAL generation. A failed checkpoint or snapshot publication triggers recovery before the state is reused. Checksum and format validation of checkpoints and WAL occurs during recovery, rather than on every statement.
+
+The current format is v3. Older formats are rejected; there is no built-in migration path. Do not edit or delete database files while a database is open. This documentation does not promise compatibility across future format changes.
 
 [Checkpointing](/storage/checkpoint/) reclaims obsolete generations when no active snapshot can use them. There is no automatic checkpoint scheduler.

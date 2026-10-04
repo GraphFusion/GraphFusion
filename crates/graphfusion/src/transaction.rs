@@ -144,26 +144,13 @@ impl StatementTxn {
         db.check_healthy()?;
         let mut state = db.inner.state.lock().map_err(|_| Error::Poisoned)?;
         db.check_healthy()?;
-        let _commit = db
-            .inner
-            .disk
-            .as_ref()
-            .map(|d| d.commit_lock())
-            .transpose()?;
-        if let Some(disk) = &db.inner.disk {
-            let started = Instant::now();
-            *state = Arc::new(disk.load()?.0);
-            db.inner
-                .metrics
-                .recovery_micros
-                .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
+        db.recover_main(&mut state)?;
         db.inner.active.fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             db: db.clone(),
             read_only: false,
-            base: state.clone(),
-            view: state.catalog.clone(),
+            base: state.published.clone(),
+            view: state.published.catalog.clone(),
             changes: Vec::new(),
             storage_changes: Vec::new(),
             objects_read: BTreeMap::new(),
@@ -543,6 +530,7 @@ impl StatementTxn {
         let started = Instant::now();
         let mut state = self.db.inner.state.lock().map_err(|_| Error::Poisoned)?;
         self.db.check_healthy()?;
+        self.db.recover_main(&mut state)?;
         let _commit = self
             .db
             .inner
@@ -555,14 +543,7 @@ impl StatementTxn {
             .metrics
             .commit_wait_micros
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let generation = if let Some(disk) = &self.db.inner.disk {
-            let (latest, generation) = disk.load()?;
-            *state = Arc::new(latest);
-            generation
-        } else {
-            0
-        };
-        if let Err(error) = self.validate(&state) {
+        if let Err(error) = self.validate(&state.published) {
             self.db
                 .inner
                 .metrics
@@ -572,20 +553,22 @@ impl StatementTxn {
         }
         let record = CommitRecord {
             seq: state
+                .published
                 .commit_seq
                 .checked_add(1)
                 .ok_or_else(|| Error::InvalidDefinition("commit sequence exhausted".into()))?,
             catalog: self.changes.clone(),
             storage: self.storage_changes.clone(),
         };
-        let candidate = Arc::new(state.apply(&record)?);
+        let candidate = Arc::new(state.published.apply(&record)?);
         if let Some(disk) = &self.db.inner.disk {
-            if let Err(error) = disk.append(generation, &LogRecord::Commit(record)) {
+            if let Err(error) = disk.append(state.generation, &LogRecord::Commit(record)) {
                 if matches!(error, Error::CommitUnknown(_)) {
                     self.db.inner.unhealthy.store(true, Ordering::SeqCst);
                 }
                 return Err(error);
             }
+            state.needs_recovery = true;
         }
         crate::persistence::failpoint("before_publish");
         let seq = candidate.commit_seq;
@@ -594,7 +577,8 @@ impl StatementTxn {
         } else {
             self.db.note_main_commit(&candidate)?;
         }
-        *state = candidate;
+        state.published = candidate;
+        state.needs_recovery = false;
         self.db
             .inner
             .metrics
@@ -609,8 +593,9 @@ impl StatementTxn {
         let expected = self
             .tip
             .ok_or_else(|| Error::Corrupt("branch has no snapshot".into()))?;
-        let state = self.db.inner.state.lock().map_err(|_| Error::Poisoned)?;
+        let mut state = self.db.inner.state.lock().map_err(|_| Error::Poisoned)?;
         self.db.check_healthy()?;
+        self.db.recover_main(&mut state)?;
         let _commit = self
             .db
             .inner
@@ -619,8 +604,8 @@ impl StatementTxn {
             .map(|d| d.commit_lock())
             .transpose()?;
         let mut base = (*self.base).clone();
-        if base.next_id < state.next_id {
-            base.next_id = state.next_id;
+        if base.next_id < state.published.next_id {
+            base.next_id = state.published.next_id;
         }
         drop(state);
         let record = CommitRecord {
@@ -700,6 +685,7 @@ impl StatementTxn {
         }
         let mut state = self.db.inner.state.lock().map_err(|_| Error::Poisoned)?;
         self.db.check_healthy()?;
+        self.db.recover_main(&mut state)?;
         let _commit = self
             .db
             .inner
@@ -707,26 +693,20 @@ impl StatementTxn {
             .as_ref()
             .map(|d| d.commit_lock())
             .transpose()?;
-        let generation = if let Some(disk) = &self.db.inner.disk {
-            let (latest, generation) = disk.load()?;
-            *state = Arc::new(latest);
-            generation
-        } else {
-            0
-        };
-        let start = state.next_id;
+        let start = state.published.next_id;
         let end = start
             .checked_add(64)
             .ok_or_else(|| Error::InvalidDefinition("object IDs exhausted".into()))?;
         if let Some(disk) = &self.db.inner.disk {
-            if let Err(error) = disk.append(generation, &LogRecord::Reserve { next_id: end }) {
+            if let Err(error) = disk.append(state.generation, &LogRecord::Reserve { next_id: end })
+            {
                 if matches!(error, Error::CommitUnknown(_)) {
                     self.db.inner.unhealthy.store(true, Ordering::SeqCst);
                 }
                 return Err(error);
             }
         }
-        Arc::make_mut(&mut state).next_id = end;
+        Arc::make_mut(&mut state.published).next_id = end;
         self.ids = start + 1..end;
         Ok(start)
     }
