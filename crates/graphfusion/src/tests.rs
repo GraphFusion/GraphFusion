@@ -641,15 +641,27 @@ fn independent_writers_merge_and_same_name_conflicts() {
 #[test]
 fn negative_name_and_collection_reads_detect_phantoms() {
     let db = Database::new();
-    let mut a = StatementTxn::begin(&db).unwrap();
-    assert!(a.lookup(MAIN_SCHEMA, ObjectKind::Graph, "absent").is_none());
-    a.create_graph(MAIN_SCHEMA, "other", GraphShape::Open)
-        .unwrap();
-    let id = create_graph(&db, "absent");
-    let mut b = StatementTxn::begin(&db).unwrap();
-    b.drop_object(id).unwrap();
-    b.commit().unwrap();
-    assert!(matches!(a.commit(), Err(Error::Conflict(_))));
+    for name in ["absent", "a/b.c\"\\名"] {
+        let mut a = StatementTxn::begin(&db).unwrap();
+        assert!(a.lookup(MAIN_SCHEMA, ObjectKind::Graph, name).is_none());
+        assert!(a.lookup(MAIN_SCHEMA, ObjectKind::Graph, name).is_none());
+        a.create_graph(MAIN_SCHEMA, "other", GraphShape::Open)
+            .unwrap();
+        let id = create_graph(&db, name);
+        let mut b = StatementTxn::begin(&db).unwrap();
+        assert_eq!(
+            b.lookup(MAIN_SCHEMA, ObjectKind::Graph, name).unwrap().id,
+            id
+        );
+        assert_eq!(
+            b.lookup(MAIN_SCHEMA, ObjectKind::Graph, name).unwrap().id,
+            id
+        );
+        b.drop_object(id).unwrap();
+        assert!(b.lookup(MAIN_SCHEMA, ObjectKind::Graph, name).is_none());
+        b.commit().unwrap();
+        assert!(matches!(a.commit(), Err(Error::Conflict(_))));
+    }
     let mut a = StatementTxn::begin(&db).unwrap();
     assert!(a.children(MAIN_SCHEMA).is_empty());
     a.create_graph(MAIN_SCHEMA, "after_scan", GraphShape::Open)
