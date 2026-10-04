@@ -70,6 +70,7 @@ fn arrow_graph_snapshots_conflicts_and_drop_reclamation() {
         .state
         .lock()
         .unwrap()
+        .published
         .storage
         .generations
         .is_empty());
@@ -109,7 +110,7 @@ fn graph_import_persists_and_rejects_unvalidated_typed_graphs() {
         session
             .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
             .unwrap();
-        let seq = db.inner.state.lock().unwrap().commit_seq;
+        let seq = db.inner.state.lock().unwrap().published.commit_seq;
         assert_eq!(
             session.replace_graph_data(arrow_graph(vec![1])).unwrap(),
             seq + 1
@@ -327,7 +328,7 @@ fn nested_definitions_are_rejected_before_commit_or_remain_recoverable() {
             let mut session = db.session();
             let value_type = format!("{}INTEGER{}", "LIST<".repeat(depth), ">".repeat(depth));
             let statement = format!("{prefix} {{ NODE N {{ value {value_type} }} }}");
-            let before = db.inner.state.lock().unwrap().commit_seq;
+            let before = db.inner.state.lock().unwrap().published.commit_seq;
             let committed = match session.execute(&statement) {
                 Ok(_) => {
                     accepted += 1;
@@ -336,7 +337,7 @@ fn nested_definitions_are_rejected_before_commit_or_remain_recoverable() {
                 Err(Error::UnsupportedFeature(message)) => {
                     assert!(message.contains("recursion limit"), "{message}");
                     rejected += 1;
-                    assert_eq!(db.inner.state.lock().unwrap().commit_seq, before);
+                    assert_eq!(db.inner.state.lock().unwrap().published.commit_seq, before);
                     false
                 }
                 Err(error) => panic!("depth {depth}: {error}"),
@@ -1015,7 +1016,17 @@ fn write_before_drop_retires_latest_data_and_row_conflicts() {
     assert!(matches!(b.commit(), Err(Error::Conflict(_))));
     dropper.commit().unwrap();
     db.checkpoint().unwrap();
-    assert_eq!(db.inner.state.lock().unwrap().storage.generations.len(), 1);
+    assert_eq!(
+        db.inner
+            .state
+            .lock()
+            .unwrap()
+            .published
+            .storage
+            .generations
+            .len(),
+        1
+    );
     assert!(graph_id(&db, "doomed").is_none());
 }
 
@@ -1146,6 +1157,170 @@ fn child_command(dir: &TestDir, mode: &str) -> Command {
         .env("GF_DIR", &dir.0)
         .env("GF_MODE", mode);
     command
+}
+
+#[test]
+fn persistent_main_state_is_shared_across_statements_and_reservations() {
+    let dir = TestDir::new();
+    let db = dir.open();
+    let reopened = dir.open();
+    let recovery = db.statistics().unwrap().recovery_micros;
+    let reader = StatementTxn::begin(&db).unwrap();
+    for _ in 0..16 {
+        let next = StatementTxn::begin(&reopened).unwrap();
+        assert!(Arc::ptr_eq(&reader.base, &next.base));
+    }
+    let mut aborted = StatementTxn::begin(&reopened).unwrap();
+    let aborted_id = aborted
+        .create(ROOT_DIRECTORY, "aborted", ObjectDefinition::Schema)
+        .unwrap();
+    drop(aborted);
+    let current = StatementTxn::begin(&db).unwrap();
+    assert!(Arc::ptr_eq(&reader.base.catalog, &current.base.catalog));
+    assert!(current.base.next_id > reader.base.next_id);
+    assert!(current
+        .catalog()
+        .lookup(ROOT_DIRECTORY, ObjectKind::Schema, "aborted")
+        .is_none());
+    drop(current);
+    let graph = create_graph(&reopened, "g");
+    assert!(graph > aborted_id);
+    assert!(reader
+        .catalog()
+        .lookup(MAIN_SCHEMA, ObjectKind::Graph, "g")
+        .is_none());
+    assert_eq!(graph_id(&db, "g"), Some(graph));
+    drop(reader);
+    db.create_branch("dev").unwrap();
+    for value in [b"first", b"later"] {
+        db.checkpoint().unwrap();
+        let mut writer = StatementTxn::begin(&reopened).unwrap();
+        writer
+            .write_row(graph, "row", Some(value.to_vec()))
+            .unwrap();
+        writer.commit().unwrap();
+    }
+    assert_eq!(db.statistics().unwrap().recovery_micros, recovery);
+    let mut branch = StatementTxn::begin_on(&db, "dev").unwrap();
+    assert_eq!(branch.read_row(graph, "row").unwrap(), None);
+    drop(branch);
+    drop(reopened);
+    drop(db);
+    let db = dir.open();
+    assert_eq!(graph_id(&db, "g"), Some(graph));
+    let mut reader = StatementTxn::begin(&db).unwrap();
+    assert_eq!(
+        reader.read_row(graph, "row").unwrap(),
+        Some(b"later".to_vec())
+    );
+}
+
+#[test]
+fn failed_main_snapshot_publication_recovers_before_commit_and_branch_creation() {
+    let dir = TestDir::new();
+    let db = dir.open();
+    create_graph(&db, "g");
+    let reader = StatementTxn::begin(&db).unwrap();
+    let mut writer = StatementTxn::begin(&db).unwrap();
+    let schema = writer
+        .create(ROOT_DIRECTORY, "durable", ObjectDefinition::Schema)
+        .unwrap();
+    let mut stale = StatementTxn::begin(&db).unwrap();
+    stale
+        .create(ROOT_DIRECTORY, "durable", ObjectDefinition::Schema)
+        .unwrap();
+    // Make secondary snapshot publication fail after the canonical WAL commit.
+    let main = dir.0.join("refs/main");
+    let saved = dir.0.join("refs/main.saved");
+    fs::rename(&main, &saved).unwrap();
+    fs::create_dir(&main).unwrap();
+    assert!(matches!(writer.commit(), Err(Error::Io(_))));
+    fs::remove_dir(&main).unwrap();
+    fs::rename(&saved, &main).unwrap();
+    assert!(matches!(stale.commit(), Err(Error::Conflict(_))));
+    assert!(reader
+        .catalog()
+        .lookup(ROOT_DIRECTORY, ObjectKind::Schema, "durable")
+        .is_none());
+    drop(reader);
+    db.with_catalog(|catalog| {
+        assert_eq!(
+            catalog
+                .lookup(ROOT_DIRECTORY, ObjectKind::Schema, "durable")
+                .unwrap()
+                .id,
+            schema
+        );
+    })
+    .unwrap();
+    db.create_branch("dev").unwrap();
+    let branch = StatementTxn::begin_on(&db, "dev").unwrap();
+    assert_eq!(
+        branch
+            .catalog()
+            .lookup(ROOT_DIRECTORY, ObjectKind::Schema, "durable")
+            .unwrap()
+            .id,
+        schema
+    );
+    drop(branch);
+    create_graph(&db, "after");
+    db.checkpoint().unwrap();
+    drop(db);
+    let db = dir.open();
+    assert!(graph_id(&db, "after").is_some());
+    db.with_catalog(|catalog| {
+        assert_eq!(
+            catalog
+                .lookup(ROOT_DIRECTORY, ObjectKind::Schema, "durable")
+                .unwrap()
+                .id,
+            schema
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn failed_checkpoint_recovers_the_selected_wal_generation() {
+    for switched in [false, true] {
+        let dir = TestDir::new();
+        let db = dir.open();
+        let (_, keeper) = seed(&db);
+        let blocker = if switched {
+            // Reclamation reads branch refs after MANIFEST has selected the new WAL.
+            let path = dir.0.join("refs/broken");
+            fs::write(&path, b"broken").unwrap();
+            path
+        } else {
+            // Interrupt snapshot installation before MANIFEST can switch generations.
+            let path = dir.0.join("data-1.snapshot");
+            fs::create_dir(&path).unwrap();
+            path
+        };
+        assert!(db.checkpoint().is_err());
+        assert_eq!(dir.0.join("wal-1.log").exists(), switched);
+        if switched {
+            fs::remove_file(blocker).unwrap();
+            let catalog = dir.0.join("catalog-1.snapshot");
+            let saved = dir.0.join("catalog-1.saved");
+            fs::rename(&catalog, &saved).unwrap();
+            assert!(matches!(db.with_catalog(|_| ()), Err(Error::Io(_))));
+            fs::rename(saved, catalog).unwrap();
+        } else {
+            fs::remove_dir(blocker).unwrap();
+        }
+        create_graph(&db, "after");
+        db.checkpoint().unwrap();
+        drop(db);
+        let db = dir.open();
+        assert!(graph_id(&db, "after").is_some());
+        let mut reader = StatementTxn::begin(&db).unwrap();
+        assert_eq!(
+            reader.read_row(keeper, "row").unwrap(),
+            Some(b"before".to_vec())
+        );
+    }
 }
 
 #[test]
@@ -1393,6 +1568,8 @@ fn corrupted_complete_records_fail_closed_and_torn_tail_is_removed() {
         .unwrap()
         .write_all(b"GFLOG")
         .unwrap();
+    drop(db);
+    let db = dir.open();
     assert!(graph_id(&db, "before").is_some());
     assert_eq!(fs::metadata(&log).unwrap().len(), valid_length);
     let mut file = FileOptions::new()
@@ -1407,7 +1584,11 @@ fn corrupted_complete_records_fail_closed_and_torn_tail_is_removed() {
     file.seek(SeekFrom::Start(24)).unwrap();
     file.write_all(&byte).unwrap();
     file.sync_all().unwrap();
-    assert!(matches!(db.with_catalog(|_| ()), Err(Error::Corrupt(_))));
+    drop(db);
+    assert!(matches!(
+        Database::open(&dir.0, OpenOptions::default()),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[test]
@@ -1418,11 +1599,15 @@ fn corrupted_checkpoint_never_falls_back_to_retired_files() {
     db.checkpoint().unwrap();
     db.session().execute("DROP GRAPH doomed").unwrap();
     db.checkpoint().unwrap();
+    drop(db);
     File::create(dir.0.join("catalog-2.snapshot"))
         .unwrap()
         .write_all(b"broken")
         .unwrap();
-    assert!(matches!(db.with_catalog(|_| ()), Err(Error::Corrupt(_))));
+    assert!(matches!(
+        Database::open(&dir.0, OpenOptions::default()),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[test]
@@ -1467,10 +1652,15 @@ fn swapping_database_files_is_detected() {
         let a = TestDir::new();
         let b = TestDir::new();
         let db = a.open();
-        let _other = b.open();
+        let other = b.open();
+        drop(db);
+        drop(other);
         fs::copy(b.0.join(file), a.0.join(file)).unwrap();
         assert!(
-            matches!(db.with_catalog(|_| ()), Err(Error::Corrupt(_))),
+            matches!(
+                Database::open(&a.0, OpenOptions::default()),
+                Err(Error::Corrupt(_))
+            ),
             "{file}"
         );
     }

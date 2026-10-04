@@ -60,11 +60,27 @@ pub struct Statistics {
 #[derive(Debug)]
 struct Inner {
     disk: Option<Disk>,
-    state: Mutex<Arc<PublishedState>>,
+    state: Mutex<MainState>,
     branches: Mutex<MemoryBranches>,
     active: AtomicUsize,
     unhealthy: AtomicBool,
     metrics: Metrics,
+}
+#[derive(Debug)]
+struct MainState {
+    published: Arc<PublishedState>,
+    generation: u64,
+    // A failed checkpoint or post-WAL publication can leave disk ahead of this state.
+    needs_recovery: bool,
+}
+impl MainState {
+    fn new(published: PublishedState, generation: u64) -> Self {
+        Self {
+            published: Arc::new(published),
+            generation,
+            needs_recovery: false,
+        }
+    }
 }
 #[derive(Debug, Default)]
 struct MemoryBranches {
@@ -151,7 +167,7 @@ impl Database {
         Self {
             inner: Arc::new(Inner {
                 disk: None,
-                state: Mutex::new(Arc::new(PublishedState::initial())),
+                state: Mutex::new(MainState::new(PublishedState::initial(), 0)),
                 branches: Mutex::new(MemoryBranches::default()),
                 active: AtomicUsize::new(0),
                 unhealthy: AtomicBool::new(false),
@@ -217,10 +233,10 @@ impl Database {
             return Err(Error::NotFound("database manifest".into()));
         }
         disk.initialize()?;
-        let (state, _) = disk.load()?;
+        let (state, generation) = disk.load()?;
         let inner = Arc::new(Inner {
             disk: Some(disk),
-            state: Mutex::new(Arc::new(state)),
+            state: Mutex::new(MainState::new(state, generation)),
             branches: Mutex::new(MemoryBranches::default()),
             active: AtomicUsize::new(0),
             unhealthy: AtomicBool::new(false),
@@ -248,15 +264,15 @@ impl Database {
         if name == "main" {
             return Err(Error::AlreadyExists(name.into()));
         }
-        let state = self.inner.state.lock().map_err(|_| Error::Poisoned)?;
+        let mut state = self.inner.state.lock().map_err(|_| Error::Poisoned)?;
         self.check_healthy()?;
+        self.recover_main(&mut state)?;
         if let Some(disk) = &self.inner.disk {
             let _commit = disk.commit_lock()?;
             if disk.read_ref(name)?.is_some() {
                 return Err(Error::AlreadyExists(name.into()));
             }
-            let (loaded, _) = disk.load()?;
-            let id = disk.ensure_main_snapshot(&loaded)?;
+            let id = disk.ensure_main_snapshot(&state.published)?;
             disk.write_ref(name, id)?;
             return Ok(id);
         }
@@ -264,7 +280,7 @@ impl Database {
         if branches.refs.contains_key(name) {
             return Err(Error::AlreadyExists(name.into()));
         }
-        branches.publish_main(&state)?;
+        branches.publish_main(&state.published)?;
         let id = *branches
             .refs
             .get("main")
@@ -379,29 +395,25 @@ impl Database {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(Error::Busy);
         }
+        self.recover_main(&mut current)?;
         let _commit = self
             .inner
             .disk
             .as_ref()
             .map(|d| d.commit_lock())
             .transpose()?;
-        let generation = if let Some(disk) = &self.inner.disk {
-            let (state, generation) = disk.load()?;
-            *current = Arc::new(state);
-            generation
-        } else {
-            0
-        };
-        let mut next = (**current).clone();
+        let mut next = (*current.published).clone();
         Arc::make_mut(&mut next.storage).reclaim();
         Arc::make_mut(&mut next.catalog)
             .names
             .retain(|_, binding| binding.object.is_some());
         next.validate()?;
         if let Some(disk) = &self.inner.disk {
-            disk.checkpoint(&next, generation)?;
+            current.needs_recovery = true;
+            current.generation = disk.checkpoint(&next, current.generation)?;
+            current.needs_recovery = false;
         }
-        *current = Arc::new(next);
+        current.published = Arc::new(next);
         self.inner
             .metrics
             .checkpoint_micros
@@ -432,6 +444,27 @@ impl Database {
             }
         }
         Ok(stats)
+    }
+    // The lifetime ownership lock excludes other processes, and state serializes all
+    // writers in this process. Reload only when a failed write made the cache uncertain.
+    fn recover_main(&self, current: &mut MainState) -> Result<()> {
+        if current.needs_recovery {
+            let disk =
+                self.inner.disk.as_ref().ok_or_else(|| {
+                    Error::Corrupt("in-memory state requires disk recovery".into())
+                })?;
+            let _commit = disk.commit_lock()?;
+            let started = Instant::now();
+            let (state, generation) = disk.load()?;
+            current.published = Arc::new(state);
+            current.generation = generation;
+            current.needs_recovery = false;
+            self.inner
+                .metrics
+                .recovery_micros
+                .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        Ok(())
     }
     fn check_healthy(&self) -> Result<()> {
         if self.inner.unhealthy.load(Ordering::SeqCst) {

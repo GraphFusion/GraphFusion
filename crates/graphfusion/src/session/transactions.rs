@@ -109,6 +109,7 @@ impl Session {
                     .state
                     .lock()
                     .map_err(|_| Error::Poisoned)?
+                    .published
                     .commit_seq
             }
         };
