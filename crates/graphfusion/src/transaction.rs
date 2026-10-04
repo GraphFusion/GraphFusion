@@ -423,16 +423,17 @@ impl StatementTxn {
         kind: ObjectKind,
         name: &str,
     ) -> Option<CatalogEntry> {
-        let key = name_key(parent, kind, name);
-        self.names_read.entry(key.clone()).or_insert_with(|| {
+        let name_read = self.names_read.entry(name_key(parent, kind, name));
+        let entry = self.view.lookup_by_key(name_read.key()).cloned();
+        name_read.or_insert_with_key(|key| {
             self.base
                 .catalog
                 .names
-                .get(&key)
+                .get(key)
                 .cloned()
                 .unwrap_or_default()
         });
-        let entry = self.view.lookup(parent, kind, name)?.clone();
+        let entry = entry?;
         self.objects_read
             .entry(entry.id)
             .or_insert_with(|| self.base.catalog.get(entry.id).map(|e| e.version));

@@ -114,7 +114,10 @@ impl CatalogSnapshot {
         self.objects.get(&id).map(Arc::as_ref)
     }
     pub fn lookup(&self, parent: ObjectId, kind: ObjectKind, name: &str) -> Option<&CatalogEntry> {
-        let id = self.names.get(&name_key(parent, kind, name))?.object?;
+        self.lookup_by_key(&name_key(parent, kind, name))
+    }
+    pub(crate) fn lookup_by_key(&self, key: &str) -> Option<&CatalogEntry> {
+        let id = self.names.get(key)?.object?;
         self.get(id)
     }
     pub fn children(&self, parent: ObjectId) -> impl Iterator<Item = &CatalogEntry> {
