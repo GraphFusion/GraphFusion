@@ -543,6 +543,81 @@ fn paths_preserve_delimited_components_and_parent_resolution() {
 }
 
 #[test]
+fn catalog_changes_preserve_pinned_snapshots_and_rollback() {
+    for persistent in [false, true] {
+        for branch in ["main", "dev"] {
+            let dir = TestDir::new();
+            let db = if persistent {
+                dir.open()
+            } else {
+                Database::new()
+            };
+            let existing = create_graph(&db, "existing");
+            if branch != "main" {
+                db.create_branch(branch).unwrap();
+            }
+            let mut reader = StatementTxn::begin_on(&db, branch).unwrap();
+            reader.set_read_only(true);
+            let mut writer = StatementTxn::begin_on(&db, branch).unwrap();
+            let created = writer
+                .create_graph(MAIN_SCHEMA, "created", GraphShape::Open)
+                .unwrap();
+            writer.drop_object(existing).unwrap();
+            assert!(writer.catalog().get(existing).is_none());
+            assert_eq!(
+                writer
+                    .catalog()
+                    .lookup(MAIN_SCHEMA, ObjectKind::Graph, "created")
+                    .unwrap()
+                    .id,
+                created
+            );
+            assert!(writer.base.catalog.get(existing).is_some());
+            assert!(writer.base.catalog.get(created).is_none());
+            let unpublished = StatementTxn::begin_on(&db, branch).unwrap();
+            assert!(unpublished.catalog().get(existing).is_some());
+            assert!(unpublished.catalog().get(created).is_none());
+            drop(unpublished);
+            writer.commit().unwrap();
+
+            assert!(reader.catalog().get(existing).is_some());
+            assert!(reader.catalog().get(created).is_none());
+            let current = StatementTxn::begin_on(&db, branch).unwrap();
+            assert!(current.catalog().get(existing).is_none());
+            assert!(current.catalog().get(created).is_some());
+            drop(current);
+
+            let mut aborted = StatementTxn::begin_on(&db, branch).unwrap();
+            aborted.drop_object(created).unwrap();
+            let abandoned = aborted
+                .create_graph(MAIN_SCHEMA, "abandoned", GraphShape::Open)
+                .unwrap();
+            assert!(aborted.catalog().get(created).is_none());
+            assert!(aborted.catalog().get(abandoned).is_some());
+            assert!(aborted.base.catalog.get(created).is_some());
+            assert!(aborted.base.catalog.get(abandoned).is_none());
+            drop(aborted);
+            let current = StatementTxn::begin_on(&db, branch).unwrap();
+            assert!(current.catalog().get(created).is_some());
+            assert!(current
+                .catalog()
+                .lookup(MAIN_SCHEMA, ObjectKind::Graph, "abandoned")
+                .is_none());
+            drop(current);
+            if branch != "main" {
+                db.with_catalog(|catalog| {
+                    assert!(catalog.get(existing).is_some());
+                    assert!(catalog.get(created).is_none());
+                })
+                .unwrap();
+            }
+            drop(reader);
+            db.checkpoint().unwrap();
+        }
+    }
+}
+
+#[test]
 fn independent_writers_merge_and_same_name_conflicts() {
     let db = Database::new();
     let mut a = StatementTxn::begin(&db).unwrap();

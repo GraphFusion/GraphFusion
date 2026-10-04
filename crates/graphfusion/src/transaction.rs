@@ -115,7 +115,7 @@ pub(crate) struct StatementTxn {
     db: Database,
     read_only: bool,
     pub base: Arc<PublishedState>,
-    view: CatalogSnapshot,
+    view: Arc<CatalogSnapshot>,
     changes: Vec<CatalogChange>,
     storage_changes: Vec<StorageChange>,
     objects_read: BTreeMap<ObjectId, Option<CommitSeq>>,
@@ -163,7 +163,7 @@ impl StatementTxn {
             db: db.clone(),
             read_only: false,
             base: state.clone(),
-            view: (*state.catalog).clone(),
+            view: state.catalog.clone(),
             changes: Vec::new(),
             storage_changes: Vec::new(),
             objects_read: BTreeMap::new(),
@@ -186,7 +186,7 @@ impl StatementTxn {
         Ok(Self {
             db: db.clone(),
             read_only: false,
-            view: (*base.catalog).clone(),
+            view: base.catalog.clone(),
             base,
             changes: Vec::new(),
             storage_changes: Vec::new(),
@@ -485,7 +485,7 @@ impl StatementTxn {
         if let ObjectDefinition::Graph { storage, .. } = entry.definition {
             self.storage_changes.push(StorageChange::Create(storage));
         }
-        self.view.put(entry.clone(), 0);
+        Arc::make_mut(&mut self.view).put(entry.clone(), 0);
         self.changes.push(CatalogChange::Put(entry));
         Ok(id)
     }
@@ -519,7 +519,7 @@ impl StatementTxn {
         if let ObjectDefinition::Graph { storage, .. } = entry.definition {
             self.storage_changes.push(StorageChange::Retire(storage));
         }
-        self.view.remove(id, 0);
+        Arc::make_mut(&mut self.view).remove(id, 0);
         self.changes.push(CatalogChange::Delete(id));
         Ok(())
     }
