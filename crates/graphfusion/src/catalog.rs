@@ -72,11 +72,48 @@ pub(crate) struct NameBinding {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(from = "CatalogSnapshotData")]
 pub struct CatalogSnapshot {
     pub(crate) objects: BTreeMap<ObjectId, Arc<CatalogEntry>>,
     pub(crate) names: BTreeMap<String, NameBinding>,
     pub(crate) members: BTreeMap<ObjectId, CommitSeq>,
     pub(crate) references: BTreeMap<ObjectId, CommitSeq>,
+    // Rebuilt from objects when a persisted catalog is loaded.
+    #[serde(skip)]
+    child_index: BTreeSet<(ObjectId, ObjectId)>,
+    #[serde(skip)]
+    dependent_index: BTreeSet<(ObjectId, ObjectId)>,
+}
+
+#[derive(Deserialize)]
+struct CatalogSnapshotData {
+    objects: BTreeMap<ObjectId, Arc<CatalogEntry>>,
+    names: BTreeMap<String, NameBinding>,
+    members: BTreeMap<ObjectId, CommitSeq>,
+    references: BTreeMap<ObjectId, CommitSeq>,
+}
+
+impl From<CatalogSnapshotData> for CatalogSnapshot {
+    fn from(data: CatalogSnapshotData) -> Self {
+        let child_index = data
+            .objects
+            .iter()
+            .map(|(id, entry)| (entry.parent, *id))
+            .collect();
+        let dependent_index = data
+            .objects
+            .iter()
+            .filter_map(|(id, entry)| entry.definition.dependency().map(|target| (target, *id)))
+            .collect();
+        Self {
+            objects: data.objects,
+            names: data.names,
+            members: data.members,
+            references: data.references,
+            child_index,
+            dependent_index,
+        }
+    }
 }
 
 impl CatalogSnapshot {
@@ -86,6 +123,8 @@ impl CatalogSnapshot {
             names: BTreeMap::new(),
             members: BTreeMap::new(),
             references: BTreeMap::new(),
+            child_index: BTreeSet::new(),
+            dependent_index: BTreeSet::new(),
         };
         result.put(
             CatalogEntry {
@@ -121,21 +160,25 @@ impl CatalogSnapshot {
         self.get(id)
     }
     pub fn children(&self, parent: ObjectId) -> impl Iterator<Item = &CatalogEntry> {
-        self.objects
-            .values()
-            .filter(move |e| e.parent == parent)
-            .map(Arc::as_ref)
+        self.child_index
+            .range((parent, ObjectId::MIN)..=(parent, ObjectId::MAX))
+            .map(|(_, id)| self.objects.get(id).expect("indexed child exists").as_ref())
+    }
+    pub(crate) fn has_children(&self, parent: ObjectId) -> bool {
+        self.child_index
+            .range((parent, ObjectId::MIN)..=(parent, ObjectId::MAX))
+            .next()
+            .is_some()
     }
     pub fn entries(&self) -> impl Iterator<Item = &CatalogEntry> {
         self.objects.values().map(Arc::as_ref)
     }
 
-    pub(crate) fn dependents(&self, target: ObjectId) -> BTreeSet<ObjectId> {
-        self.objects
-            .values()
-            .filter(|e| e.definition.dependency() == Some(target))
-            .map(|e| e.id)
-            .collect()
+    pub(crate) fn has_dependents(&self, target: ObjectId) -> bool {
+        self.dependent_index
+            .range((target, ObjectId::MIN)..=(target, ObjectId::MAX))
+            .next()
+            .is_some()
     }
 
     pub(crate) fn put(&mut self, mut entry: CatalogEntry, seq: CommitSeq) {
@@ -151,8 +194,10 @@ impl CatalogSnapshot {
             },
         );
         self.members.insert(entry.parent, seq);
+        self.child_index.insert((entry.parent, entry.id));
         if let Some(target) = entry.definition.dependency() {
             self.references.insert(target, seq);
+            self.dependent_index.insert((target, entry.id));
         }
         self.objects.insert(entry.id, Arc::new(entry));
     }
@@ -167,8 +212,10 @@ impl CatalogSnapshot {
                 },
             );
             self.members.insert(entry.parent, seq);
+            self.child_index.remove(&(entry.parent, id));
             if let Some(target) = entry.definition.dependency() {
                 self.references.insert(target, seq);
+                self.dependent_index.remove(&(target, id));
             }
         }
     }
@@ -183,7 +230,17 @@ impl CatalogSnapshot {
         {
             return Err(Error::Corrupt("missing bootstrap catalog objects".into()));
         }
-        for entry in self.entries() {
+        if self.child_index.len() != self.objects.len() {
+            return Err(Error::Corrupt("invalid catalog child index".into()));
+        }
+        let mut dependencies = 0;
+        for (id, entry) in &self.objects {
+            if *id != entry.id {
+                return Err(Error::Corrupt("catalog object ID mismatch".into()));
+            }
+            if !self.child_index.contains(&(entry.parent, *id)) {
+                return Err(Error::Corrupt("invalid catalog child index".into()));
+            }
             if entry.id == ROOT_DIRECTORY {
                 continue;
             }
@@ -198,6 +255,10 @@ impl CatalogSnapshot {
                 if self.get(id).map(|e| e.definition.kind()) != Some(ObjectKind::GraphType) {
                     return Err(Error::Corrupt("dangling graph type reference".into()));
                 }
+                dependencies += 1;
+                if !self.dependent_index.contains(&(id, entry.id)) {
+                    return Err(Error::Corrupt("invalid catalog dependent index".into()));
+                }
             }
             if self
                 .lookup(entry.parent, entry.definition.kind(), &entry.name)
@@ -206,6 +267,9 @@ impl CatalogSnapshot {
             {
                 return Err(Error::Corrupt("invalid name index".into()));
             }
+        }
+        if self.dependent_index.len() != dependencies {
+            return Err(Error::Corrupt("invalid catalog dependent index".into()));
         }
         for (key, binding) in &self.names {
             if let Some(id) = binding.object {

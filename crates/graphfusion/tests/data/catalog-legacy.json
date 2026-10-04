@@ -1,0 +1,104 @@
+{
+  "objects": {
+    "1": {
+      "id": 1,
+      "parent": 0,
+      "name": "",
+      "version": 0,
+      "definition": "Directory"
+    },
+    "2": {
+      "id": 2,
+      "parent": 1,
+      "name": "main",
+      "version": 0,
+      "definition": "Schema"
+    },
+    "3": {
+      "id": 3,
+      "parent": 1,
+      "name": "small",
+      "version": 1,
+      "definition": "Schema"
+    },
+    "68": {
+      "id": 68,
+      "parent": 3,
+      "name": "g",
+      "version": 2,
+      "definition": {
+        "Graph": {
+          "shape": "Open",
+          "storage": 67
+        }
+      }
+    },
+    "131": {
+      "id": 131,
+      "parent": 2,
+      "name": "t",
+      "version": 3,
+      "definition": {
+        "GraphType": {
+          "open": false,
+          "nodes": {
+            "N": {
+              "labels": [],
+              "properties": {}
+            }
+          },
+          "edges": {}
+        }
+      }
+    },
+    "196": {
+      "id": 196,
+      "parent": 2,
+      "name": "typed",
+      "version": 4,
+      "definition": {
+        "Graph": {
+          "shape": {
+            "Named": 131
+          },
+          "storage": 195
+        }
+      }
+    }
+  },
+  "names": {
+    "[0,\"Directory\",\"\"]": {
+      "object": 1,
+      "version": 0
+    },
+    "[1,\"Schema\",\"main\"]": {
+      "object": 2,
+      "version": 0
+    },
+    "[1,\"Schema\",\"small\"]": {
+      "object": 3,
+      "version": 1
+    },
+    "[2,\"Graph\",\"typed\"]": {
+      "object": 196,
+      "version": 4
+    },
+    "[2,\"GraphType\",\"t\"]": {
+      "object": 131,
+      "version": 3
+    },
+    "[3,\"Graph\",\"g\"]": {
+      "object": 68,
+      "version": 2
+    }
+  },
+  "members": {
+    "0": 0,
+    "1": 1,
+    "2": 4,
+    "3": 2
+  },
+  "references": {
+    "131": 4
+  }
+}

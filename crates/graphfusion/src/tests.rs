@@ -1,5 +1,5 @@
 use super::*;
-use catalog::{GraphShape, ObjectDefinition, ObjectKind, MAIN_SCHEMA, ROOT_DIRECTORY};
+use catalog::{GraphShape, ObjectDefinition, ObjectId, ObjectKind, MAIN_SCHEMA, ROOT_DIRECTORY};
 use std::collections::BTreeMap;
 use std::{
     fs::{File, OpenOptions as FileOptions},
@@ -668,6 +668,261 @@ fn negative_name_and_collection_reads_detect_phantoms() {
         .unwrap();
     create_graph(&db, "phantom");
     assert!(matches!(a.commit(), Err(Error::Conflict(_))));
+}
+
+#[test]
+fn catalog_relationship_indexes_follow_moves_replacements_and_removals() {
+    let mut catalog = catalog::CatalogSnapshot::initial();
+    for (id, parent, definition) in [
+        (10, ROOT_DIRECTORY, ObjectDefinition::Schema),
+        (11, ROOT_DIRECTORY, ObjectDefinition::Schema),
+        (
+            20,
+            MAIN_SCHEMA,
+            ObjectDefinition::GraphType(types::GraphDefinition::default()),
+        ),
+        (
+            21,
+            MAIN_SCHEMA,
+            ObjectDefinition::GraphType(types::GraphDefinition::default()),
+        ),
+        (
+            32,
+            10,
+            ObjectDefinition::Graph {
+                shape: GraphShape::Named(20),
+                storage: 132,
+            },
+        ),
+        (
+            30,
+            10,
+            ObjectDefinition::Graph {
+                shape: GraphShape::Named(20),
+                storage: 130,
+            },
+        ),
+        (
+            31,
+            11,
+            ObjectDefinition::Graph {
+                shape: GraphShape::Open,
+                storage: 131,
+            },
+        ),
+    ] {
+        catalog.put(
+            catalog::CatalogEntry {
+                id,
+                parent,
+                name: format!("object_{id}"),
+                version: 0,
+                definition,
+            },
+            1,
+        );
+    }
+    assert_catalog_relationships(&catalog);
+    let pinned = catalog.clone();
+    let mut moved = catalog.get(30).unwrap().clone();
+    moved.parent = 11;
+    moved.name = "moved".into();
+    moved.definition = ObjectDefinition::Graph {
+        shape: GraphShape::Named(21),
+        storage: 130,
+    };
+    catalog.put(moved.clone(), 2);
+    assert_catalog_relationships(&catalog);
+    assert_eq!(
+        catalog
+            .children(11)
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        vec![30, 31]
+    );
+    let restored = serde_json::from_slice(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+    assert_catalog_relationships(&restored);
+    catalog.remove(32, 3);
+    assert!(!catalog.has_dependents(20));
+    assert_catalog_relationships(&catalog);
+    moved.definition = ObjectDefinition::Graph {
+        shape: GraphShape::Open,
+        storage: 130,
+    };
+    catalog.put(moved, 4);
+    assert!(!catalog.has_dependents(21));
+    assert_catalog_relationships(&catalog);
+    for id in [30, 31, 10, 11] {
+        catalog.remove(id, 5);
+        assert_catalog_relationships(&catalog);
+    }
+    assert_catalog_relationships(&pinned);
+    assert!(pinned.has_dependents(20));
+    assert_eq!(
+        pinned
+            .children(10)
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        vec![30, 32]
+    );
+}
+
+#[test]
+fn catalog_relationship_indexes_restore_legacy_snapshots() {
+    let input = include_str!("../tests/data/catalog-legacy.json");
+    let mut catalog: catalog::CatalogSnapshot = serde_json::from_str(input).unwrap();
+    assert_catalog_relationships(&catalog);
+    let schema = catalog
+        .lookup(ROOT_DIRECTORY, ObjectKind::Schema, "small")
+        .unwrap()
+        .id;
+    let typ = catalog
+        .lookup(MAIN_SCHEMA, ObjectKind::GraphType, "t")
+        .unwrap()
+        .id;
+    let graph = catalog
+        .lookup(MAIN_SCHEMA, ObjectKind::Graph, "typed")
+        .unwrap()
+        .id;
+    assert_eq!(
+        catalog
+            .children(schema)
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["g"]
+    );
+    assert!(catalog.has_dependents(typ));
+    catalog.remove(graph, 10);
+    assert!(!catalog.has_dependents(typ));
+    assert_catalog_relationships(&catalog);
+
+    let mut corrupt: serde_json::Value = serde_json::from_str(input).unwrap();
+    corrupt["objects"][MAIN_SCHEMA.to_string()]["id"] = ObjectId::MAX.into();
+    let corrupt: catalog::CatalogSnapshot = serde_json::from_value(corrupt).unwrap();
+    assert!(matches!(corrupt.validate(), Err(Error::Corrupt(_))));
+}
+
+fn assert_catalog_relationships(catalog: &catalog::CatalogSnapshot) {
+    let targets: std::collections::BTreeSet<_> = catalog
+        .entries()
+        .flat_map(|entry| [entry.id, entry.parent])
+        .chain([ObjectId::MAX])
+        .collect();
+    for target in targets {
+        let expected: Vec<_> = catalog
+            .entries()
+            .filter(|entry| entry.parent == target)
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(
+            catalog
+                .children(target)
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            expected,
+            "parent {target}"
+        );
+        assert_eq!(
+            catalog.has_children(target),
+            !expected.is_empty(),
+            "parent {target}"
+        );
+        assert_eq!(
+            catalog.has_dependents(target),
+            catalog
+                .entries()
+                .any(|entry| entry.definition.dependency() == Some(target)),
+            "target {target}"
+        );
+    }
+    catalog.validate().unwrap();
+}
+
+#[test]
+fn catalog_restrictions_follow_transaction_local_deletions() {
+    for persistent in [false, true] {
+        for branch in ["main", "dev"] {
+            let dir = TestDir::new();
+            let db = if persistent {
+                dir.open()
+            } else {
+                Database::new()
+            };
+            let mut setup = StatementTxn::begin(&db).unwrap();
+            let schema = setup
+                .create(ROOT_DIRECTORY, "scope", ObjectDefinition::Schema)
+                .unwrap();
+            let typ = setup
+                .create(
+                    MAIN_SCHEMA,
+                    "t",
+                    ObjectDefinition::GraphType(types::GraphDefinition::default()),
+                )
+                .unwrap();
+            let first = setup
+                .create_graph(schema, "first", GraphShape::Named(typ))
+                .unwrap();
+            let second = setup
+                .create_graph(schema, "second", GraphShape::Named(typ))
+                .unwrap();
+            setup.commit().unwrap();
+            if branch != "main" {
+                db.create_branch(branch).unwrap();
+            }
+            let reader = StatementTxn::begin_on(&db, branch).unwrap();
+            for commit in [false, true] {
+                let mut writer = StatementTxn::begin_on(&db, branch).unwrap();
+                assert!(matches!(
+                    writer.drop_object(schema),
+                    Err(Error::DependencyExists(_))
+                ));
+                assert!(matches!(
+                    writer.drop_object(typ),
+                    Err(Error::DependencyExists(_))
+                ));
+                writer.drop_object(first).unwrap();
+                assert!(matches!(
+                    writer.drop_object(schema),
+                    Err(Error::DependencyExists(_))
+                ));
+                assert!(matches!(
+                    writer.drop_object(typ),
+                    Err(Error::DependencyExists(_))
+                ));
+                writer.drop_object(second).unwrap();
+                assert!(!writer.catalog().has_children(schema));
+                assert!(!writer.catalog().has_dependents(typ));
+                writer.drop_object(typ).unwrap();
+                writer.drop_object(schema).unwrap();
+                assert_catalog_relationships(writer.catalog());
+                if commit {
+                    writer.commit().unwrap();
+                } else {
+                    drop(writer);
+                }
+                let current = StatementTxn::begin_on(&db, branch).unwrap();
+                assert_eq!(current.catalog().get(schema).is_none(), commit);
+                assert_eq!(current.catalog().has_dependents(typ), !commit);
+                assert_eq!(
+                    current.catalog().children(schema).count(),
+                    if commit { 0 } else { 2 }
+                );
+                assert_catalog_relationships(current.catalog());
+                assert_eq!(reader.catalog().children(schema).count(), 2);
+                assert!(reader.catalog().has_dependents(typ));
+            }
+            if branch != "main" {
+                db.with_catalog(|catalog| {
+                    assert_eq!(catalog.children(schema).count(), 2);
+                    assert!(catalog.has_dependents(typ));
+                    assert_catalog_relationships(catalog);
+                })
+                .unwrap();
+            }
+            drop(reader);
+            db.checkpoint().unwrap();
+        }
+    }
 }
 
 #[test]
