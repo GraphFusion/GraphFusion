@@ -439,11 +439,19 @@ impl StatementTxn {
             .or_insert_with(|| self.base.catalog.get(entry.id).map(|e| e.version));
         Some(entry)
     }
-    pub fn children(&mut self, parent: ObjectId) -> Vec<CatalogEntry> {
+    fn read_members(&mut self, parent: ObjectId) {
         self.members_read
             .entry(parent)
             .or_insert_with(|| *self.base.catalog.members.get(&parent).unwrap_or(&0));
+    }
+    #[cfg(test)]
+    pub fn children(&mut self, parent: ObjectId) -> Vec<CatalogEntry> {
+        self.read_members(parent);
         self.view.children(parent).cloned().collect()
+    }
+    fn has_children(&mut self, parent: ObjectId) -> bool {
+        self.read_members(parent);
+        self.view.has_children(parent)
     }
     pub fn create(
         &mut self,
@@ -507,13 +515,13 @@ impl StatementTxn {
             ));
         }
         let entry = self.get(id)?;
-        if !self.children(id).is_empty() {
+        if self.has_children(id) {
             return Err(Error::DependencyExists(entry.name));
         }
         self.references_read
             .entry(id)
             .or_insert_with(|| *self.base.catalog.references.get(&id).unwrap_or(&0));
-        if !self.view.dependents(id).is_empty() {
+        if self.view.has_dependents(id) {
             return Err(Error::DependencyExists(entry.name));
         }
         self.lookup(entry.parent, entry.definition.kind(), &entry.name);
