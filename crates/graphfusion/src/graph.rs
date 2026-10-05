@@ -1,5 +1,8 @@
 //! Validated immutable Arrow tables for a property graph.
-use crate::{Error, Result};
+use crate::{
+    rows::{DeleteVector, ResidentRows, ResidentTable},
+    Error, Result,
+};
 use datafusion::{
     arrow::{
         array::UInt64Array,
@@ -35,13 +38,17 @@ pub(crate) struct Table {
     pub batches: Vec<RecordBatch>,
     pub provider: Arc<dyn TableProvider>,
     pub row_count: usize,
-    /// Parquet object id still holding these exact rows. Cleared when the rows change.
+    /// Immutable Parquet object ID, shared across versions with different row masks.
     pub file_id: Option<u64>,
-    /// Stable WAL identity of a resident fragment; preserved only by append_rows.
+    /// Stable WAL identity of a resident fragment across append/mask operations.
     pub memory_id: Option<u64>,
     pub deleted_ids: BTreeSet<u64>,
     /// Row removals from this transaction's resident base, replayed before new batches.
     pub memory_deleted_ids: BTreeSet<u64>,
+    pub(crate) resident: ResidentRows,
+    pub(crate) file_rows: Option<Arc<crate::parquet::FileRows>>,
+    pub(crate) file_deleted: Arc<DeleteVector>,
+    max_id: Option<u64>,
 }
 impl NodeTable {
     /// Reads an external Parquet table and validates it for a subsequent graph import.
@@ -99,6 +106,15 @@ impl Table {
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
         reserved: &[&str],
+    ) -> Result<Self> {
+        Self::try_new_with_deletions(labels, schema, batches, reserved, vec![])
+    }
+    pub(crate) fn try_new_with_deletions(
+        labels: Vec<String>,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        reserved: &[&str],
+        deleted: Vec<Arc<DeleteVector>>,
     ) -> Result<Self> {
         let label_set: BTreeSet<_> = labels.iter().cloned().collect();
         if label_set.len() != labels.len() || labels.iter().any(String::is_empty) {
@@ -159,27 +175,43 @@ impl Table {
                 }
             }
         }
-        let provider = Arc::new(MemTable::try_new(schema.clone(), vec![batches.clone()])?);
+        let resident = ResidentRows::new(&batches, deleted);
+        let max_id = batches
+            .iter()
+            .flat_map(|b| crate::rows::column(b, ID).values().iter().copied())
+            .max();
+        let provider: Arc<dyn TableProvider> = if resident.deleted.iter().any(|d| d.len() != 0) {
+            Arc::new(ResidentTable {
+                schema: schema.clone(),
+                batches: batches.clone(),
+                deleted: resident.deleted.clone(),
+            })
+        } else {
+            Arc::new(MemTable::try_new(schema.clone(), vec![batches.clone()])?)
+        };
         Ok(Self {
             labels: label_set,
             schema,
-            row_count: batches.iter().map(RecordBatch::num_rows).sum(),
+            row_count: batches
+                .iter()
+                .zip(&resident.deleted)
+                .map(|(b, d)| b.num_rows() - d.len())
+                .sum(),
             batches,
             provider,
             file_id: None,
             memory_id: None,
             deleted_ids: BTreeSet::new(),
             memory_deleted_ids: BTreeSet::new(),
+            resident,
+            file_rows: None,
+            file_deleted: Arc::default(),
+            max_id,
         })
     }
 
     pub(crate) fn append_rows(&mut self, extra: Table) -> Result<()> {
-        let loaded = self
-            .batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>();
-        if loaded != self.row_count {
+        if self.file_id.is_some() {
             return Err(Error::Corrupt(
                 "cannot append to an unloaded graph table".into(),
             ));
@@ -189,94 +221,141 @@ impl Table {
                 "incompatible graph table append".into(),
             ));
         }
-        let mut batches = self.batches.clone();
-        batches.extend(extra.batches);
-        let provider = Arc::new(MemTable::try_new(
-            self.schema.clone(),
-            vec![batches.clone()],
-        )?);
+        for (batch, deleted) in extra.batches.into_iter().zip(extra.resident.deleted) {
+            self.resident.append(&batch, deleted);
+            self.batches.push(batch);
+        }
         self.memory_deleted_ids.extend(extra.memory_deleted_ids);
-        self.batches = batches;
-        self.row_count = self.batches.iter().map(RecordBatch::num_rows).sum();
-        self.provider = provider;
-        self.file_id = None;
+        self.row_count += extra.row_count;
+        self.max_id = self.max_id.max(extra.max_id);
+        self.refresh_resident_provider()?;
         Ok(())
     }
-    /// Masks rows of an immutable file without rewriting it. The caller supplies only
-    /// IDs that occur in this fragment, after evaluating its mutation plan.
-    pub(crate) fn mask_rows(&mut self, ids: &BTreeSet<u64>) -> Result<()> {
-        use datafusion::arrow::{array::BooleanArray, compute::filter_record_batch};
-        let new: BTreeSet<_> = if self.file_id.is_some() {
-            ids.difference(&self.deleted_ids).copied().collect()
+    /// Mark physical row positions without changing shared Arrow/Parquet data.
+    pub(crate) fn mask_rows(&mut self, ids: &BTreeSet<u64>) -> Result<BTreeSet<u64>> {
+        let mut removed = BTreeSet::new();
+        if ids.is_empty() {
+            return Ok(removed);
+        }
+        if let Some(file) = &self.file_rows {
+            for (id, row) in file.locate(ids)? {
+                if Arc::make_mut(&mut self.file_deleted).insert(row) {
+                    self.deleted_ids.insert(id);
+                    removed.insert(id);
+                }
+            }
+            if !removed.is_empty() {
+                self.provider = file.provider(self.file_deleted.clone(), None);
+            }
         } else {
-            self.memory_deleted_ids.extend(ids.iter().copied());
-            self.ids(ID).filter(|id| ids.contains(id)).collect()
-        };
-        if new.is_empty() {
-            return Ok(());
+            for id in ids {
+                if self.resident.remove(*id) {
+                    self.memory_deleted_ids.insert(*id);
+                    removed.insert(*id);
+                }
+            }
+            if !removed.is_empty() {
+                self.refresh_resident_provider()?;
+            }
         }
         self.row_count = self
             .row_count
-            .checked_sub(new.len())
+            .checked_sub(removed.len())
             .ok_or_else(|| Error::Corrupt("too many masked rows".into()))?;
-        if self.file_id.is_some() {
-            self.deleted_ids.extend(new.iter().copied());
-        }
-        if !self.batches.is_empty() {
-            self.batches = self
-                .batches
-                .iter()
-                .map(|batch| {
-                    let values = batch
-                        .column_by_name(ID)
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap();
-                    let keep = BooleanArray::from(
-                        values
-                            .values()
-                            .iter()
-                            .map(|id| !new.contains(id))
-                            .collect::<Vec<_>>(),
-                    );
-                    filter_record_batch(batch, &keep)
-                        .map_err(datafusion::error::DataFusionError::from)
-                        .map_err(Error::from)
-                })
-                .collect::<Result<_>>()?;
-            self.provider = Arc::new(MemTable::try_new(
+        Ok(removed)
+    }
+    fn refresh_resident_provider(&mut self) -> Result<()> {
+        self.provider = if self.resident.deleted.iter().any(|d| d.len() != 0) {
+            Arc::new(ResidentTable {
+                schema: self.schema.clone(),
+                batches: self.batches.clone(),
+                deleted: self.resident.deleted.clone(),
+            })
+        } else {
+            Arc::new(MemTable::try_new(
                 self.schema.clone(),
                 vec![self.batches.clone()],
-            )?);
-        } else {
-            use datafusion::{
-                datasource::{provider_as_source, ViewTable},
-                logical_expr::{col, lit, LogicalPlanBuilder},
-            };
-            let plan = LogicalPlanBuilder::scan(
-                "__gf_masked",
-                provider_as_source(self.provider.clone()),
-                None,
-            )?
-            .filter(col(ID).in_list(new.iter().map(|id| lit(*id)).collect(), true))?
-            .build()?;
-            self.provider = Arc::new(ViewTable::new(plan, None));
-        }
+            )?)
+        };
         Ok(())
     }
+    pub(crate) fn prune_deleted_batches(&mut self) -> Result<()> {
+        self.resident.prune(&mut self.batches);
+        self.refresh_resident_provider()
+    }
+    pub(crate) fn visible_batches(&self) -> Result<Vec<RecordBatch>> {
+        self.batches
+            .iter()
+            .zip(&self.resident.deleted)
+            .map(|(batch, deleted)| deleted.filter(batch).map_err(Error::from))
+            .collect()
+    }
+    /// Only selected rows are gathered; unaffected property buffers stay shared.
+    pub(crate) fn select_ids(&self, ids: &BTreeSet<u64>) -> Result<Option<Arc<dyn TableProvider>>> {
+        if let Some(file) = &self.file_rows {
+            let mut positions: Vec<_> = file
+                .locate(ids)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .filter(|row| !self.file_deleted.contains(*row))
+                .collect();
+            if positions.is_empty() {
+                return Ok(None);
+            }
+            positions.sort_unstable();
+            return Ok(Some(
+                file.provider(self.file_deleted.clone(), Some(positions)),
+            ));
+        }
+        use datafusion::arrow::compute::take;
+        let mut positions: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+        for id in ids {
+            if let Some(location) = self.resident.index.get(*id) {
+                positions
+                    .entry(location.batch)
+                    .or_default()
+                    .push(location.row as u64);
+            }
+        }
+        if positions.is_empty() {
+            return Ok(None);
+        }
+        let batches = positions
+            .into_iter()
+            .map(|(batch, rows)| {
+                let indices = UInt64Array::from(rows);
+                let columns = self.batches[batch]
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                RecordBatch::try_new(self.schema.clone(), columns)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(datafusion::error::DataFusionError::from)?;
+        Ok(Some(Arc::new(MemTable::try_new(
+            self.schema.clone(),
+            vec![batches],
+        )?)))
+    }
+    pub(crate) fn incident_ids(&self, nodes: &BTreeSet<u64>) -> Result<BTreeSet<u64>> {
+        match &self.file_rows {
+            Some(file) => file.incident_ids(nodes, &self.file_deleted),
+            None => Ok(self.resident.incident_ids(nodes)),
+        }
+    }
     pub fn ids<'a>(&'a self, column: &'a str) -> impl Iterator<Item = u64> + 'a {
-        self.batches.iter().flat_map(move |batch| {
-            batch
-                .column_by_name(column)
-                .expect("validated graph schema")
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("validated graph ID type")
-                .values()
-                .iter()
-                .copied()
-        })
+        self.batches
+            .iter()
+            .zip(&self.resident.deleted)
+            .flat_map(move |(batch, deleted)| {
+                crate::rows::column(batch, column)
+                    .values()
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(move |(row, id)| (!deleted.contains(row)).then_some(id))
+            })
     }
 }
 
@@ -289,11 +368,13 @@ impl GraphData {
     pub(crate) fn next_element_id(&self) -> Option<u64> {
         self.nodes
             .iter()
-            .flat_map(|t| t.0.ids(ID))
-            .chain(self.edges.iter().flat_map(|t| t.table.ids(ID)))
+            .map(|t| t.0.max_id)
+            .chain(self.edges.iter().map(|t| t.table.max_id))
+            .flatten()
             .max()
             .map_or(Some(0), |id| id.checked_add(1))
     }
+
     /// Validates identity and endpoints across all tables. Each node is stored once.
     pub fn try_new(nodes: Vec<NodeTable>, edges: Vec<EdgeTable>) -> Result<Self> {
         let mut node_ids = BTreeSet::new();
@@ -321,6 +402,11 @@ impl GraphData {
                 }
             }
         }
+        Self::from_mutation(nodes, edges)
+    }
+    /// Mutations preserve IDs/endpoints from a validated snapshot. Only property
+    /// layouts and newly grouped resident fragments need revalidation here.
+    pub(crate) fn from_mutation(nodes: Vec<NodeTable>, edges: Vec<EdgeTable>) -> Result<Self> {
         property_types(nodes.iter().map(|t| &t.0))?;
         property_types(edges.iter().map(|t| &t.table))?;
         // Keep one resident fragment per layout, even after repeated row updates.

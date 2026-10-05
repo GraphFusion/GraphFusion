@@ -21,3 +21,5 @@ MATCH (p:Person {name: 'Bob'}) DETACH DELETE p;
 Null targets are skipped. Deleted non-null identities are invalid for later reference/property access in that statement, including through aliases. If a variable contains both live and deleted identities, the current implementation invalidates the entire variable.
 
 Published element IDs are not recycled after deletion within the storage generation. Aborted, never-published IDs can be reused. A failure in a later clause or result rolls back the statement's deletes.
+
+Deletes mark snapshot-specific physical row positions without copying survivor property columns. DETACH DELETE looks up incident edge IDs through adjacency indexes. Target matching may still scan columns; immutable file indexes load lazily on first mutation.

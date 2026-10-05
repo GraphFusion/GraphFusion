@@ -11,6 +11,210 @@ fn buffered(dir: &TestDir, rows: usize, bytes: usize) -> Database {
 }
 
 #[tokio::test]
+async fn resident_masks_share_buffers_and_survive_rollback_recovery_and_sealing() {
+    let dir = TestDir::new();
+    {
+        let db = buffered(&dir, 1000, usize::MAX);
+        let mut s = db.session();
+        s.execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+            .unwrap();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(graph::ID, arrow::datatypes::DataType::UInt64, false),
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::UInt64Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        s.replace_graph_data(
+            graph::GraphData::try_new(
+                vec![graph::NodeTable::try_new(vec!["N".into()], schema, vec![batch]).unwrap()],
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let id = graph_id(&db, "g").unwrap();
+        let before = StatementTxn::begin(&db).unwrap().graph_data(id).unwrap();
+        let buffer = before.nodes[0].0.batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .clone();
+        let mut old = db.session();
+        old.execute("SESSION SET GRAPH g; START TRANSACTION READ ONLY")
+            .unwrap();
+        assert!(s.run("MATCH (n {v: 1}) DELETE n RETURN n.v").await.is_err());
+        assert_eq!(count(&mut s).await, 3);
+        s.run("MATCH (n {v: 1}) DELETE n").await.unwrap();
+        s.run("MATCH (n {v: 2}) SET n.v = 20").await.unwrap();
+        let after = StatementTxn::begin(&db).unwrap().graph_data(id).unwrap();
+        assert!(Arc::ptr_eq(
+            &buffer,
+            after.nodes[0].0.batches[0].column_by_name("v").unwrap()
+        ));
+        assert_eq!(before.node_count(), 3);
+        assert_eq!(after.node_count(), 2);
+        assert_eq!(after.nodes[0].0.resident.deleted[0].len(), 2);
+        assert_eq!(
+            property_values(&s.query("MATCH (n) RETURN count(*) AS c").await.unwrap()),
+            vec![2]
+        );
+        assert_eq!(
+            property_values(&old.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+            vec![1, 2, 3]
+        );
+        old.execute("COMMIT").unwrap();
+    }
+    let db = buffered(&dir, 1000, usize::MAX);
+    let mut s = db.session();
+    s.execute("SESSION SET GRAPH g").unwrap();
+    assert_eq!(
+        property_values(&s.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![3, 20]
+    );
+    db.checkpoint().unwrap();
+    assert_eq!(
+        property_values(&s.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![3, 20]
+    );
+}
+
+#[tokio::test]
+async fn legacy_v4_manifests_without_index_sidecars_keep_physical_row_coordinates() {
+    let dir = TestDir::new();
+    let db = buffered(&dir, 1000, usize::MAX);
+    let mut s = db.session();
+    s.execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    s.replace_graph_data(arrow_graph(vec![90, 10, 70, 30]))
+        .unwrap();
+    db.checkpoint().unwrap();
+    let tx = StatementTxn::begin(&db).unwrap();
+    let manifest = tx
+        .base
+        .storage
+        .generations
+        .values()
+        .find_map(|g| g.parquet.as_ref())
+        .unwrap();
+    let mut wire = serde_json::to_value(manifest).unwrap();
+    wire["nodes"][0]["Parquet"]
+        .as_object_mut()
+        .unwrap()
+        .remove("index_bytes");
+    let legacy: crate::parquet::GraphManifest = serde_json::from_value(wire).unwrap();
+    fs::remove_file(parquet_files(&dir)[0].with_extension("index")).unwrap();
+    let disk = db.inner.disk.as_ref().unwrap();
+    let mut graph = (*legacy.open(disk).unwrap()).clone();
+    assert_eq!(
+        graph.nodes[0]
+            .0
+            .mask_rows(&std::collections::BTreeSet::from([10, 70]))
+            .unwrap()
+            .len(),
+        2
+    );
+    let ctx = datafusion::execution::context::SessionContext::new();
+    let batches = ctx
+        .read_table(graph.nodes[0].0.provider.clone())
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            crate::rows::column(batch, graph::ID)
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect();
+    assert_eq!(ids, vec![90, 30]);
+}
+
+#[tokio::test]
+async fn row_index_corruption_is_rejected_and_branch_history_retains_sidecars() {
+    for damage in ["missing", "truncated", "checksum"] {
+        let dir = TestDir::new();
+        {
+            let db = buffered(&dir, 1000, usize::MAX);
+            db.session()
+                .run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {v: 1})")
+                .await
+                .unwrap();
+            db.checkpoint().unwrap();
+        }
+        let index = parquet_files(&dir)[0].with_extension("index");
+        match damage {
+            "missing" => fs::remove_file(index).unwrap(),
+            "truncated" => fs::write(index, b"GFRIDX01").unwrap(),
+            _ => {
+                let mut bytes = fs::read(&index).unwrap();
+                bytes[24] ^= 1;
+                fs::write(index, bytes).unwrap();
+            }
+        }
+        assert!(
+            matches!(
+                Database::open(&dir.0, OpenOptions::default()),
+                Err(Error::Corrupt(_))
+            ),
+            "{damage}"
+        );
+    }
+    let dir = TestDir::new();
+    {
+        let db = buffered(&dir, 1000, usize::MAX);
+        let mut s = db.session();
+        s.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {v: 1})")
+            .await
+            .unwrap();
+        db.checkpoint().unwrap();
+        let index = parquet_files(&dir)[0].with_extension("index");
+        db.create_branch("dev").unwrap();
+        s.execute("DROP GRAPH g").unwrap();
+        db.checkpoint().unwrap();
+        assert!(index.is_file());
+        let mut dev = db.session();
+        dev.set_branch("dev").unwrap();
+        dev.execute("SESSION SET GRAPH g").unwrap();
+        dev.run("MATCH (n {v: 1}) SET n.v = 2").await.unwrap();
+    }
+    let db = buffered(&dir, 1000, usize::MAX);
+    let mut dev = db.session();
+    dev.set_branch("dev").unwrap();
+    dev.execute("SESSION SET GRAPH g").unwrap();
+    assert_eq!(
+        property_values(&dev.query("MATCH (n) RETURN n.v AS v").await.unwrap()),
+        vec![2]
+    );
+    db.checkpoint().unwrap();
+    assert!(parquet_files(&dir)[0].with_extension("index").is_file());
+    // A separate, unreferenced generation and an interrupted index stage are reclaimed.
+    let retired = TestDir::new();
+    let db = buffered(&retired, 1000, usize::MAX);
+    db.session()
+        .run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N)")
+        .await
+        .unwrap();
+    db.checkpoint().unwrap();
+    fs::write(retired.0.join("graph-999999.index"), b"orphan index").unwrap();
+    db.session().execute("DROP GRAPH g").unwrap();
+    db.checkpoint().unwrap();
+    assert!(parquet_files(&retired).is_empty());
+    assert!(!fs::read_dir(&retired.0).unwrap().any(|entry| entry
+        .unwrap()
+        .path()
+        .extension()
+        .is_some_and(|e| e == "index")));
+}
+
+#[tokio::test]
 async fn branch_writes_persist_incremental_records_and_replay_after_checkpoint() {
     let dir = TestDir::new();
     {
@@ -428,6 +632,8 @@ async fn checkpoint_crashes_preserve_unsealed_wal_data_and_allow_future_writes()
     for point in [
         "parquet_write",
         "parquet_sync",
+        "row_index_write",
+        "row_index_sync",
         "parquet_directory",
         "checkpoint_catalog",
         "checkpoint_data",

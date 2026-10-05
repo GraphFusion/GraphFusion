@@ -727,7 +727,9 @@ impl StatementTxn {
                 data: Batches {
                     schema: table.schema.clone(),
                     batches: table.batches[start..].to_vec(),
+                    deleted: table.resident.deleted[start..].to_vec(),
                 },
+                cache: Default::default(),
             },
             append: old.is_some(),
             deleted_ids: if old.is_some() {

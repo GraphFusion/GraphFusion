@@ -1,4 +1,4 @@
-//! GQL writes are relational DataFusion plans, published by the graph coordinator.
+//! GQL plans resolve write targets; indexed snapshot overlays publish their changes.
 use super::{
     execution::{batch, col, freeze, memory, Trace},
     expressions::Binder,
@@ -20,7 +20,7 @@ use datafusion::{
     common::{Column, TableReference},
     datasource::provider_as_source,
     execution::context::SessionContext,
-    logical_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder},
+    logical_expr::{lit, Expr, JoinType, LogicalPlan, LogicalPlanBuilder},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -99,13 +99,6 @@ async fn table_with_empty(
         },
     )?))
 }
-fn source(table: &Table) -> Result<LogicalPlanBuilder> {
-    Ok(LogicalPlanBuilder::scan(
-        "__gf_old",
-        provider_as_source(table.provider.clone()),
-        None,
-    )?)
-}
 fn properties(
     map: Option<&ast::MapLiteral>,
     session: &SessionState,
@@ -159,52 +152,6 @@ pub(super) async fn apply(
     let affected_before = writes.affected;
     let mut data = (*writes.data(tx, id)?).clone();
     scope.sources.insert(id, Arc::new(data.clone()));
-    // Durable providers contain no resident Arrow batches. Materialize their immutable
-    // snapshot through DataFusion before validating or rewriting the graph.
-    if !matches!(clause, ast::QueryClause::Insert(_)) {
-        for node in &mut data.nodes {
-            if node
-                .0
-                .batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .sum::<usize>()
-                != node.0.row_count
-            {
-                let file_id = node.0.file_id;
-                let mut loaded = table(source(&node.0)?, node.0.labels.clone(), false, ctx, trace)
-                    .await?
-                    .ok_or_else(|| Error::Corrupt("graph row count changed".into()))?;
-                loaded.file_id = file_id;
-                loaded.deleted_ids = node.0.deleted_ids.clone();
-                node.0 = loaded;
-            }
-        }
-        for edge in &mut data.edges {
-            if edge
-                .table
-                .batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .sum::<usize>()
-                != edge.table.row_count
-            {
-                let file_id = edge.table.file_id;
-                let mut loaded = table(
-                    source(&edge.table)?,
-                    edge.table.labels.clone(),
-                    true,
-                    ctx,
-                    trace,
-                )
-                .await?
-                .ok_or_else(|| Error::Corrupt("graph row count changed".into()))?;
-                loaded.file_id = file_id;
-                loaded.deleted_ids = edge.table.deleted_ids.clone();
-                edge.table = loaded;
-            }
-        }
-    }
     plan = freeze(plan, ctx, trace, None).await?;
     match clause {
         ast::QueryClause::Insert(insert) => {
@@ -299,9 +246,9 @@ pub(super) async fn apply(
                 };
                 let binding = target(&plan, scope, &name, id, ctx, trace).await?;
                 let patch = patch(&plan, &binding, values, &mut edit, ctx, trace).await?;
-                if let Some((patch, count)) = patch {
-                    data = edit_graph(&data, binding.kind, &patch, &edit, ctx, trace).await?;
-                    writes.affected += count;
+                if let Some((patch, ids)) = patch {
+                    data = edit_graph(&data, binding.kind, &patch, &ids, &edit, ctx, trace).await?;
+                    writes.affected += ids.len();
                     plan = refresh(plan, scope, id, &data)?;
                     plan = freeze(plan, ctx, trace, None).await?;
                 }
@@ -330,18 +277,18 @@ pub(super) async fn apply(
                 };
                 let binding = target(&plan, scope, &name, id, ctx, trace).await?;
                 let mut edit = edit;
-                if let Some((patch, count)) =
+                if let Some((patch, ids)) =
                     patch(&plan, &binding, vec![], &mut edit, ctx, trace).await?
                 {
-                    data = edit_graph(&data, binding.kind, &patch, &edit, ctx, trace).await?;
-                    writes.affected += count;
+                    data = edit_graph(&data, binding.kind, &patch, &ids, &edit, ctx, trace).await?;
+                    writes.affected += ids.len();
                     plan = refresh(plan, scope, id, &data)?;
                     plan = freeze(plan, ctx, trace, None).await?;
                 }
             }
         }
         ast::QueryClause::Delete(delete) => {
-            let (next, affected) =
+            let (next, affected, deleted_nodes, deleted_edges) =
                 delete_graph(&plan, scope, id, &data, delete, ctx, trace).await?;
             data = next;
             writes.affected += affected;
@@ -355,14 +302,20 @@ pub(super) async fn apply(
                 .collect();
             let mut removed = BTreeSet::new();
             for (name, binding) in bindings {
-                let (scan, live) = graph::scan(scope, id, &data, binding.kind, None)?;
+                let deleted = if binding.kind == ElementKind::Node {
+                    &deleted_nodes
+                } else {
+                    &deleted_edges
+                };
+                if deleted.is_empty() {
+                    continue;
+                }
                 let missing = plan
                     .clone()
-                    .filter(binding.column(ID).is_not_null())?
-                    .join_on(
-                        scan,
-                        JoinType::LeftAnti,
-                        [binding.column(ID).eq(live.column(ID))],
+                    .filter(
+                        binding
+                            .column(ID)
+                            .in_list(deleted.iter().map(|id| lit(*id)).collect(), false),
                     )?
                     .limit(0, Some(1))?
                     .build()?;
@@ -376,7 +329,9 @@ pub(super) async fn apply(
             scope.references.retain(|name, _| !removed.contains(name));
             scope.domains.retain(|name, _| !removed.contains(name));
             scope.order.retain(|name| !removed.contains(name));
-            plan = refresh(plan, scope, id, &data)?;
+            if affected != 0 {
+                plan = refresh(plan, scope, id, &data)?;
+            }
         }
         _ => unreachable!("mutation dispatch"),
     }
@@ -606,7 +561,7 @@ async fn patch(
     edit: &mut Edit,
     ctx: &SessionContext,
     trace: &mut Trace,
-) -> Result<Option<(LogicalPlan, usize)>> {
+) -> Result<Option<(LogicalPlan, BTreeSet<u64>)>> {
     use datafusion::logical_expr::ExprSchemable;
     let mut expressions = vec![binding.column(ID).alias(ID)];
     for (i, (name, value)) in values.into_iter().enumerate() {
@@ -648,7 +603,7 @@ async fn patch(
     }
     Ok(Some((
         memory(schema, batches)?.alias("__gf_patch")?.build()?,
-        ids.len(),
+        ids,
     )))
 }
 
@@ -656,6 +611,7 @@ async fn edit_graph(
     data: &GraphData,
     kind: ElementKind,
     patch: &LogicalPlan,
+    ids: &BTreeSet<u64>,
     edit: &Edit,
     ctx: &SessionContext,
     trace: &mut Trace,
@@ -676,9 +632,20 @@ async fn edit_graph(
         data.edges.iter().map(|t| (&t.table, t.directed)).collect()
     };
     for (old, directed) in tables {
+        let Some(provider) = old.select_ids(ids)? else {
+            if kind == ElementKind::Node {
+                nodes.push(NodeTable(old.clone()));
+            } else {
+                edges.push(EdgeTable {
+                    table: old.clone(),
+                    directed,
+                });
+            }
+            continue;
+        };
+        let selected = LogicalPlanBuilder::scan("__gf_old", provider_as_source(provider), None)?;
         let on = col("__gf_old", ID).eq(col("__gf_patch", ID));
-        let kept = source(old)?.join_on(patch.clone(), JoinType::LeftAnti, [on.clone()])?;
-        let changed = source(old)?.join_on(patch.clone(), JoinType::Inner, [on])?;
+        let changed = selected.join_on(patch.clone(), JoinType::Inner, [on])?;
         let mut projections = Vec::new();
         for field in old.schema.fields() {
             let name = field.name();
@@ -710,22 +677,9 @@ async fn edit_graph(
             trace,
         )
         .await?;
-        let kept = if old.file_id.is_some() || old.memory_id.is_some() {
-            let mut kept = old.clone();
-            if let Some(changed) = &changed {
-                kept.mask_rows(&changed.ids(ID).collect())?;
-            }
-            (kept.row_count != 0).then_some(kept)
-        } else {
-            table(
-                kept,
-                old.labels.clone(),
-                kind == ElementKind::Edge,
-                ctx,
-                trace,
-            )
-            .await?
-        };
+        let mut kept = old.clone();
+        kept.mask_rows(ids)?;
+        let kept = (kept.row_count != 0).then_some(kept);
         for table in [kept, changed].into_iter().flatten() {
             if kind == ElementKind::Node {
                 nodes.push(NodeTable(table));
@@ -734,7 +688,7 @@ async fn edit_graph(
             }
         }
     }
-    GraphData::try_new(nodes, edges)
+    GraphData::from_mutation(nodes, edges)
 }
 
 fn refresh(
@@ -776,26 +730,27 @@ fn refresh(
     super::references::refresh(plan, scope, graph_id, data)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn retained_table(
-    old: &Table,
-    plan: LogicalPlanBuilder,
-    edge: bool,
+/// Collect identities once, skipping null targets before touching any fragment.
+async fn delete_ids(
+    plan: Option<LogicalPlanBuilder>,
     ctx: &SessionContext,
     trace: &mut Trace,
-) -> Result<Option<Table>> {
-    let retained = table(plan, old.labels.clone(), edge, ctx, trace).await?;
-    if old.file_id.is_none() && old.memory_id.is_none() {
-        return Ok(retained);
-    }
-    let Some(retained) = retained else {
-        return Ok(None);
+) -> Result<BTreeSet<u64>> {
+    let Some(plan) = plan else {
+        return Ok(BTreeSet::new());
     };
-    let keep: BTreeSet<_> = retained.ids(ID).collect();
-    let removed = old.ids(ID).filter(|id| !keep.contains(id)).collect();
-    let mut table = old.clone();
-    table.mask_rows(&removed)?;
-    Ok(Some(table))
+    let (_, batches) = trace.collect(ctx, &plan.distinct()?.build()?).await?;
+    Ok(batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("element IDs");
+            ids.iter().flatten()
+        })
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -807,7 +762,7 @@ async fn delete_graph(
     delete: &ast::DeleteStatement,
     ctx: &SessionContext,
     trace: &mut Trace,
-) -> Result<(GraphData, usize)> {
+) -> Result<(GraphData, usize, BTreeSet<u64>, BTreeSet<u64>)> {
     let mut node_ids: Option<LogicalPlanBuilder> = None;
     let mut edge_ids: Option<LogicalPlanBuilder> = None;
     for item in &delete.items {
@@ -826,79 +781,48 @@ async fn delete_graph(
             None => ids,
         });
     }
-    let nodes = node_ids
-        .map(|p| {
-            p.distinct()?
-                .alias("__gf_delete")
-                .and_then(LogicalPlanBuilder::build)
-        })
-        .transpose()?;
-    let edges = edge_ids
-        .map(|p| {
-            p.distinct()?
-                .alias("__gf_delete")
-                .and_then(LogicalPlanBuilder::build)
-        })
-        .transpose()?;
+    let nodes = delete_ids(node_ids, ctx, trace).await?;
+    let edges = delete_ids(edge_ids, ctx, trace).await?;
+    if nodes.is_empty() && edges.is_empty() {
+        return Ok((data.clone(), 0, nodes, edges));
+    }
     let mut new_nodes = Vec::new();
     let mut new_edges = Vec::new();
+    let mut deleted_nodes = BTreeSet::new();
+    let mut deleted_edges = BTreeSet::new();
     for node in &data.nodes {
-        let mut plan = source(&node.0)?;
-        if let Some(ids) = &nodes {
-            plan = plan.join_on(
-                ids.clone(),
-                JoinType::LeftAnti,
-                [col("__gf_old", ID).eq(col("__gf_delete", ID))],
-            )?;
+        let mut table = node.0.clone();
+        if !nodes.is_empty() {
+            deleted_nodes.extend(table.mask_rows(&nodes)?);
         }
-        if let Some(table) = retained_table(&node.0, plan, false, ctx, trace).await? {
+        if table.row_count != 0 {
             new_nodes.push(NodeTable(table));
         }
     }
     for edge in &data.edges {
-        let mut plan = source(&edge.table)?;
-        if let Some(ids) = &edges {
-            plan = plan.join_on(
-                ids.clone(),
-                JoinType::LeftAnti,
-                [col("__gf_old", ID).eq(col("__gf_delete", ID))],
-            )?;
-        }
-        if delete.detach {
-            if let Some(ids) = &nodes {
-                plan = plan.join_on(
-                    ids.clone(),
-                    JoinType::LeftAnti,
-                    [col("__gf_old", SOURCE).eq(col("__gf_delete", ID)).or(col(
-                        "__gf_old",
-                        DESTINATION,
-                    )
-                    .eq(col("__gf_delete", ID)))],
-                )?;
+        let mut removed = edges.clone();
+        if !deleted_nodes.is_empty() {
+            let incident = edge.table.incident_ids(&deleted_nodes)?;
+            if delete.detach {
+                removed.extend(incident);
+            } else if !incident.is_subset(&edges) {
+                return Err(Error::InvalidQuery(
+                    "DELETE cannot remove a node that still has edges; use DETACH DELETE".into(),
+                ));
             }
         }
-        if let Some(table) = retained_table(&edge.table, plan, true, ctx, trace).await? {
+        let mut table = edge.table.clone();
+        if !removed.is_empty() {
+            deleted_edges.extend(table.mask_rows(&removed)?);
+        }
+        if table.row_count != 0 {
             new_edges.push(EdgeTable {
                 table,
                 directed: edge.directed,
             });
         }
     }
-    if !delete.detach {
-        let node_ids: BTreeSet<u64> = new_nodes.iter().flat_map(|node| node.0.ids(ID)).collect();
-        let dangling = new_edges.iter().any(|edge| {
-            edge.table
-                .ids(SOURCE)
-                .chain(edge.table.ids(DESTINATION))
-                .any(|id| !node_ids.contains(&id))
-        });
-        if dangling {
-            return Err(Error::InvalidQuery(
-                "DELETE cannot remove a node that still has edges; use DETACH DELETE".into(),
-            ));
-        }
-    }
-    let next = GraphData::try_new(new_nodes, new_edges)?;
-    let affected = data.node_count() + data.edge_count() - next.node_count() - next.edge_count();
-    Ok((next, affected))
+    let next = GraphData::from_mutation(new_nodes, new_edges)?;
+    let affected = deleted_nodes.len() + deleted_edges.len();
+    Ok((next, affected, deleted_nodes, deleted_edges))
 }

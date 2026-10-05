@@ -593,6 +593,7 @@ impl Disk {
                             if let Some(manifest) = &generation.parquet {
                                 for table in manifest.tables() {
                                     files.insert(format!("graph-{}.parquet", table.id));
+                                    files.insert(format!("graph-{}.index", table.id));
                                 }
                             }
                         }
@@ -615,11 +616,13 @@ impl Disk {
                                             TableChange::Memory { .. } => continue,
                                         };
                                         files.insert(format!("graph-{id}.parquet"));
+                                        files.insert(format!("graph-{id}.index"));
                                     }
                                 }
                                 StorageChange::ReplaceParquet { manifest, .. } => {
                                     for table in manifest.tables() {
                                         files.insert(format!("graph-{}.parquet", table.id));
+                                        files.insert(format!("graph-{}.index", table.id));
                                     }
                                 }
                                 _ => (),
@@ -779,15 +782,36 @@ fn read_frame(file: &mut File, allow_tail: bool) -> Result<Option<Vec<u8>>> {
     Ok(Some(payload))
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0; 256];
+        let mut i = 0;
+        while i < table.len() {
+            let mut crc = i as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+                bit += 1;
+            }
+            table[i] = crc;
+            i += 1;
         }
-    }
-    !crc
+        table
+    };
+    !bytes.iter().fold(!0u32, |crc, byte| {
+        (crc >> 8) ^ TABLE[((crc ^ u32::from(*byte)) & 0xff) as usize]
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn crc32_matches_ieee_test_vectors() {
+    assert_eq!(crc32(b""), 0);
+    assert_eq!(crc32(b"123456789"), 0xcbf43926);
+    assert_eq!(
+        crc32(b"The quick brown fox jumps over the lazy dog"),
+        0x414fa339
+    );
 }
 
 pub(crate) fn failpoint(_name: &str) {

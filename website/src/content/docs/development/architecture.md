@@ -20,7 +20,7 @@ OPTIONAL MATCH, path composition and writes sometimes materialize intermediate t
 
 ## Published state and commit
 
-One published snapshot combines a commit sequence, immutable catalog root, storage root and identity reservation watermark. Statements and explicit transactions register active snapshots and keep private changes. Catalog maps use copy-on-write entries; graph generations contain immutable resident Arrow fragments and sealed Parquet files, with deletion masks for replaced or removed sealed rows.
+One published snapshot combines a commit sequence, immutable catalog root, storage root and identity reservation watermark. Statements and explicit transactions register active snapshots and keep private changes. Catalog maps use copy-on-write entries; graph generations contain immutable resident Arrow fragments and sealed Parquet files, with ID/row-position indexes, edge adjacency lookups and snapshot-specific deletion bitmaps. New Parquet files have checksummed immutable index sidecars; Arrow buffers stay shared when masking resident rows.
 
 At write commit, optimistic validation checks graph versions and catalog object/name/membership/dependency reads against the newest committed state. A validated delta merges into that state, preserving disjoint changes. Persistent publication appends and syncs a checksummed WAL record containing Arrow IPC deltas and layout changes, then exposes the new snapshot. When a graph reaches its MemTable threshold, sealing stages and syncs new fragment files before the committing WAL record references them. Catalog and graph data are not committed independently.
 
