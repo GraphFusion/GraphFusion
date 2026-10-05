@@ -25,7 +25,7 @@ if installed != f'wasm-bindgen {VERSION}':
 if not shutil.which('wasm-opt'):
     sys.exit('Install Binaryen (wasm-opt) to optimize the browser engine. See development/browser-playground.')
 optimizer = subprocess.check_output(['wasm-opt', '--version'], text=True).strip()
-if optimizer != f'wasm-opt version {BINARYEN_VERSION}':
+if optimizer.split()[:3] != ['wasm-opt', 'version', BINARYEN_VERSION]:
     sys.exit(f'Expected Binaryen {BINARYEN_VERSION}; found {optimizer}. Older optimizers can break the browser engine. See development/browser-playground.')
 subprocess.run(['cargo', 'build', '--locked', '-p', 'graphfusion-wasm',
                 '--target', 'wasm32-unknown-unknown', '--profile', 'wasm'], cwd=ROOT, env=env, check=True)
