@@ -12,6 +12,7 @@ export default defineConfig({
     logo: { src: './src/assets/graphfusion.svg', alt: '', replacesTitle: false },
     expressiveCode: { shiki: { langAlias: { gql: 'cypher' } } },
     social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/GraphFusion/GraphFusion' }],
+    components: { SiteTitle: './src/components/HeaderBrand.astro' },
     customCss: ['./src/styles/custom.css'],
     sidebar: [
       { label: 'Start here', items: [{ autogenerate: { directory: 'start' } }] },
