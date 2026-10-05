@@ -15,8 +15,11 @@ mod session;
 mod storage;
 mod transaction;
 pub mod types;
+#[cfg(feature = "visualization")]
+pub mod visualization;
 
 pub use datafusion::arrow;
+use datafusion::common::instant::Instant;
 pub use error::{Error, Result};
 use persistence::{Disk, FileGuard};
 pub use query::QueryResult;
@@ -32,7 +35,6 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, Weak,
     },
-    time::Instant,
 };
 use transaction::{PublishedState, StatementTxn};
 

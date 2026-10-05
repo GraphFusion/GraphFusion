@@ -17,6 +17,12 @@ RETURN next.name AS friend_of_friend;
 
 ## Try it
 
+The development checkout includes a [browser Playground](website/src/content/docs/start/playground.md)
+with a real WebAssembly engine and an interactive graph view. See the
+[browser build guide](website/src/content/docs/development/browser-playground.md)
+to run it locally. Queries execute in the browser; the initial version keeps
+the database in memory.
+
 Install the 0.1.1 CLI from crates.io:
 
 ```sh

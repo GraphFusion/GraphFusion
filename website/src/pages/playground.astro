@@ -1,0 +1,76 @@
+---
+import '../styles/playground.css';
+import { examples } from '../playground/examples';
+---
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Playground · GraphFusion</title>
+  <meta name="description" content="Explore GQL queries and visualize their results with GraphFusion running entirely in your browser." />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="GraphFusion home"><img src="/favicon.svg" alt="" />GraphFusion</a>
+    <span class="header-divider"></span><span class="header-title">Playground</span>
+    <span class="local-badge"><span class="status-dot"></span>Runs on your device</span>
+    <a class="docs-link" href="/start/quickstart/">Documentation <span aria-hidden="true">↗</span></a>
+  </header>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Workspace">
+      <details open id="workspace-options">
+        <summary>Workspace <span aria-hidden="true">⌄</span></summary>
+        <div class="sidebar-content">
+          <div class="eyebrow">YOUR DATABASE</div>
+          <div class="database-card"><span class="database-icon" aria-hidden="true">◉</span><div><strong>Connected team</strong><span>In-memory session</span></div><span class="tiny-dot"></span></div>
+          <p class="memory-note">Private to this tab. Reloading clears your data.</p>
+          <div class="section-label"><span class="eyebrow">EXPLORE</span><span class="small-tag">GQL</span></div>
+          <nav id="examples" aria-label="Example queries">
+            {examples.map((example, i) => <button data-example={i} class:list={['example', { active: i === 0 }]}><span class="example-icon" aria-hidden="true">{['◎', '↗', '⌁', '▥', '✎'][i]}</span><span><strong>{example.title}</strong><small>{example.description}</small></span></button>)}
+          </nav>
+          <div class="section-label history-heading"><span class="eyebrow">RECENT QUERIES</span><span id="history-count" class="small-tag">0</span></div>
+          <div id="history"><p class="muted sidebar-empty">Your queries will appear here.</p></div>
+          <div class="sidebar-bottom"><a href="/start/status/">Supported GQL <span>↗</span></a><button id="reset">↻ <span>Reset sample data</span></button></div>
+        </div>
+      </details>
+    </aside>
+    <main class="workspace">
+      <div class="workspace-heading"><div><div class="eyebrow">GRAPH EXPLORER</div><h1>Explore connections.</h1><p>Write a query. See your data take shape.</p></div><span id="engine-status" role="status" class="engine-status"><span class="status-dot loading"></span>Loading engine…</span></div>
+      <section class="editor-card" aria-label="Query editor">
+        <div class="editor-heading"><span class="editor-title"><span class="code-mark" aria-hidden="true">&gt;_</span> Query</span><span id="query-title">Explore the graph</span><button id="clear-query" title="Clear editor" aria-label="Clear editor">×</button></div>
+        <div id="editor"></div>
+        <div class="editor-footer"><span class="shortcut"><kbd>⌘</kbd><kbd>Enter</kbd> to run <span class="shortcut-alt">· Ctrl + Enter</span></span><div><button id="stop" class="stop-button" hidden>Stop & reset</button><button id="run" class="run-button" disabled><span aria-hidden="true">▶</span> Run query</button></div></div>
+      </section>
+      <div id="error" role="alert" hidden></div>
+      <section class="result-card" aria-label="Query results" aria-busy="true">
+        <div class="result-heading"><div class="result-tabs" role="tablist" aria-label="Result views">
+          <button id="tab-graph" role="tab" aria-selected="true" aria-controls="view-graph" data-view="graph">◎ <span>Graph</span></button>
+          <button id="tab-table" role="tab" aria-selected="false" aria-controls="view-table" data-view="table" tabindex="-1">▦ <span>Table</span></button>
+          <button id="tab-plan" role="tab" aria-selected="false" aria-controls="view-plan" data-view="plan" tabindex="-1">☷ <span>Plan</span></button>
+        </div><div id="result-meta" aria-live="polite">Preparing your workspace…</div></div>
+        <div class="result-banner" id="result-banner" hidden></div>
+        <div id="view-graph" role="tabpanel" aria-labelledby="tab-graph" class="graph-view">
+          <div class="graph-area">
+            <div class="graph-legend" id="legend" aria-label="Node labels"></div>
+            <div id="graph" aria-label="Interactive query result graph"></div>
+            <div class="canvas-empty" id="graph-empty"><span class="empty-orbit" aria-hidden="true">◎</span><strong id="empty-title">Connecting the dots</strong><p id="empty-description">Loading GraphFusion and your sample graph…</p></div>
+            <div class="graph-toolbar"><label class="graph-search"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Find in this result…" aria-label="Find a node in the result" /></label><div class="graph-tools"><button id="zoom-in" aria-label="Zoom in" title="Zoom in">+</button><button id="zoom-out" aria-label="Zoom out" title="Zoom out">−</button><button id="fit" aria-label="Fit graph" title="Fit graph">⛶</button><button id="layout" aria-label="Rearrange graph" title="Rearrange graph">⌘</button></div></div>
+            <span class="canvas-hint">Drag to move · Scroll to zoom · Click to inspect</span>
+          </div>
+          <aside class="inspector" aria-label="Element inspector"><div class="inspector-heading"><span class="eyebrow">INSPECT</span><span id="selected-kind" class="small-tag">Element</span></div>
+            <label for="element-picker" class="sr-only">Inspect an element</label><select id="element-picker"><option value="">Select a node or relationship</option></select>
+            <div id="inspector-content"><div class="inspector-empty"><span aria-hidden="true">↖</span><strong>A closer look</strong><p>Select an element to explore its labels and properties.</p></div></div>
+          </aside>
+        </div>
+        <div id="view-table" role="tabpanel" aria-labelledby="tab-table" hidden><div id="table-container"></div></div>
+        <div id="view-plan" role="tabpanel" aria-labelledby="tab-plan" hidden><div class="plan-heading"><h2>Query execution</h2><p>The logical and physical plans produced by DataFusion.</p></div><h3>Logical plan</h3><pre id="logical-plan"></pre><h3>Physical plan</h3><pre id="physical-plan"></pre></div>
+        <footer class="result-footer"><span id="graph-counts">0 nodes · 0 relationships</span><div><select id="statement-picker" aria-label="Statement result" hidden></select><button id="export" disabled>↓ Export JSON</button></div></footer>
+      </section>
+      <div class="workspace-footer"><span><span class="status-dot"></span> Queries & data stay in this browser</span><span>GraphFusion · GQL + WebAssembly</span></div>
+    </main>
+  </div>
+  <dialog id="reset-dialog"><h2>Reset this workspace?</h2><p>This clears the current database and reloads the sample graph. Your recent query history stays available.</p><form method="dialog"><button value="cancel">Keep exploring</button><button value="reset" class="run-button">Reset sample data</button></form></dialog>
+  <script>import '../playground/app';</script>
+</body>
+</html>

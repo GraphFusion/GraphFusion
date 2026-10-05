@@ -21,7 +21,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: website
@@ -35,6 +35,25 @@ jobs:
           cache: npm
           cache-dependency-path: website/package-lock.json
       - run: npm ci
+      - name: Install browser engine toolchain
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --target wasm32-unknown-unknown
+          sudo apt-get update
+          sudo apt-get install -y clang binaryen
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/wasm-bindgen*
+            target
+          key: docs-wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Install version-matched browser bindings
+        run: |
+          if ! wasm-bindgen --version | grep -qx 'wasm-bindgen 0.2.128'; then
+            cargo install wasm-bindgen-cli --version 0.2.128 --locked
+          fi
+      - run: npm run build:wasm
       - run: npm run check
       - run: npm run build
       - run: npx playwright install --with-deps chromium

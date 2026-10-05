@@ -68,6 +68,8 @@ pub struct QueryResult {
     /// Produced inside an open explicit transaction. commit_seq is its base snapshot.
     /// This flag does not change later; the COMMIT result acknowledges durability.
     pub transaction_pending: bool,
+    #[cfg(feature = "visualization")]
+    pub graph: crate::visualization::GraphProjection,
 }
 
 impl QueryResult {
@@ -88,18 +90,27 @@ pub(crate) async fn execute_statement(
     if let Some(schema) = at_schema {
         context.current_schema = crate::session::schema_reference(tx, session, schema)?;
     }
-    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
-        .with_memory_pool(std::sync::Arc::new(
-            datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                session.query_limits.memory_limit_bytes,
-            ),
-        ))
-        .build()?;
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new().with_memory_pool(
+        std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+            session.query_limits.memory_limit_bytes,
+        )),
+    );
+    #[cfg(target_family = "wasm")]
+    let runtime = runtime.with_disk_manager_builder(
+        datafusion::execution::disk_manager::DiskManagerBuilder::default()
+            .with_mode(datafusion::execution::disk_manager::DiskManagerMode::Disabled),
+    );
+    let runtime = runtime.build()?;
     // DataFusion's leaf-projection pushdown joins a qualified table-scan schema
     // (`__gf_scan_N.__gf_id`) with the unqualified `__gf_id` on our scan
     // projection and rejects the plan as ambiguous. That shows up as soon as a
     // graph has a single table for an element kind.
     let mut config = datafusion::execution::config::SessionConfig::new();
+    // Browser workers have one executor thread and no filesystem for spilling.
+    #[cfg(target_family = "wasm")]
+    {
+        config = config.with_target_partitions(1);
+    }
     config
         .options_mut()
         .optimizer
@@ -118,6 +129,8 @@ pub(crate) async fn execute_statement(
     )
     .await?;
     let (schema, batches) = trace.collect(&ctx, &plan).await?;
+    #[cfg(feature = "visualization")]
+    let graph = crate::visualization::project(&batches, &trace.sources, &ctx).await?;
     for (graph, data) in writes.graphs {
         tx.replace_graph_data(graph, data)?;
     }
@@ -130,6 +143,8 @@ pub(crate) async fn execute_statement(
         physical_plan: trace.physical.join("\n"),
         affected_elements: writes.affected,
         transaction_pending: true,
+        #[cfg(feature = "visualization")]
+        graph,
     })
 }
 
