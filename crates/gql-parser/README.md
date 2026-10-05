@@ -3,12 +3,11 @@
 The GQL lexer, parser, and abstract syntax tree used by
 [GraphFusion](https://github.com/GraphFusion/GraphFusion).
 
-These examples target the unreleased 0.2.0 development version. Use the Git
-dependency to try the current code:
+Add the published parser to your dependencies:
 
 ```toml
 [dependencies]
-gql-parser = { git = "https://github.com/GraphFusion/GraphFusion.git" }
+gql-parser = "0.2.0"
 ```
 
 ```rust

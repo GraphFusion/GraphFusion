@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-Run `graphfusion --help` for supported options. The 0.2.0 development CLI provides an interactive REPL and one-shot commands. It runs locally and does not listen on a network port.
+Run `graphfusion --help` for supported options. The 0.2.0 CLI provides an interactive REPL and one-shot commands. It runs locally and does not listen on a network port.
 
 ## Interactive mode
 

@@ -11,7 +11,7 @@ Add the published library and an async runtime to your application:
 
 ```toml
 [dependencies]
-graphfusion = "0.1.1"
+graphfusion = "0.2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
