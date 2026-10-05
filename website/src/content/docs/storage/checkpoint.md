@@ -17,4 +17,4 @@ Close the interactive REPL before using this separate command, or run `\checkpoi
 
 DROP and graph replacement retire storage; they do not immediately delete files that a reader might still scan. Reclamation happens after the new manifest is durable and no active lease can reference the old generation. Orphan files from interrupted staging can be reclaimed as well.
 
-Checkpoint is not Parquet compaction, an index build or a backup command. There is no automatic scheduler or supported live-directory copying backup protocol yet.
+Checkpoint writes ID/row-position sidecars while sealing resident fragments. It does not compact existing Parquet files or their deletion masks, and is not a backup command. There is no automatic scheduler or supported live-directory copying backup protocol yet.

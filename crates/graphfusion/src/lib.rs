@@ -9,6 +9,8 @@ mod memtable;
 mod parquet;
 mod persistence;
 mod query;
+mod row_index;
+mod rows;
 mod session;
 mod storage;
 mod transaction;
@@ -528,8 +530,13 @@ impl Database {
             stats.sealed_files += manifest.tables().count();
             for fragment in manifest.fragments() {
                 if let memtable::Fragment::Memory(t) = fragment {
-                    stats.memtable_rows +=
-                        t.data.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                    stats.memtable_rows += t
+                        .data
+                        .batches
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| b.num_rows() - t.data.deleted.get(i).map_or(0, |d| d.len()))
+                        .sum::<usize>();
                     stats.memtable_bytes += t
                         .data
                         .batches

@@ -7,12 +7,18 @@ use datafusion::arrow::{
     record_batch::RecordBatch,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::BTreeSet, io::Cursor};
+use std::{
+    collections::BTreeSet,
+    io::Cursor,
+    sync::{Arc, OnceLock},
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Batches {
     pub schema: SchemaRef,
     pub batches: Vec<RecordBatch>,
+    /// Runtime masks are encoded as live rows when a full IPC image is needed.
+    pub deleted: Vec<Arc<crate::rows::DeleteVector>>,
 }
 impl Serialize for Batches {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
@@ -20,8 +26,14 @@ impl Serialize for Batches {
         {
             let mut writer = StreamWriter::try_new(&mut bytes, &self.schema)
                 .map_err(serde::ser::Error::custom)?;
-            for batch in &self.batches {
-                writer.write(batch).map_err(serde::ser::Error::custom)?;
+            for (i, batch) in self.batches.iter().enumerate() {
+                let batch = match self.deleted.get(i) {
+                    Some(deleted) => deleted.filter(batch).map_err(serde::ser::Error::custom)?,
+                    None => batch.clone(),
+                };
+                if batch.num_rows() != 0 {
+                    writer.write(&batch).map_err(serde::ser::Error::custom)?;
+                }
             }
             writer.finish().map_err(serde::ser::Error::custom)?;
         }
@@ -38,7 +50,11 @@ impl<'de> Deserialize<'de> for Batches {
         let batches = reader
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(serde::de::Error::custom)?;
-        Ok(Self { schema, batches })
+        Ok(Self {
+            schema,
+            batches,
+            deleted: vec![],
+        })
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,10 +62,15 @@ pub(crate) struct MemoryTable {
     pub id: ObjectId,
     pub labels: BTreeSet<String>,
     pub data: Batches,
+    #[serde(skip)]
+    pub cache: Arc<OnceLock<Table>>,
 }
 impl MemoryTable {
     pub fn open(&self, edge: bool) -> Result<Table> {
-        let mut table = Table::try_new(
+        if let Some(table) = self.cache.get() {
+            return Ok(table.clone());
+        }
+        let mut table = Table::try_new_with_deletions(
             self.labels.iter().cloned().collect(),
             self.data.schema.clone(),
             self.data.batches.clone(),
@@ -62,9 +83,29 @@ impl MemoryTable {
             } else {
                 &[crate::graph::ID]
             },
+            self.data.deleted.clone(),
         )?;
         table.memory_id = Some(self.id);
-        Ok(table)
+        let _ = self.cache.set(table);
+        Ok(self.cache.get().unwrap().clone())
+    }
+    pub fn from_table(id: ObjectId, mut table: Table) -> Self {
+        table.memory_id = Some(id);
+        table.memory_deleted_ids.clear();
+        let data = Batches {
+            schema: table.schema.clone(),
+            batches: table.batches.clone(),
+            deleted: table.resident.deleted.clone(),
+        };
+        let cache = Arc::new(OnceLock::new());
+        let labels = table.labels.clone();
+        let _ = cache.set(table);
+        Self {
+            id,
+            labels,
+            data,
+            cache,
+        }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,9 +142,7 @@ impl TableChange {
                 let Some(Fragment::Parquet(old)) = previous.iter().find(|f| f.id() == *id) else {
                     return Err(Error::Corrupt("missing immutable mask base".into()));
                 };
-                let mut table = old.clone();
-                table.deleted_ids.extend(deleted_ids.iter().copied());
-                Ok(Fragment::Parquet(table))
+                Ok(Fragment::Parquet(old.with_deletes(deleted_ids)?))
             }
             Self::Reuse(id) => previous
                 .iter()
@@ -119,10 +158,9 @@ impl TableChange {
                 if !deleted_ids.is_empty() {
                     return Err(Error::Corrupt("new MemTable has a removal base".into()));
                 }
-                table.open(edge)?;
-                let mut table = table.clone();
-                table.data.batches.retain(|b| b.num_rows() != 0);
-                Ok(Fragment::Memory(table))
+                let mut loaded = table.open(edge)?;
+                loaded.prune_deleted_batches()?;
+                Ok(Fragment::Memory(MemoryTable::from_table(table.id, loaded)))
             }
             Self::Memory {
                 table,
@@ -137,33 +175,11 @@ impl TableChange {
                     return Err(Error::Corrupt("MemTable append layout differs".into()));
                 }
                 let extra = table.open(edge)?;
-                if deleted_ids.is_empty() {
-                    let mut next = old.clone();
-                    next.data.batches.extend(
-                        table
-                            .data
-                            .batches
-                            .iter()
-                            .filter(|b| b.num_rows() != 0)
-                            .cloned(),
-                    );
-                    return Ok(Fragment::Memory(next));
-                }
                 let mut loaded = old.open(edge)?;
                 loaded.mask_rows(deleted_ids)?;
                 loaded.append_rows(extra)?;
-                Ok(Fragment::Memory(MemoryTable {
-                    id: old.id,
-                    labels: old.labels.clone(),
-                    data: Batches {
-                        schema: loaded.schema,
-                        batches: loaded
-                            .batches
-                            .into_iter()
-                            .filter(|b| b.num_rows() != 0)
-                            .collect(),
-                    },
-                }))
+                loaded.prune_deleted_batches()?;
+                Ok(Fragment::Memory(MemoryTable::from_table(old.id, loaded)))
             }
         }
     }

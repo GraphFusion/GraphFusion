@@ -2108,6 +2108,8 @@ async fn parquet_crash_matrix_atomically_publishes_catalog_and_graph() {
     for (point, committed) in [
         ("parquet_write", false),
         ("parquet_sync", false),
+        ("row_index_write", false),
+        ("row_index_sync", false),
         ("parquet_directory", false),
         ("parquet_wal_header", false),
         ("parquet_wal_payload", false),

@@ -14,7 +14,11 @@ cargo run -p graphfusion --locked -- run --database ./demo-db --create \
 
 Writes first update private Arrow MemTables. At commit, a checksummed WAL record stores the new batches as Arrow IPC, fragment references, deletion masks, catalog changes and identity counters together. The WAL is synchronized before the new snapshot becomes visible or COMMIT succeeds. Recovery reconstructs unsealed MemTables from committed records; a successful write does not require a Parquet file.
 
-Each graph seals its resident fragments when either **65,536 rows** or **16 MiB of Arrow array memory** is reached. Sealing is synchronous at commit: resident rows become database-owned immutable Parquet files, files and their directory are synchronized, then the WAL publishes the new layout. Previously sealed files are reused. Queries read both sealed files and resident batches through DataFusion. Updates to sealed rows log deletion masks and replacement rows; deletes preserve the original file until reclamation is safe.
+Each graph seals its resident fragments when either **65,536 rows** or **16 MiB of Arrow array memory** is reached. Sealing is synchronous at commit: live resident rows become database-owned immutable Parquet files with ID-sorted `.index` sidecars, files and their directory are synchronized, then the WAL publishes the new layout. Previously sealed files are reused. Queries read both sealed files and resident batches through DataFusion. Updates to sealed rows log deletion masks and replacement rows; deletes preserve the original file until reclamation is safe.
+
+Resident fragments keep an ID-to-row lookup and edge adjacency lookup alongside immutable Arrow batches. Updates mask old rows and append replacement batches; deletes set snapshot-specific row bits. Unchanged Arrow buffers remain shared with readers. Fully deleted resident batches are pruned when publishing a durable layout.
+
+Each new Parquet sidecar stores element IDs, original physical row positions and edge endpoints, with a checksum. The runtime loads these immutable indexes lazily, builds file adjacency only when checking or deleting nodes, and keeps separate deletion bitmaps for each snapshot. WAL deletion deltas retain logical IDs; recovery resolves them into physical row positions. Mutation target resolution still uses DataFusion and may scan property columns. Once targets are known, updates gather only affected rows and DETACH DELETE finds incident edges through adjacency lookups. Parquet readers apply physical row selections before decoding selected columns.
 
 Configure the thresholds for all handles sharing the database coordinator:
 
@@ -38,6 +42,6 @@ Recovery reads the manifest/checkpoint and committed WAL, validates referenced g
 
 After opening the directory, the owning process shares its published `main` snapshot between statements. Commits and ID reservations update this state under the coordinator's lock; successful checkpoints advance its WAL generation. A failed checkpoint or post-WAL publication triggers recovery before the state is reused. Checksum and format validation of checkpoints and WAL occurs during recovery, rather than on every statement.
 
-The current format is v4. Older formats are rejected; there is no built-in migration path. Do not edit or delete database files while a database is open. This documentation does not promise compatibility across future format changes.
+The current format remains v4. Existing v4 files without sidecars build their runtime indexes from ID and endpoint columns on first use. Referenced sidecars are validated during recovery; missing or corrupted sidecars fail opening the database. Older formats are rejected; there is no built-in migration path. Do not edit or delete database files while a database is open. This documentation does not promise compatibility across future format changes.
 
 [Checkpointing](/storage/checkpoint/) forces remaining main MemTables to seal, rotates the WAL and reclaims obsolete generations when no active snapshot can use them. There is no automatic checkpoint scheduler.

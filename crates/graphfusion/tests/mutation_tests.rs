@@ -415,3 +415,143 @@ async fn repeated_inserts_do_not_rewrite_one_file_per_previous_row() {
     let result = s.query("MATCH (n:N) RETURN COUNT(*) AS c").await.unwrap();
     assert_eq!(rows(&result), vec![vec!["8"]]);
 }
+
+#[tokio::test]
+async fn detach_indexes_handle_parallel_edges_loops_directions_and_separate_id_spaces() {
+    use graphfusion::{
+        arrow::{
+            array::{Int64Array, UInt64Array},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        },
+        graph::{EdgeTable, GraphData, NodeTable, DESTINATION, ID, SOURCE},
+        StorageOptions,
+    };
+    use std::sync::Arc;
+    for mode in ["memory", "resident", "parquet"] {
+        let dir = Durable::new();
+        let db = if mode == "memory" {
+            Database::new()
+        } else {
+            dir.open()
+        };
+        db.configure_storage(StorageOptions {
+            memtable_max_rows: usize::MAX,
+            memtable_max_bytes: usize::MAX,
+        })
+        .unwrap();
+        let mut s = session(&db);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ID, DataType::UInt64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let nodes = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![10, 20, 30])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let edges = |ids: Vec<u64>, sources: Vec<u64>, destinations: Vec<u64>, directed| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(ID, DataType::UInt64, false),
+                Field::new(SOURCE, DataType::UInt64, false),
+                Field::new(DESTINATION, DataType::UInt64, false),
+                Field::new("v", DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(ids.clone())),
+                    Arc::new(UInt64Array::from(sources)),
+                    Arc::new(UInt64Array::from(destinations)),
+                    Arc::new(Int64Array::from(
+                        ids.iter().map(|id| *id as i64).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap();
+            EdgeTable::try_new(
+                vec![if directed { "E" } else { "U" }.into()],
+                directed,
+                schema,
+                vec![batch],
+            )
+            .unwrap()
+        };
+        s.replace_graph_data(
+            GraphData::try_new(
+                vec![NodeTable::try_new(vec!["N".into()], schema, vec![nodes]).unwrap()],
+                vec![
+                    edges(
+                        vec![10, 20, 30, 40],
+                        vec![10, 10, 10, 20],
+                        vec![20, 20, 10, 30],
+                        true,
+                    ),
+                    edges(vec![50], vec![20], vec![10], false),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        if mode == "parquet" {
+            db.checkpoint().unwrap();
+        }
+        let mut old = db.session();
+        old.execute("SESSION SET GRAPH g; START TRANSACTION READ ONLY")
+            .unwrap();
+        // Property replacement leaves endpoints intact, including in cached adjacency.
+        run(&mut s, "MATCH ()-[e:E {v: 10}]->() SET e.v = 11").await;
+        assert!(s.run("MATCH (n {v: 1}) DELETE n").await.is_err());
+        let deleted = run(&mut s, "MATCH (n {v: 1}) DETACH DELETE n").await;
+        assert_eq!(deleted.affected_elements, 5, "{mode}");
+        assert!(!deleted.physical_plan.contains("NestedLoopJoinExec"));
+        assert_eq!(
+            rows(
+                &s.query("MATCH (n) RETURN n.v AS v ORDER BY v")
+                    .await
+                    .unwrap()
+            ),
+            vec![vec!["2"], vec!["3"]]
+        );
+        assert_eq!(
+            rows(&s.query("MATCH ()-[e:E]->() RETURN e.v AS v").await.unwrap()),
+            vec![vec!["40"]]
+        );
+        assert_eq!(
+            old.query("MATCH (n) RETURN n.v AS v")
+                .await
+                .unwrap()
+                .row_count(),
+            3
+        );
+        assert_eq!(
+            old.query("MATCH ()-[e:E]->() RETURN e.v AS v")
+                .await
+                .unwrap()
+                .row_count(),
+            4
+        );
+        old.execute("COMMIT").unwrap();
+        drop(old);
+        if mode != "memory" {
+            drop(s);
+            drop(db);
+            let db = dir.open();
+            let mut s = db.session();
+            s.execute("SESSION SET GRAPH g").unwrap();
+            assert_eq!(
+                rows(&s.query("MATCH ()-[e:E]->() RETURN e.v AS v").await.unwrap()),
+                vec![vec!["40"]]
+            );
+            assert_eq!(
+                run(&mut s, "MATCH (n {v: 2}) DETACH DELETE n")
+                    .await
+                    .affected_elements,
+                2
+            );
+        }
+    }
+}

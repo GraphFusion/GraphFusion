@@ -35,7 +35,7 @@ The parser also accepts casts, CASE, most string/numeric functions, temporal exp
 ## Operational boundaries
 
 - Query results are fully materialized; there is no streaming or prepared-statement API.
-- Writes use WAL-backed MemTables and threshold-based Parquet sealing; updates preserve sealed files with deletion masks. There are no indexes or background compaction.
+- Writes use WAL-backed MemTables and threshold-based Parquet sealing; updates preserve sealed files with deletion masks. ID/row-position and edge adjacency indexes support mutations. Property indexes and background compaction are not implemented.
 - Durable storage targets a local Linux/macOS filesystem, not network filesystems or object storage.
 - Format v4 has no migration from older formats.
 - There is no server protocol, authentication service or distributed transaction coordinator.
