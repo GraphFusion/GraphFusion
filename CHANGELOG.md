@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.3.0 — Unreleased
+
 ## 0.2.0 — 2026-10-05
 
 - Add typed AST visitors and deterministic tree dumps covering every stored AST
