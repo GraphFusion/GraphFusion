@@ -1,10 +1,12 @@
 ---
 import '../styles/playground.css';
 import { examples } from '../playground/examples';
+import { analyticsHead } from '../analytics.mjs';
 ---
 <!doctype html>
 <html lang="en">
 <head>
+  {analyticsHead.map(({ tag: Tag, attrs, content }) => <Tag {...attrs} set:html={content} />)}
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Playground · GraphFusion</title>
   <meta name="description" content="Explore GQL queries and visualize their results with GraphFusion running entirely in your browser." />

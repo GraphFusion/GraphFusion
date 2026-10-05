@@ -1,9 +1,11 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import { analyticsHead } from './src/analytics.mjs';
 export default defineConfig({
   site: 'https://graphfusion.github.io',
   trailingSlash: 'always',
   integrations: [starlight({
+    head: analyticsHead,
     title: 'GraphFusion',
     description: 'An embedded graph database in Rust. Query property graphs with GQL, execute with Apache DataFusion, and store data in Arrow and Parquet.',
     favicon: '/favicon.svg',
