@@ -8,6 +8,7 @@ import gzip
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = '0.2.128'
+BINARYEN_VERSION = '133'
 env = os.environ.copy()
 if sys.platform == 'darwin' and not env.get('CC_wasm32_unknown_unknown'):
     # Apple's system clang has no WebAssembly backend. Homebrew LLVM does.
@@ -23,6 +24,9 @@ if installed != f'wasm-bindgen {VERSION}':
     sys.exit(f'Expected wasm-bindgen {VERSION}; found {installed}')
 if not shutil.which('wasm-opt'):
     sys.exit('Install Binaryen (wasm-opt) to optimize the browser engine. See development/browser-playground.')
+optimizer = subprocess.check_output(['wasm-opt', '--version'], text=True).strip()
+if optimizer != f'wasm-opt version {BINARYEN_VERSION}':
+    sys.exit(f'Expected Binaryen {BINARYEN_VERSION}; found {optimizer}. Older optimizers can break the browser engine. See development/browser-playground.')
 subprocess.run(['cargo', 'build', '--locked', '-p', 'graphfusion-wasm',
                 '--target', 'wasm32-unknown-unknown', '--profile', 'wasm'], cwd=ROOT, env=env, check=True)
 output = ROOT / 'website/public/wasm'

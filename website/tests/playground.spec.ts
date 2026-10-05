@@ -3,9 +3,22 @@ test.setTimeout(120_000);
 
 async function open(page: Page) {
   await page.goto("/playground/");
+  await page.waitForFunction(
+    () =>
+      !document.getElementById("error")!.hidden ||
+      document
+        .getElementById("graph-counts")!
+        .textContent!.includes("11 nodes · 17 relationships"),
+    undefined,
+    { timeout: 90_000 },
+  );
+  const alert = page.locator("#error");
+  await expect(
+    alert,
+    (await alert.textContent()) || "The browser engine should initialize.",
+  ).toBeHidden();
   await expect(page.locator("#graph-counts")).toContainText(
     "11 nodes · 17 relationships",
-    { timeout: 90_000 },
   );
   await expect(
     page.getByRole("button", { name: "Run query", exact: true }),

@@ -11,14 +11,16 @@ The optional core `visualization` feature captures labels, properties and edge e
 
 ## Toolchain
 
-Install the project's Rust toolchain, a C compiler with a WebAssembly backend, the matching wasm-bindgen CLI and Binaryen:
+Install the project's Rust toolchain, a C compiler with a WebAssembly backend, the matching wasm-bindgen CLI and Binaryen 133:
 
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.128 --locked
 ```
 
-On macOS, `brew install llvm binaryen` supplies the compiler and optimizer. The build script locates Homebrew LLVM without changing your shell configuration. On Ubuntu, install `clang` and `binaryen`.
+On macOS, `brew install llvm binaryen` supplies the compiler and optimizer. The build script locates Homebrew LLVM without changing your shell configuration. Check that `wasm-opt --version` reports `wasm-opt version 133`.
+
+On Ubuntu, install `clang` and download the matching archive from the [official Binaryen 133 release](https://github.com/WebAssembly/binaryen/releases/tag/version_133), then add its `bin/` directory to `PATH`. CI verifies the release checksum. The Ubuntu 24.04 `binaryen` package is version 108; its optimized engine fails during initialization when growing the external-reference table. The build script rejects mismatched optimizer versions before compiling.
 
 ## Build and test
 
