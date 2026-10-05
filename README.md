@@ -17,22 +17,22 @@ RETURN next.name AS friend_of_friend;
 
 ## Try it
 
-The development checkout includes a [browser Playground](website/src/content/docs/start/playground.md)
+The documentation includes a [browser Playground](website/src/content/docs/start/playground.md)
 with a real WebAssembly engine and an interactive graph view. See the
 [browser build guide](website/src/content/docs/development/browser-playground.md)
 to run it locally. Queries execute in the browser; the initial version keeps
 the database in memory.
 
-Install the 0.1.1 CLI from crates.io:
+Install the 0.2.0 CLI from crates.io:
 
 ```sh
-cargo install graphfusion --version 0.1.1 --locked
+cargo install graphfusion --version 0.2.0 --locked
 graphfusion run --query 'RETURN 6 * 7 AS answer'
 ```
 
-For the Rust library, add `graphfusion = "0.1.1"` to your dependencies.
+For the Rust library, add `graphfusion = "0.2.0"` to your dependencies.
 
-From a repository checkout, start an interactive database REPL (0.2.0 development):
+From a repository checkout, start an interactive database REPL:
 
 ```sh
 cargo run -p graphfusion --locked -- ./demo-db
@@ -54,7 +54,7 @@ Add `--database ./demo-db --create` to keep the graph in a new local database
 directory. Use the [Rust API](https://graphfusion.github.io/rust/embedding/)
 to embed GraphFusion and consume Arrow results directly.
 
-To inspect a query's AST without executing it (0.2.0 development):
+To inspect a query's AST without executing it:
 
 ```sh
 cargo run -p graphfusion --locked -- run --dump-ast --query 'MATCH (p:Person) RETURN p.name AS name;'

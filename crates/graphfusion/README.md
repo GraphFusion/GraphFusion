@@ -11,7 +11,7 @@ graphs with GQL, consume Apache Arrow results, and persist data in Apache Parque
 
 ```toml
 [dependencies]
-graphfusion = "0.1.1"
+graphfusion = "0.2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## CLI
 
 ```sh
-cargo install graphfusion --version 0.1.1 --locked
+cargo install graphfusion --version 0.2.0 --locked
 graphfusion run --query 'RETURN 6 * 7 AS answer'
 ```
 

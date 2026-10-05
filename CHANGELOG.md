@@ -1,6 +1,20 @@
 # Changelog
 
-## 0.2.0 — Unreleased
+## 0.2.0 — 2026-10-05
+
+- Add typed AST visitors and deterministic tree dumps covering every stored AST
+  field, with traversal hooks, early termination and checked-in output snapshots.
+- Persist committed Arrow MemTables in the WAL and seal them to immutable Parquet
+  files at configurable row or memory thresholds. Recovery restores unsealed
+  batches; checkpoint seals remaining main-branch data.
+- Index graph mutations with resident ID and adjacency lookups, Parquet index
+  sidecars and snapshot-specific deletion vectors. Updates reuse unchanged
+  buffers and files; selected Parquet rows are filtered before decoding.
+- Reduce catalog and transaction overhead with copy-on-write catalog entries,
+  encoded name keys, child/dependency indexes and shared persistent main state.
+- Add a browser Playground powered by WebAssembly, with an in-memory GQL engine
+  and interactive graph visualization. The optional `visualization` feature
+  captures graph identities and properties from each query's source snapshot.
 
 - Record immutable commit snapshots and named branch refs. A branch starts at
   the current `main` snapshot; later commits move only that ref, and checkpoint
@@ -20,7 +34,8 @@
   until its last handle drops. Threads in that process share the coordinator and
   execute through independent sessions; other processes receive `DatabaseInUse`.
   Recovery after `CommitUnknown` requires dropping all database/session handles.
-
+- Breaking: the persistent disk format is now v4. Older database directories are
+  rejected, and no built-in migration is provided.
 - Breaking: rename the parser's Rust library from `graphfusion_gql_parser` to
   `gql_parser`, following Cargo's default for the `gql-parser` package. Update
   Rust import paths when upgrading; the package name remains `gql-parser`.
