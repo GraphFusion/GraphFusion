@@ -4,11 +4,11 @@ use crate::{
     storage::{StorageChange, StorageSnapshot},
     Database, Error, Result,
 };
+use datafusion::common::instant::Instant;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     sync::{atomic::Ordering, Arc},
-    time::Instant,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

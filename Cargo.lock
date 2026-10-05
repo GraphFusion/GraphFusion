@@ -404,7 +404,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -435,6 +437,16 @@ checksum = "958c5d6ecf1f214b4c2bbbbf6ab9523a864bd136dcf71a7e8904799acfe1ad47"
 dependencies = [
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1370,9 +1382,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1402,13 +1416,26 @@ version = "0.2.0-dev"
 dependencies = [
  "async-trait",
  "base64",
+ "chrono",
  "datafusion",
+ "getrandom 0.3.4",
  "gql-parser",
  "rustyline",
  "serde",
  "serde_json",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "graphfusion-wasm"
+version = "0.2.0-dev"
+dependencies = [
+ "console_error_panic_hook",
+ "graphfusion",
+ "serde_json",
+ "tokio",
+ "wasm-bindgen",
 ]
 
 [[package]]

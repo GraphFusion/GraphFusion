@@ -2,6 +2,7 @@
 members = [
     "crates/graphfusion",
     "crates/gql-parser",
+    "crates/graphfusion-wasm",
 ]
 resolver = "2"
 
@@ -15,3 +16,12 @@ homepage = "https://graphfusion.github.io/"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Optimize the browser bundle without expensive workspace-wide LTO.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+debug = false
+strip = "debuginfo"
+lto = "thin"
+codegen-units = 1

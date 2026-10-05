@@ -27,3 +27,4 @@ target
 /website/test-results/
 /website/playwright-report/
 /website/legacy-dist/
+/website/public/wasm/

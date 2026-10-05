@@ -23,6 +23,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+#[cfg(not(target_family = "wasm"))]
 fn table_url(path: &Path) -> Result<ListingTableUrl> {
     // Plain paths are interpreted as glob patterns by ListingTableUrl::parse.
     let url = url::Url::from_file_path(path)
@@ -30,6 +31,13 @@ fn table_url(path: &Path) -> Result<ListingTableUrl> {
     ListingTableUrl::try_new(url, None).map_err(|error| {
         Error::UnsupportedFeature(format!("unscannable Parquet database path: {error}"))
     })
+}
+
+#[cfg(target_family = "wasm")]
+fn table_url(_: &Path) -> Result<ListingTableUrl> {
+    Err(Error::UnsupportedFeature(
+        "local Parquet files are unavailable in the browser".into(),
+    ))
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
