@@ -319,6 +319,35 @@ pub(super) fn scan(
     kind: ElementKind,
     direction: Option<ast::Direction>,
 ) -> Result<(LogicalPlan, ElementBinding)> {
+    scan_tables(scope, graph_id, graph, kind, direction, None)
+}
+
+pub(super) fn scan_insert(
+    scope: &mut Bindings,
+    graph_id: ObjectId,
+    graph: &GraphData,
+    kind: ElementKind,
+    inserted: &Table,
+    directed: bool,
+) -> Result<(LogicalPlan, ElementBinding)> {
+    scan_tables(
+        scope,
+        graph_id,
+        graph,
+        kind,
+        None,
+        Some((inserted, directed)),
+    )
+}
+
+fn scan_tables(
+    scope: &mut Bindings,
+    graph_id: ObjectId,
+    graph: &GraphData,
+    kind: ElementKind,
+    direction: Option<ast::Direction>,
+    inserted: Option<(&Table, bool)>,
+) -> Result<(LogicalPlan, ElementBinding)> {
     let tables: Vec<(&Table, bool)> = match kind {
         ElementKind::Node => graph.nodes.iter().map(|table| (&table.0, false)).collect(),
         ElementKind::Edge => graph
@@ -354,7 +383,8 @@ pub(super) fn scan(
     // per element kind.
     let scan_name = format!("__gf_scan_{}", scope.next);
     let mut branches = Vec::new();
-    for (table, directed) in tables {
+    let scanned = inserted.map_or(tables, |t| vec![t]);
+    for (table, directed) in scanned {
         let orientations = match direction {
             None => vec![false],
             Some(ast::Direction::Right) if directed => vec![false],

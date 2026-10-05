@@ -35,9 +35,9 @@ The parser also accepts casts, CASE, most string/numeric functions, temporal exp
 ## Operational boundaries
 
 - Query results are fully materialized; there is no streaming or prepared-statement API.
-- Updates rewrite the affected graph; there are no indexes or incremental Parquet deltas.
+- Writes use WAL-backed MemTables and threshold-based Parquet sealing; updates preserve sealed files with deletion masks. There are no indexes or background compaction.
 - Durable storage targets a local Linux/macOS filesystem, not network filesystems or object storage.
-- Format v3 has no migration from older formats.
+- Format v4 has no migration from older formats.
 - There is no server protocol, authentication service or distributed transaction coordinator.
 
 Unsupported operations return errors. Successful parsing alone is not an execution or conformance test. See [limits](/storage/limits/) before running expensive path searches.

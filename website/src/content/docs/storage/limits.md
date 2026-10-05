@@ -27,10 +27,12 @@ Candidate enumeration currently happens before path ranking. Dense graphs, paral
 
 ## Storage and API
 
-- Graph updates materialize and rewrite the complete affected graph.
+[MemTable thresholds](/storage/persistence/) default to 65,536 resident rows or 16 MiB of Arrow array buffers per graph. Sealing happens synchronously at commit. Limits do not bound private transaction memory or historical snapshots; multiple graphs each have their own budget. WAL retains committed deltas until a successful checkpoint. Resident updates log removals and replacement batches; append-only writes record only new batches. Mutation plans can still scan/filter existing data in memory.
+
+- Inserts append to resident fragments without reading previously sealed files. Updates and deletes currently materialize the affected graph to evaluate their plans, but preserve sealed files using deletion masks and resident replacement rows.
 - Results are materialized; no streaming/prepared query API is exposed.
 - Metadata records have a 64 MiB limit; unsupported definition nesting is rejected before publication.
-- Persistent statement startup reloads recovery metadata and validates Parquet footers.
-- Typed graph data operations, indexes, incremental file deltas and format migrations are not implemented.
+- Persistent startup replays committed WAL records and validates referenced files once. Subsequent statements share the published snapshot; failed checkpoint/publication requires recovery.
+- Typed graph data operations, indexes, background sealing, automatic checkpoint scheduling, deletion-mask compaction and format migrations are not implemented.
 
 The [support matrix](/start/status/) separates these execution limits from parser coverage.

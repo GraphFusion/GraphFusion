@@ -31,6 +31,6 @@ GraphFusion is under active development. The parser recognizes more of GQL than 
 
 ## When to use it
 
-Start here if you want to experiment with GQL over columnar graph data, embed graph queries in a Rust application, or contribute to a DataFusion-based graph engine. Expect materialized results, graph-wide rewrites for updates and explicit resource limits. There is no network server, distributed execution service or stable on-disk migration path yet.
+Start here if you want to experiment with GQL over columnar graph data, embed graph queries in a Rust application, or contribute to a DataFusion-based graph engine. Expect materialized results, graph materialization for updates and explicit resource limits. There is no network server, distributed execution service or stable on-disk migration path yet.
 
 [Run your first graph query →](/start/quickstart/)

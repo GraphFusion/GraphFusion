@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-A checkpoint writes a new durable snapshot and WAL generation, then permits obsolete storage generations to be reclaimed. The database must have no active statement or transaction snapshots in its owning process.
+A checkpoint seals remaining main-branch MemTables to Parquet, writes a new durable snapshot and WAL generation, then permits obsolete storage generations to be reclaimed. File IDs are durably reserved before sealing; recovery uses either the old WAL or the new checkpoint if the process stops during this operation. The database must have no active statement or transaction snapshots in its owning process.
 
 ```sh
 cargo run -p graphfusion --locked -- checkpoint --database ./demo-db

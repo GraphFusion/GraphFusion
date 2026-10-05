@@ -527,7 +527,7 @@ fn cli_import_query_and_checkpoint_survive_independent_processes() {
     let query = "USE GRAPH social MATCH (a:Person {name: 'Alice'})-[:Knows]->(b)-[:Knows]->(c) RETURN c.name AS friend";
     let output = fixture.run("run", &["--query", query, "--explain"]);
     assert!(output.contains("Cara"), "{output}");
-    assert!(output.contains("file_type=parquet"), "{output}");
+    assert!(output.contains("partition_sizes="), "{output}");
     assert!(output.contains("HashJoinExec"), "{output}");
     fixture.run("checkpoint", &[]);
     assert!(fixture.run("run", &["--query", query]).contains("Cara"));
@@ -718,7 +718,7 @@ fn cli_executes_persistent_gql_mutations_without_an_external_import() {
         ],
     );
     assert!(result.contains("31"));
-    assert!(result.contains("file_type=parquet"));
+    assert!(result.contains("partition_sizes="));
     let result = fixture.invoke(
         "run",
         &["--query", "USE GRAPH g MATCH (a {name: 'Alice'}) DELETE a"],

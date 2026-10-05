@@ -1401,6 +1401,7 @@ name = "graphfusion"
 version = "0.2.0-dev"
 dependencies = [
  "async-trait",
+ "base64",
  "datafusion",
  "gql-parser",
  "rustyline",

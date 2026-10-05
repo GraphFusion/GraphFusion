@@ -268,7 +268,7 @@ async fn failure_in_later_clause_or_result_rolls_back_all_graph_changes() {
                 .extension()
                 .is_some_and(|e| e == "parquet"))
             .count(),
-        1
+        0
     );
 }
 
@@ -406,7 +406,7 @@ async fn repeated_inserts_do_not_rewrite_one_file_per_previous_row() {
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".parquet"))
         .count();
-    assert!(files <= 8, "parquet files: {files}");
+    assert_eq!(files, 0, "small inserts must remain in MemTable");
     drop(s);
     drop(db);
     let db = dir.open();

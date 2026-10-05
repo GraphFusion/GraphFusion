@@ -37,6 +37,11 @@ pub(crate) struct Table {
     pub row_count: usize,
     /// Parquet object id still holding these exact rows. Cleared when the rows change.
     pub file_id: Option<u64>,
+    /// Stable WAL identity of a resident fragment; preserved only by append_rows.
+    pub memory_id: Option<u64>,
+    pub deleted_ids: BTreeSet<u64>,
+    /// Row removals from this transaction's resident base, replayed before new batches.
+    pub memory_deleted_ids: BTreeSet<u64>,
 }
 impl NodeTable {
     /// Reads an external Parquet table and validates it for a subsequent graph import.
@@ -162,6 +167,9 @@ impl Table {
             batches,
             provider,
             file_id: None,
+            memory_id: None,
+            deleted_ids: BTreeSet::new(),
+            memory_deleted_ids: BTreeSet::new(),
         })
     }
 
@@ -187,10 +195,74 @@ impl Table {
             self.schema.clone(),
             vec![batches.clone()],
         )?);
+        self.memory_deleted_ids.extend(extra.memory_deleted_ids);
         self.batches = batches;
         self.row_count = self.batches.iter().map(RecordBatch::num_rows).sum();
         self.provider = provider;
         self.file_id = None;
+        Ok(())
+    }
+    /// Masks rows of an immutable file without rewriting it. The caller supplies only
+    /// IDs that occur in this fragment, after evaluating its mutation plan.
+    pub(crate) fn mask_rows(&mut self, ids: &BTreeSet<u64>) -> Result<()> {
+        use datafusion::arrow::{array::BooleanArray, compute::filter_record_batch};
+        let new: BTreeSet<_> = if self.file_id.is_some() {
+            ids.difference(&self.deleted_ids).copied().collect()
+        } else {
+            self.memory_deleted_ids.extend(ids.iter().copied());
+            self.ids(ID).filter(|id| ids.contains(id)).collect()
+        };
+        if new.is_empty() {
+            return Ok(());
+        }
+        self.row_count = self
+            .row_count
+            .checked_sub(new.len())
+            .ok_or_else(|| Error::Corrupt("too many masked rows".into()))?;
+        if self.file_id.is_some() {
+            self.deleted_ids.extend(new.iter().copied());
+        }
+        if !self.batches.is_empty() {
+            self.batches = self
+                .batches
+                .iter()
+                .map(|batch| {
+                    let values = batch
+                        .column_by_name(ID)
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    let keep = BooleanArray::from(
+                        values
+                            .values()
+                            .iter()
+                            .map(|id| !new.contains(id))
+                            .collect::<Vec<_>>(),
+                    );
+                    filter_record_batch(batch, &keep)
+                        .map_err(datafusion::error::DataFusionError::from)
+                        .map_err(Error::from)
+                })
+                .collect::<Result<_>>()?;
+            self.provider = Arc::new(MemTable::try_new(
+                self.schema.clone(),
+                vec![self.batches.clone()],
+            )?);
+        } else {
+            use datafusion::{
+                datasource::{provider_as_source, ViewTable},
+                logical_expr::{col, lit, LogicalPlanBuilder},
+            };
+            let plan = LogicalPlanBuilder::scan(
+                "__gf_masked",
+                provider_as_source(self.provider.clone()),
+                None,
+            )?
+            .filter(col(ID).in_list(new.iter().map(|id| lit(*id)).collect(), true))?
+            .build()?;
+            self.provider = Arc::new(ViewTable::new(plan, None));
+        }
         Ok(())
     }
     pub fn ids<'a>(&'a self, column: &'a str) -> impl Iterator<Item = u64> + 'a {
@@ -251,7 +323,40 @@ impl GraphData {
         }
         property_types(nodes.iter().map(|t| &t.0))?;
         property_types(edges.iter().map(|t| &t.table))?;
-        Ok(Self { nodes, edges })
+        // Keep one resident fragment per layout, even after repeated row updates.
+        let mut compact_nodes: Vec<NodeTable> = Vec::new();
+        for node in nodes {
+            if node.0.file_id.is_none() {
+                if let Some(existing) = compact_nodes.iter_mut().find(|t| {
+                    t.0.file_id.is_none()
+                        && t.0.labels == node.0.labels
+                        && t.0.schema == node.0.schema
+                }) {
+                    existing.0.append_rows(node.0)?;
+                    continue;
+                }
+            }
+            compact_nodes.push(node);
+        }
+        let mut compact_edges: Vec<EdgeTable> = Vec::new();
+        for edge in edges {
+            if edge.table.file_id.is_none() {
+                if let Some(existing) = compact_edges.iter_mut().find(|e| {
+                    e.table.file_id.is_none()
+                        && e.directed == edge.directed
+                        && e.table.labels == edge.table.labels
+                        && e.table.schema == edge.table.schema
+                }) {
+                    existing.table.append_rows(edge.table)?;
+                    continue;
+                }
+            }
+            compact_edges.push(edge);
+        }
+        Ok(Self {
+            nodes: compact_nodes,
+            edges: compact_edges,
+        })
     }
     pub fn node_count(&self) -> usize {
         self.nodes.iter().map(|t| t.0.row_count).sum()

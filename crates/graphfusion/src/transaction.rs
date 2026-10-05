@@ -280,72 +280,16 @@ impl StatementTxn {
             generation: storage,
             next: next_element_id,
         });
-        if self.db.inner.disk.is_some() {
-            let previous = self
-                .base
-                .storage
-                .generations
-                .get(&storage)
-                .and_then(|generation| generation.parquet.clone());
-            let reuse = |table: &crate::graph::Table| {
-                let id = table.file_id?;
-                let manifest = previous.as_ref()?;
-                manifest
-                    .tables()
-                    .find(|existing| existing.id == id)
-                    .filter(|existing| {
-                        existing.labels == table.labels
-                            && existing.schema.as_ref() == table.schema.as_ref()
-                            && existing.rows == table.row_count
-                    })
-            };
-            let mut manifest = crate::parquet::GraphManifest::default();
-            for table in &data.nodes {
-                if let Some(existing) = reuse(&table.0) {
-                    manifest.nodes.push(existing.clone());
-                    continue;
-                }
-                let id = self.allocate_id()?;
-                manifest.nodes.push(
-                    self.db
-                        .inner
-                        .disk
-                        .as_ref()
-                        .unwrap()
-                        .write_graph_table(id, &table.0)?,
-                );
-            }
-            for edge in &data.edges {
-                if let Some(existing) = reuse(&edge.table) {
-                    manifest.edges.push(crate::parquet::EdgeManifest {
-                        table: existing.clone(),
-                        directed: edge.directed,
-                    });
-                    continue;
-                }
-                let id = self.allocate_id()?;
-                manifest.edges.push(crate::parquet::EdgeManifest {
-                    table: self
-                        .db
-                        .inner
-                        .disk
-                        .as_ref()
-                        .unwrap()
-                        .write_graph_table(id, &edge.table)?,
-                    directed: edge.directed,
-                });
-            }
-            self.db.inner.disk.as_ref().unwrap().finish_graph_files()?;
-            self.storage_changes.push(StorageChange::ReplaceParquet {
-                generation: storage,
-                manifest: Arc::new(manifest),
-            });
-        } else {
-            self.storage_changes.push(StorageChange::ReplaceGraph {
-                generation: storage,
-                data: Arc::new(data),
-            });
-        }
+        // Private changes stay in Arrow memory until commit. Collapsing repeated replacements
+        // also prevents explicit transactions from sealing each intermediate statement.
+        self.storage_changes.retain(|change| {
+            !matches!(change,
+            StorageChange::ReplaceGraph { generation, .. } if *generation == storage)
+        });
+        self.storage_changes.push(StorageChange::ReplaceGraph {
+            generation: storage,
+            data: Arc::new(data),
+        });
         Ok(())
     }
     pub fn allocate_element_ids(&mut self, graph: ObjectId, count: usize) -> Result<Vec<u64>> {
@@ -519,7 +463,7 @@ impl StatementTxn {
         self.changes.push(CatalogChange::Delete(id));
         Ok(())
     }
-    pub fn commit(self) -> Result<CommitSeq> {
+    pub fn commit(mut self) -> Result<CommitSeq> {
         self.db.check_healthy()?;
         if self.branch != "main" {
             return self.commit_branch();
@@ -527,6 +471,7 @@ impl StatementTxn {
         if self.changes.is_empty() && self.storage_changes.is_empty() {
             return Ok(self.base.commit_seq);
         }
+        self.prepare_graph_changes()?;
         let started = Instant::now();
         let mut state = self.db.inner.state.lock().map_err(|_| Error::Poisoned)?;
         self.db.check_healthy()?;
@@ -572,9 +517,7 @@ impl StatementTxn {
         }
         crate::persistence::failpoint("before_publish");
         let seq = candidate.commit_seq;
-        if let Some(disk) = &self.db.inner.disk {
-            disk.publish_main_snapshot(&candidate)?;
-        } else {
+        if self.db.inner.disk.is_none() {
             self.db.note_main_commit(&candidate)?;
         }
         state.published = candidate;
@@ -586,10 +529,11 @@ impl StatementTxn {
             .fetch_add(1, Ordering::Relaxed);
         Ok(seq)
     }
-    fn commit_branch(self) -> Result<CommitSeq> {
+    fn commit_branch(mut self) -> Result<CommitSeq> {
         if self.changes.is_empty() && self.storage_changes.is_empty() {
             return Ok(self.base.commit_seq);
         }
+        self.prepare_graph_changes()?;
         let expected = self
             .tip
             .ok_or_else(|| Error::Corrupt("branch has no snapshot".into()))?;
@@ -626,8 +570,20 @@ impl StatementTxn {
                 return Err(Error::Conflict("branch moved".into()));
             }
             let id = disk.allocate_commit_id()?;
-            disk.write_commit(id, Some(expected), &candidate)?;
-            disk.write_ref(&self.branch, id)?;
+            disk.write_branch_delta(id, expected, candidate.next_id, record)?;
+            if let Err(error) = disk.write_ref(&self.branch, id) {
+                self.db.inner.unhealthy.store(true, Ordering::SeqCst);
+                return Err(match error {
+                    Error::Io(error) => Error::CommitUnknown(error),
+                    error => error,
+                });
+            }
+            self.db
+                .inner
+                .branch_cache
+                .lock()
+                .map_err(|_| Error::Poisoned)?
+                .insert(self.branch.clone(), (id, Arc::new(candidate)));
         } else {
             self.db
                 .publish_branch_commit(&self.branch, expected, candidate)?;
@@ -638,6 +594,148 @@ impl StatementTxn {
             .commits
             .fetch_add(1, Ordering::Relaxed);
         Ok(seq)
+    }
+    fn prepare_graph_changes(&mut self) -> Result<()> {
+        if self.db.inner.disk.is_none() {
+            return Ok(());
+        }
+        let options = *self
+            .db
+            .inner
+            .storage_options
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
+        let changes = std::mem::take(&mut self.storage_changes);
+        for change in changes {
+            let StorageChange::ReplaceGraph { generation, data } = change else {
+                self.storage_changes.push(change);
+                continue;
+            };
+            let previous = self
+                .base
+                .storage
+                .generations
+                .get(&generation)
+                .and_then(|g| g.parquet.as_deref())
+                .cloned()
+                .unwrap_or_default();
+            let resident = data
+                .nodes
+                .iter()
+                .map(|t| &t.0)
+                .chain(data.edges.iter().map(|e| &e.table))
+                .filter(|t| t.file_id.is_none());
+            let (rows, bytes) = resident.fold((0usize, 0usize), |(rows, bytes), t| {
+                (
+                    rows.saturating_add(t.row_count),
+                    bytes.saturating_add(
+                        t.batches
+                            .iter()
+                            .map(|b| b.get_array_memory_size())
+                            .sum::<usize>(),
+                    ),
+                )
+            });
+            let seal = rows >= options.memtable_max_rows || bytes >= options.memtable_max_bytes;
+            let nodes = data
+                .nodes
+                .iter()
+                .map(|t| self.prepare_table(&t.0, &previous.nodes, seal))
+                .collect::<Result<_>>()?;
+            let old_edges: Vec<_> = previous.edges.iter().map(|e| e.table.clone()).collect();
+            let edges = data
+                .edges
+                .iter()
+                .map(|e| {
+                    Ok(crate::memtable::EdgeChange {
+                        table: self.prepare_table(&e.table, &old_edges, seal)?,
+                        directed: e.directed,
+                    })
+                })
+                .collect::<Result<_>>()?;
+            if seal {
+                self.db.inner.disk.as_ref().unwrap().finish_graph_files()?;
+            }
+            self.storage_changes.push(StorageChange::BufferGraph {
+                generation,
+                nodes,
+                edges,
+            });
+        }
+        crate::persistence::failpoint("memtable_prepare");
+        Ok(())
+    }
+    fn prepare_table(
+        &mut self,
+        table: &crate::graph::Table,
+        previous: &[crate::memtable::Fragment],
+        seal: bool,
+    ) -> Result<crate::memtable::TableChange> {
+        use crate::memtable::{Batches, Fragment, MemoryTable, TableChange};
+        if let Some(id) = table.file_id {
+            if let Some(Fragment::Parquet(old)) = previous.iter().find(|t| t.id() == id) {
+                if !old.deleted_ids.is_subset(&table.deleted_ids) {
+                    return Err(Error::Corrupt("immutable masks regressed".into()));
+                }
+                let deleted_ids: std::collections::BTreeSet<_> = table
+                    .deleted_ids
+                    .difference(&old.deleted_ids)
+                    .copied()
+                    .collect();
+                return if deleted_ids.is_empty() {
+                    Ok(TableChange::Reuse(id))
+                } else {
+                    Ok(TableChange::Mask { id, deleted_ids })
+                };
+            }
+            return Err(Error::Corrupt("missing immutable table reference".into()));
+        }
+        if seal && table.row_count != 0 {
+            let id = self.allocate_id()?;
+            return Ok(TableChange::Parquet(
+                self.db
+                    .inner
+                    .disk
+                    .as_ref()
+                    .unwrap()
+                    .write_graph_table(id, table)?,
+            ));
+        }
+        let old = table.memory_id.and_then(|id| {
+            previous.iter().find_map(|f| match f {
+                Fragment::Memory(t) if t.id == id => Some(t),
+                _ => None,
+            })
+        });
+        let start = old.map_or(0, |t| t.data.batches.len());
+        if start > table.batches.len() {
+            return Err(Error::Corrupt("MemTable batches regressed".into()));
+        }
+        if let Some(old) = old {
+            if start == table.batches.len() && table.memory_deleted_ids.is_empty() {
+                return Ok(TableChange::Reuse(old.id));
+            }
+        }
+        let id = match old {
+            Some(t) => t.id,
+            None => self.allocate_id()?,
+        };
+        Ok(TableChange::Memory {
+            table: MemoryTable {
+                id,
+                labels: table.labels.clone(),
+                data: Batches {
+                    schema: table.schema.clone(),
+                    batches: table.batches[start..].to_vec(),
+                },
+            },
+            append: old.is_some(),
+            deleted_ids: if old.is_some() {
+                table.memory_deleted_ids.clone()
+            } else {
+                Default::default()
+            },
+        })
     }
     fn validate(&self, current: &PublishedState) -> Result<()> {
         for (generation, version) in &self.graph_versions {

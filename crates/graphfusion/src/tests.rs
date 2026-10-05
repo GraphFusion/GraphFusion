@@ -158,13 +158,20 @@ impl TestDir {
         Self(path)
     }
     fn open(&self) -> Database {
-        Database::open(
+        let db = Database::open(
             &self.0,
             OpenOptions {
                 create_if_missing: true,
             },
         )
-        .unwrap()
+        .unwrap();
+        // These legacy protocol tests exercise sealing on every commit.
+        db.configure_storage(StorageOptions {
+            memtable_max_rows: 1,
+            memtable_max_bytes: 1,
+        })
+        .unwrap();
+        db
     }
 }
 impl Drop for TestDir {
@@ -1216,7 +1223,7 @@ fn persistent_main_state_is_shared_across_statements_and_reservations() {
 }
 
 #[test]
-fn failed_main_snapshot_publication_recovers_before_commit_and_branch_creation() {
+fn lazy_main_snapshot_failures_do_not_block_wal_commits() {
     let dir = TestDir::new();
     let db = dir.open();
     create_graph(&db, "g");
@@ -1229,12 +1236,14 @@ fn failed_main_snapshot_publication_recovers_before_commit_and_branch_creation()
     stale
         .create(ROOT_DIRECTORY, "durable", ObjectDefinition::Schema)
         .unwrap();
-    // Make secondary snapshot publication fail after the canonical WAL commit.
+    // Lazy branch snapshots are independent of canonical WAL commits.
+    db.branches().unwrap();
     let main = dir.0.join("refs/main");
     let saved = dir.0.join("refs/main.saved");
     fs::rename(&main, &saved).unwrap();
     fs::create_dir(&main).unwrap();
-    assert!(matches!(writer.commit(), Err(Error::Io(_))));
+    writer.commit().unwrap();
+    assert!(matches!(db.create_branch("blocked"), Err(Error::Io(_))));
     fs::remove_dir(&main).unwrap();
     fs::rename(&saved, &main).unwrap();
     assert!(matches!(stale.commit(), Err(Error::Conflict(_))));
@@ -1287,6 +1296,7 @@ fn failed_checkpoint_recovers_the_selected_wal_generation() {
         let dir = TestDir::new();
         let db = dir.open();
         let (_, keeper) = seed(&db);
+        db.branches().unwrap();
         let blocker = if switched {
             // Reclamation reads branch refs after MANIFEST has selected the new WAL.
             let path = dir.0.join("refs/broken");
@@ -1843,6 +1853,13 @@ fn child_worker() {
 }
 
 fn worker(db: Database, mode: &str, name: &str, barrier: impl FnOnce()) -> String {
+    if !mode.starts_with("memtable_") {
+        db.configure_storage(StorageOptions {
+            memtable_max_rows: 1,
+            memtable_max_bytes: 1,
+        })
+        .unwrap();
+    }
     let mut outcome = String::new();
     match mode {
         "recovery_write" => {
@@ -1937,12 +1954,20 @@ fn worker(db: Database, mode: &str, name: &str, barrier: impl FnOnce()) -> Strin
             );
             outcome.push_str("GF_OLD_OK");
         }
-        "explicit_crash" | "explicit_io" => {
+        "explicit_crash"
+        | "explicit_io"
+        | "memtable_write"
+        | "memtable_io"
+        | "memtable_branch_write"
+        | "memtable_branch_io" => {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let mut s = db.session();
+            if mode.starts_with("memtable_branch_") {
+                s.set_branch("dev").unwrap();
+            }
             s.execute("SESSION SET GRAPH g; START TRANSACTION").unwrap();
             runtime.block_on(s.run("INSERT (:N {v: 2}); CREATE GRAPH atomic_marker ANY GRAPH; INSERT (:N {v: 3}); DROP GRAPH doomed; CREATE GRAPH second ANY GRAPH; USE GRAPH second INSERT (:N {v: 9})")).unwrap();
-            if mode == "explicit_io" {
+            if mode == "explicit_io" || mode == "memtable_io" || mode == "memtable_branch_io" {
                 let mut reader = db.session();
                 reader.execute("START TRANSACTION READ ONLY").unwrap();
                 assert!(matches!(s.execute("COMMIT"), Err(Error::CommitUnknown(_))));
@@ -2038,7 +2063,7 @@ fn worker(db: Database, mode: &str, name: &str, barrier: impl FnOnce()) -> Strin
         }
         "hold" => barrier(),
         "initialize" => (),
-        "checkpoint" => db.checkpoint().unwrap(),
+        "checkpoint" | "memtable_checkpoint" => db.checkpoint().unwrap(),
         _ => panic!("unknown worker mode"),
     }
     outcome
@@ -2677,3 +2702,6 @@ fn property_values(result: &QueryResult) -> Vec<i64> {
     values.sort_unstable();
     values
 }
+
+#[path = "memtable_tests.rs"]
+mod memtable_tests;

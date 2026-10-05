@@ -2,6 +2,7 @@
 use crate::{
     catalog::ObjectId,
     graph::{EdgeTable, GraphData, NodeTable, Table, DESTINATION, ID, SOURCE},
+    memtable::Fragment,
     persistence::{failpoint, sync_directory, Disk},
     transaction::PublishedState,
     Error, Result,
@@ -33,7 +34,7 @@ fn table_url(path: &Path) -> Result<ListingTableUrl> {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct GraphManifest {
-    pub nodes: Vec<TableManifest>,
+    pub nodes: Vec<Fragment>,
     pub edges: Vec<EdgeManifest>,
 }
 
@@ -44,11 +45,12 @@ pub(crate) struct TableManifest {
     pub schema: SchemaRef,
     pub rows: usize,
     pub bytes: u64,
+    pub deleted_ids: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct EdgeManifest {
-    pub table: TableManifest,
+    pub table: Fragment,
     pub directed: bool,
 }
 
@@ -56,7 +58,7 @@ impl TableManifest {
     fn name(&self) -> String {
         format!("graph-{}.parquet", self.id)
     }
-    fn empty_table(&self, edge: bool) -> Result<Table> {
+    pub(crate) fn empty_table(&self, edge: bool) -> Result<Table> {
         Table::try_new(
             self.labels.iter().cloned().collect(),
             self.schema.clone(),
@@ -69,7 +71,7 @@ impl TableManifest {
         )
         .map_err(|e| Error::Corrupt(format!("invalid Parquet graph schema: {e}")))
     }
-    fn open(&self, disk: &Disk, edge: bool) -> Result<Table> {
+    pub(crate) fn open(&self, disk: &Disk, edge: bool) -> Result<Table> {
         let mut table = self.empty_table(edge)?;
         let path = disk.directory.join(self.name());
         table.provider = Arc::new(ListingTable::try_new(
@@ -79,6 +81,7 @@ impl TableManifest {
         )?);
         table.row_count = self.rows;
         table.file_id = Some(self.id);
+        table.mask_rows(&self.deleted_ids)?;
         Ok(table)
     }
     fn check_file(&self, disk: &Disk) -> Result<()> {
@@ -106,14 +109,47 @@ impl TableManifest {
     }
 }
 
+impl Fragment {
+    fn empty_table(&self, edge: bool) -> Result<Table> {
+        match self {
+            Self::Parquet(t) => t.empty_table(edge),
+            Self::Memory(t) => Table::try_new(
+                t.labels.iter().cloned().collect(),
+                t.data.schema.clone(),
+                vec![],
+                if edge {
+                    &[ID, SOURCE, DESTINATION]
+                } else {
+                    &[ID]
+                },
+            ),
+        }
+    }
+    fn open(&self, disk: &Disk, edge: bool) -> Result<Table> {
+        match self {
+            Self::Parquet(t) => t.open(disk, edge),
+            Self::Memory(t) => t.open(edge),
+        }
+    }
+}
 impl GraphManifest {
-    pub fn tables(&self) -> impl Iterator<Item = &TableManifest> {
+    pub fn fragments(&self) -> impl Iterator<Item = &Fragment> {
         self.nodes.iter().chain(self.edges.iter().map(|e| &e.table))
     }
+    pub fn tables(&self) -> impl Iterator<Item = &TableManifest> {
+        self.fragments().filter_map(|f| match f {
+            Fragment::Parquet(t) => Some(t),
+            Fragment::Memory(_) => None,
+        })
+    }
     pub fn validate(&self, next_id: ObjectId, files: &mut BTreeSet<ObjectId>) -> Result<()> {
-        for table in self.tables() {
-            if table.id < 3 || table.id >= next_id || table.bytes == 0 || !files.insert(table.id) {
-                return Err(Error::Corrupt("invalid or shared Parquet file ID".into()));
+        for fragment in self.fragments() {
+            if fragment.id() < 3 || fragment.id() >= next_id || !files.insert(fragment.id()) {
+                return Err(Error::Corrupt("invalid or shared graph fragment ID".into()));
+            }
+            if matches!(fragment, Fragment::Parquet(t) if t.bytes == 0 || t.deleted_ids.len() > t.rows)
+            {
+                return Err(Error::Corrupt("empty Parquet file".into()));
             }
         }
         let nodes = self
@@ -176,7 +212,35 @@ impl Disk {
             schema: table.schema.clone(),
             rows: table.row_count,
             bytes: file.metadata()?.len(),
+            deleted_ids: BTreeSet::new(),
         })
+    }
+    /// Called under the coordinator/commit lock before installing a checkpoint.
+    /// IDs are reserved in the old WAL first so a failed seal never reuses a file name.
+    pub fn seal_memtables(&self, state: &mut PublishedState) -> Result<()> {
+        let mut next_id = state.next_id;
+        for generation in Arc::make_mut(&mut state.storage).generations.values_mut() {
+            if let Some(manifest) = &mut generation.parquet {
+                let manifest = Arc::make_mut(manifest);
+                for (fragment, edge) in manifest
+                    .nodes
+                    .iter_mut()
+                    .map(|f| (f, false))
+                    .chain(manifest.edges.iter_mut().map(|e| (&mut e.table, true)))
+                {
+                    if let Fragment::Memory(table) = fragment {
+                        let loaded = table.open(edge)?;
+                        *fragment = Fragment::Parquet(self.write_graph_table(next_id, &loaded)?);
+                        next_id = next_id.checked_add(1).ok_or_else(|| {
+                            Error::InvalidDefinition("object IDs exhausted".into())
+                        })?;
+                    }
+                }
+            }
+        }
+        state.next_id = next_id;
+        self.finish_graph_files()?;
+        state.validate()
     }
     pub fn finish_graph_files(&self) -> Result<()> {
         sync_directory(&self.directory)?;
@@ -188,6 +252,16 @@ impl Disk {
             if let Some(manifest) = &generation.parquet {
                 for table in manifest.tables() {
                     table.check_file(self)?;
+                }
+                for fragment in &manifest.nodes {
+                    if let Fragment::Memory(t) = fragment {
+                        t.open(false)?;
+                    }
+                }
+                for edge in &manifest.edges {
+                    if let Fragment::Memory(t) = &edge.table {
+                        t.open(true)?;
+                    }
                 }
             }
         }

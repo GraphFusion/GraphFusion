@@ -44,6 +44,11 @@ pub(crate) enum StorageChange {
         generation: ObjectId,
         data: Arc<crate::graph::GraphData>,
     },
+    BufferGraph {
+        generation: ObjectId,
+        nodes: Vec<crate::memtable::TableChange>,
+        edges: Vec<crate::memtable::EdgeChange>,
+    },
     ReplaceParquet {
         generation: ObjectId,
         manifest: Arc<crate::parquet::GraphManifest>,
@@ -84,6 +89,40 @@ impl StorageSnapshot {
                 }
                 target.graph = Some(data.clone());
                 target.parquet = None;
+                target.graph_version = seq;
+            }
+            StorageChange::BufferGraph {
+                generation,
+                nodes,
+                edges,
+            } => {
+                let target = self
+                    .generations
+                    .get_mut(generation)
+                    .ok_or_else(|| Error::Corrupt("missing graph generation".into()))?;
+                if target.retired_at.is_some() {
+                    return Err(Error::Conflict("graph generation was retired".into()));
+                }
+                let previous = target.parquet.as_deref().cloned().unwrap_or_default();
+                let old_nodes = &previous.nodes;
+                let old_edges: Vec<_> = previous.edges.iter().map(|e| e.table.clone()).collect();
+                let manifest = crate::parquet::GraphManifest {
+                    nodes: nodes
+                        .iter()
+                        .map(|t| t.apply(old_nodes, false))
+                        .collect::<Result<_>>()?,
+                    edges: edges
+                        .iter()
+                        .map(|e| {
+                            Ok(crate::parquet::EdgeManifest {
+                                table: e.table.apply(&old_edges, true)?,
+                                directed: e.directed,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                };
+                target.graph = None;
+                target.parquet = Some(Arc::new(manifest));
                 target.graph_version = seq;
             }
             StorageChange::ReplaceParquet {
