@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 const MAGIC: &[u8; 8] = b"GFLOG001";
 const END: &[u8; 8] = b"GFCOMMIT";
 const HEADER: usize = 24;
@@ -18,6 +18,7 @@ const MAX_RECORD: usize = 64 * 1024 * 1024;
 #[derive(Debug)]
 pub(crate) struct Disk {
     pub directory: PathBuf,
+    pub next_commit_id: std::sync::Mutex<Option<u64>>,
 }
 
 #[derive(Debug)]
@@ -226,7 +227,7 @@ impl Disk {
     }
 
     pub fn append(&self, generation: u64, record: &LogRecord) -> Result<()> {
-        let graph_commit = matches!(record, LogRecord::Commit(commit) if commit.storage.iter().any(|change| matches!(change, crate::storage::StorageChange::ReplaceParquet { .. })));
+        let graph_commit = matches!(record, LogRecord::Commit(commit) if commit.storage.iter().any(|change| matches!(change, crate::storage::StorageChange::ReplaceParquet { .. } | crate::storage::StorageChange::BufferGraph { .. })));
         let payload = serde_json::to_vec(record)?;
         let bytes = encode_frame(&payload)?;
         // Serialization does not enforce the recovery deserializer's recursion limit.
@@ -242,25 +243,30 @@ impl Disk {
             failpoint("wal_header");
             if graph_commit {
                 failpoint("parquet_wal_header");
+                failpoint("memtable_wal_header");
             }
             file.write_all(&bytes[HEADER..bytes.len() - END.len()])?;
             failpoint("wal_payload");
             if graph_commit {
                 failpoint("parquet_wal_payload");
+                failpoint("memtable_wal_payload");
             }
             file.write_all(END)?;
             failpoint("wal_commit");
             if graph_commit {
                 failpoint("parquet_wal_commit");
+                failpoint("memtable_wal_commit");
             }
             inject_io_error("wal_sync")?;
             if graph_commit {
                 inject_io_error("parquet_wal_sync")?;
+                inject_io_error("memtable_wal_sync")?;
             }
             file.sync_all()?;
             failpoint("wal_sync");
             if graph_commit {
                 failpoint("parquet_wal_sync");
+                failpoint("memtable_wal_sync");
             }
             Ok(())
         })();
@@ -376,18 +382,18 @@ impl Disk {
     pub(crate) fn publish_main_snapshot(&self, state: &PublishedState) -> Result<()> {
         let parent = self.read_ref("main")?;
         if let Some(id) = parent {
-            if self.read_commit(id)?.state.commit_seq == state.commit_seq {
+            if same_snapshot(&self.read_commit(id)?.state, state) {
                 return Ok(());
             }
         }
         let id = self.allocate_commit_id()?;
-        self.write_commit(id, parent, state)?;
+        self.write_commit(id, None, state)?;
         self.write_ref("main", id)
     }
 
     pub(crate) fn ensure_main_snapshot(&self, state: &PublishedState) -> Result<u64> {
         if let Some(id) = self.read_ref("main")? {
-            if self.read_commit(id)?.state.commit_seq == state.commit_seq {
+            if same_snapshot(&self.read_commit(id)?.state, state) {
                 return Ok(id);
             }
         }
@@ -432,12 +438,59 @@ impl Disk {
         write_document(&temporary, &commit)?;
         sync_directory(&dir)?;
         fs::rename(&temporary, dir.join(name))?;
+        if name != "main" {
+            failpoint("branch_ref_rename");
+            inject_io_error("branch_ref_sync")?;
+        }
         sync_directory(&dir)?;
+        sync_directory(&self.directory)?;
+        if name != "main" {
+            failpoint("branch_ref_sync");
+        }
         Ok(())
     }
 
     pub(crate) fn read_commit(&self, id: u64) -> Result<StoredCommit> {
-        read_document(&self.commit_path(id))
+        let mut next = id;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut deltas = Vec::new();
+        let mut tip_parent = None;
+        let mut state = loop {
+            if !seen.insert(next) {
+                return Err(Error::Corrupt("branch commit cycle".into()));
+            }
+            match read_document::<StoredCommitRecord>(&self.commit_path(next))? {
+                StoredCommitRecord::Snapshot(snapshot) => {
+                    if next == id {
+                        tip_parent = snapshot.parent;
+                    }
+                    snapshot.state.validate()?;
+                    break snapshot.state;
+                }
+                StoredCommitRecord::Delta {
+                    parent,
+                    next_id,
+                    record,
+                } => {
+                    if next == id {
+                        tip_parent = Some(parent);
+                    }
+                    deltas.push((next_id, record));
+                    next = parent;
+                }
+            }
+        };
+        for (next_id, record) in deltas.into_iter().rev() {
+            if next_id < state.next_id {
+                return Err(Error::Corrupt("branch IDs regressed".into()));
+            }
+            state.next_id = next_id;
+            state = state.apply(&record)?;
+        }
+        Ok(StoredCommit {
+            parent: tip_parent,
+            state,
+        })
     }
 
     pub(crate) fn write_commit(
@@ -454,34 +507,72 @@ impl Disk {
         }
         write_document(
             &path,
-            &StoredCommit {
+            &StoredCommitRecord::Snapshot(StoredCommit {
                 parent,
                 state: state.clone(),
-            },
+            }),
         )?;
         sync_directory(&dir)?;
+        sync_directory(&self.directory)?;
+        Ok(())
+    }
+
+    pub(crate) fn write_branch_delta(
+        &self,
+        id: u64,
+        parent: u64,
+        next_id: u64,
+        record: CommitRecord,
+    ) -> Result<()> {
+        let dir = self.commits_dir();
+        fs::create_dir_all(&dir)?;
+        let path = self.commit_path(id);
+        if path.exists() {
+            return Err(Error::Corrupt("branch commit already exists".into()));
+        }
+        let delta = StoredCommitRecord::Delta {
+            parent,
+            next_id,
+            record,
+        };
+        // Use the same framed checksums and replay validation as the main WAL.
+        let payload = serde_json::to_vec(&delta)?;
+        serde_json::from_slice::<StoredCommitRecord>(&payload)?;
+        write_document(&path, &delta)?;
+        failpoint("branch_delta_write");
+        sync_directory(&dir)?;
+        sync_directory(&self.directory)?;
+        failpoint("branch_delta_sync");
         Ok(())
     }
 
     pub(crate) fn allocate_commit_id(&self) -> Result<u64> {
-        let mut max = 0u64;
-        let dir = self.commits_dir();
-        if dir.exists() {
-            for entry in fs::read_dir(&dir)? {
-                let name = entry?.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if let Some(id) = name
-                    .strip_suffix(".snap")
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    max = max.max(id);
+        let mut cached = self.next_commit_id.lock().map_err(|_| Error::Poisoned)?;
+        let id = if let Some(id) = *cached {
+            id
+        } else {
+            let mut max = 0u64;
+            let dir = self.commits_dir();
+            if dir.exists() {
+                for entry in fs::read_dir(&dir)? {
+                    let name = entry?.file_name();
+                    if let Some(id) = name
+                        .to_str()
+                        .and_then(|s| s.strip_suffix(".snap"))
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        max = max.max(id);
+                    }
                 }
             }
-        }
-        max.checked_add(1)
-            .ok_or_else(|| Error::InvalidDefinition("commit ids exhausted".into()))
+            max.checked_add(1)
+                .ok_or_else(|| Error::InvalidDefinition("commit ids exhausted".into()))?
+        };
+        *cached = Some(
+            id.checked_add(1)
+                .ok_or_else(|| Error::InvalidDefinition("commit ids exhausted".into()))?,
+        );
+        Ok(id)
     }
 
     /// Parquet files still named by a non-main branch, including ancestors of its tip.
@@ -496,17 +587,46 @@ impl Disk {
                 if !seen.insert(id) {
                     return Err(Error::Corrupt(format!("commit cycle at {id}")));
                 }
-                let stored = self.read_commit(id)?;
-                for generation in stored.state.storage.generations.values() {
-                    if let Some(manifest) = &generation.parquet {
-                        for table in manifest.tables() {
-                            files.insert(format!("graph-{}.parquet", table.id));
+                match read_document::<StoredCommitRecord>(&self.commit_path(id))? {
+                    StoredCommitRecord::Snapshot(stored) => {
+                        for generation in stored.state.storage.generations.values() {
+                            if let Some(manifest) = &generation.parquet {
+                                for table in manifest.tables() {
+                                    files.insert(format!("graph-{}.parquet", table.id));
+                                }
+                            }
+                        }
+                        match stored.parent {
+                            Some(parent) => id = parent,
+                            None => break,
                         }
                     }
-                }
-                match stored.parent {
-                    Some(parent) => id = parent,
-                    None => break,
+                    StoredCommitRecord::Delta { parent, record, .. } => {
+                        use crate::{memtable::TableChange, storage::StorageChange};
+                        for change in record.storage {
+                            match change {
+                                StorageChange::BufferGraph { nodes, edges, .. } => {
+                                    for change in nodes.iter().chain(edges.iter().map(|e| &e.table))
+                                    {
+                                        let id = match change {
+                                            TableChange::Parquet(t) => t.id,
+                                            TableChange::Reuse(id)
+                                            | TableChange::Mask { id, .. } => *id,
+                                            TableChange::Memory { .. } => continue,
+                                        };
+                                        files.insert(format!("graph-{id}.parquet"));
+                                    }
+                                }
+                                StorageChange::ReplaceParquet { manifest, .. } => {
+                                    for table in manifest.tables() {
+                                        files.insert(format!("graph-{}.parquet", table.id));
+                                    }
+                                }
+                                _ => (),
+                            }
+                        }
+                        id = parent;
+                    }
                 }
             }
         }
@@ -528,6 +648,38 @@ impl Disk {
 pub(crate) struct StoredCommit {
     pub parent: Option<u64>,
     pub state: PublishedState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum StoredCommitRecord {
+    Snapshot(StoredCommit),
+    Delta {
+        parent: u64,
+        next_id: u64,
+        record: CommitRecord,
+    },
+}
+
+// A checkpoint keeps the logical sequence while sealing fragments and reclaiming
+// retired generations. A branch must fork that current layout, not a stale cached ref.
+fn same_snapshot(a: &PublishedState, b: &PublishedState) -> bool {
+    a.commit_seq == b.commit_seq
+        && a.next_id == b.next_id
+        && a.storage
+            .generations
+            .keys()
+            .eq(b.storage.generations.keys())
+        && a.storage.generations.iter().all(|(id, generation)| {
+            let other = &b.storage.generations[id];
+            match (&generation.parquet, &other.parquet) {
+                (Some(a), Some(b)) => a
+                    .fragments()
+                    .map(|t| t.id())
+                    .eq(b.fragments().map(|t| t.id())),
+                (None, None) => true,
+                _ => false,
+            }
+        })
 }
 
 fn lock_file(path: &Path) -> Result<File> {

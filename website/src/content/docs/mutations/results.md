@@ -17,4 +17,4 @@ The complete statement is one atomic unit, including its returned expressions. C
 
 `QueryResult::affected_elements` counts inserted/deleted elements and distinct targets per update item. Two update items can count the same element twice. It is an operation count, not a unique-element count for the whole program. FINISH reports it with a commit sequence in the CLI.
 
-Composite writes using UNION/INTERSECT/EXCEPT/OTHERWISE and query NEXT continuations are not supported. Typed graph writes also require future constraint enforcement. [Limits](/storage/limits/) describes full-graph materialization and rewrite costs.
+Composite writes using UNION/INTERSECT/EXCEPT/OTHERWISE and query NEXT continuations are not supported. Typed graph writes also require future constraint enforcement. [Limits](/storage/limits/) describes materialization costs and MemTable limits.

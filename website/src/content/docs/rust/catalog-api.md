@@ -9,7 +9,7 @@ sidebar:
 
 `Database::with_catalog` exposes a catalog view inside a statement snapshot. Catalog entries carry stable object IDs, kinds, immutable definitions and commit versions. Inspecting the catalog does not mutate session selection.
 
-`Database::statistics()` reports commits, conflicts, lock-wait time, recovery/checkpoint time, busy checkpoints and log bytes. Counts are process-local rather than a cluster-wide monitoring history.
+`Database::statistics()` reports commits, conflicts, lock-wait time, recovery/checkpoint time, busy checkpoints log bytes, resident main MemTable rows/array bytes and referenced sealed files. Counts are process-local rather than a cluster-wide monitoring history.
 
 `Database::checkpoint()` requests an idle checkpoint and may return Busy while a statement or transaction in the owning process holds a snapshot. See [checkpointing](/storage/checkpoint/).
 

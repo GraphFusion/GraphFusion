@@ -5,6 +5,7 @@ pub mod gql {
 pub mod catalog;
 mod error;
 pub mod graph;
+mod memtable;
 mod parquet;
 mod persistence;
 mod query;
@@ -38,6 +39,20 @@ pub struct OpenOptions {
     /// Persistent databases require a local filesystem with working file locks and atomic rename.
     pub create_if_missing: bool,
 }
+/// Limits apply to resident batches in each graph. Either limit triggers sealing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageOptions {
+    pub memtable_max_rows: usize,
+    pub memtable_max_bytes: usize,
+}
+impl Default for StorageOptions {
+    fn default() -> Self {
+        Self {
+            memtable_max_rows: 65_536,
+            memtable_max_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
 #[derive(Debug, Default)]
 struct Metrics {
     commits: AtomicU64,
@@ -56,15 +71,21 @@ pub struct Statistics {
     pub checkpoint_micros: u64,
     pub checkpoint_busy: u64,
     pub log_bytes: u64,
+    /// Resident main-branch rows and Arrow array bytes in the published snapshot.
+    pub memtable_rows: usize,
+    pub memtable_bytes: usize,
+    pub sealed_files: usize,
 }
 #[derive(Debug)]
 struct Inner {
     disk: Option<Disk>,
     state: Mutex<MainState>,
     branches: Mutex<MemoryBranches>,
+    branch_cache: Mutex<HashMap<String, (u64, Arc<PublishedState>)>>,
     active: AtomicUsize,
     unhealthy: AtomicBool,
     metrics: Metrics,
+    storage_options: Mutex<StorageOptions>,
 }
 #[derive(Debug)]
 struct MainState {
@@ -169,9 +190,11 @@ impl Database {
                 disk: None,
                 state: Mutex::new(MainState::new(PublishedState::initial(), 0)),
                 branches: Mutex::new(MemoryBranches::default()),
+                branch_cache: Mutex::new(HashMap::new()),
                 active: AtomicUsize::new(0),
                 unhealthy: AtomicBool::new(false),
                 metrics: Metrics::default(),
+                storage_options: Mutex::new(StorageOptions::default()),
             }),
         }
     }
@@ -226,6 +249,7 @@ impl Database {
         registry.remove(&directory);
         let disk = Disk {
             directory: directory.clone(),
+            next_commit_id: Mutex::new(None),
         };
         let owner = disk.acquire_ownership()?;
         let _commit = disk.commit_lock()?;
@@ -238,9 +262,11 @@ impl Database {
             disk: Some(disk),
             state: Mutex::new(MainState::new(state, generation)),
             branches: Mutex::new(MemoryBranches::default()),
+            branch_cache: Mutex::new(HashMap::new()),
             active: AtomicUsize::new(0),
             unhealthy: AtomicBool::new(false),
             metrics: Metrics::default(),
+            storage_options: Mutex::new(StorageOptions::default()),
         });
         registry.insert(
             directory,
@@ -290,6 +316,11 @@ impl Database {
     }
     pub fn branches(&self) -> Result<Vec<Branch>> {
         let mut listed = if let Some(disk) = &self.inner.disk {
+            let mut state = self.inner.state.lock().map_err(|_| Error::Poisoned)?;
+            self.check_healthy()?;
+            self.recover_main(&mut state)?;
+            let _commit = disk.commit_lock()?;
+            disk.ensure_main_snapshot(&state.published)?;
             disk.list_refs()?
         } else {
             let branches = self.inner.branches.lock().map_err(|_| Error::Poisoned)?;
@@ -313,7 +344,20 @@ impl Database {
             let id = disk
                 .read_ref(name)?
                 .ok_or_else(|| Error::NotFound(name.into()))?;
-            return Ok((id, Arc::new(disk.read_commit(id)?.state)));
+            let mut cache = self
+                .inner
+                .branch_cache
+                .lock()
+                .map_err(|_| Error::Poisoned)?;
+            if let Some((cached_id, state)) = cache.get(name) {
+                if *cached_id == id {
+                    return Ok((id, state.clone()));
+                }
+            }
+            let state = Arc::new(disk.read_commit(id)?.state);
+            disk.check_graph_files(&state)?;
+            cache.insert(name.to_owned(), (id, state.clone()));
+            return Ok((id, state));
         }
         let branches = self.inner.branches.lock().map_err(|_| Error::Poisoned)?;
         let id = *branches
@@ -409,7 +453,31 @@ impl Database {
             .retain(|_, binding| binding.object.is_some());
         next.validate()?;
         if let Some(disk) = &self.inner.disk {
+            let count = next
+                .storage
+                .generations
+                .values()
+                .filter_map(|g| g.parquet.as_ref())
+                .flat_map(|m| m.fragments())
+                .filter(|f| matches!(f, memtable::Fragment::Memory(_)))
+                .count() as u64;
+            let reserved = next
+                .next_id
+                .checked_add(count)
+                .ok_or_else(|| Error::InvalidDefinition("object IDs exhausted".into()))?;
             current.needs_recovery = true;
+            if count != 0 {
+                if let Err(error) = disk.append(
+                    current.generation,
+                    &persistence::LogRecord::Reserve { next_id: reserved },
+                ) {
+                    if matches!(error, Error::CommitUnknown(_)) {
+                        self.inner.unhealthy.store(true, Ordering::SeqCst);
+                    }
+                    return Err(error);
+                }
+                disk.seal_memtables(&mut next)?;
+            }
             current.generation = disk.checkpoint(&next, current.generation)?;
             current.needs_recovery = false;
         }
@@ -418,6 +486,21 @@ impl Database {
             .metrics
             .checkpoint_micros
             .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+    /// Changes the thresholds for all handles sharing this coordinator. A successful
+    /// write seals resident batches when either threshold is reached; checkpoint forces sealing.
+    pub fn configure_storage(&self, options: StorageOptions) -> Result<()> {
+        if options.memtable_max_rows == 0 || options.memtable_max_bytes == 0 {
+            return Err(Error::InvalidDefinition(
+                "MemTable thresholds must be nonzero".into(),
+            ));
+        }
+        *self
+            .inner
+            .storage_options
+            .lock()
+            .map_err(|_| Error::Poisoned)? = options;
         Ok(())
     }
     pub fn statistics(&self) -> Result<Statistics> {
@@ -430,7 +513,33 @@ impl Database {
             checkpoint_micros: m.checkpoint_micros.load(Ordering::Relaxed),
             checkpoint_busy: m.checkpoint_busy.load(Ordering::Relaxed),
             log_bytes: 0,
+            memtable_rows: 0,
+            memtable_bytes: 0,
+            sealed_files: 0,
         };
+        let current = self.inner.state.lock().map_err(|_| Error::Poisoned)?;
+        for manifest in current
+            .published
+            .storage
+            .generations
+            .values()
+            .filter_map(|g| g.parquet.as_ref())
+        {
+            stats.sealed_files += manifest.tables().count();
+            for fragment in manifest.fragments() {
+                if let memtable::Fragment::Memory(t) = fragment {
+                    stats.memtable_rows +=
+                        t.data.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                    stats.memtable_bytes += t
+                        .data
+                        .batches
+                        .iter()
+                        .map(|b| b.get_array_memory_size())
+                        .sum::<usize>();
+                }
+            }
+        }
+        drop(current);
         if let Some(disk) = &self.inner.disk {
             for entry in fs::read_dir(&disk.directory)? {
                 let entry = entry?;

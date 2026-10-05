@@ -34,6 +34,6 @@ cargo run -p graphfusion --locked -- import --database ./demo-db \
   --graph social --manifest ./data/graph.json
 ```
 
-Persistent import reads and validates the external files, then writes database-owned immutable Parquet files. The database does not rely on the caller keeping the original files unchanged. Import materializes input; it is not a streaming ingest API. Persistent database paths must be UTF-8 without ASCII control characters.
+Persistent import reads and validates the external files, then commits database-owned Arrow IPC batches in the WAL and resident MemTables. Inputs reaching the storage thresholds seal to immutable Parquet at commit; smaller imports seal at a later threshold or checkpoint. The database does not rely on the caller keeping the original files unchanged. Import materializes input; it is not a streaming ingest API. Persistent database paths must be UTF-8 without ASCII control characters.
 
 The [Rust social example](https://github.com/GraphFusion/GraphFusion/blob/main/crates/graphfusion/examples/social.rs) builds actual Arrow tables. CSV/JSON graph-table import and typed graph import are not implemented.

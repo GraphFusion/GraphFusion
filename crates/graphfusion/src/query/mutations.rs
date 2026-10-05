@@ -161,44 +161,48 @@ pub(super) async fn apply(
     scope.sources.insert(id, Arc::new(data.clone()));
     // Durable providers contain no resident Arrow batches. Materialize their immutable
     // snapshot through DataFusion before validating or rewriting the graph.
-    for node in &mut data.nodes {
-        if node
-            .0
-            .batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>()
-            != node.0.row_count
-        {
-            let file_id = node.0.file_id;
-            let mut loaded = table(source(&node.0)?, node.0.labels.clone(), false, ctx, trace)
+    if !matches!(clause, ast::QueryClause::Insert(_)) {
+        for node in &mut data.nodes {
+            if node
+                .0
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>()
+                != node.0.row_count
+            {
+                let file_id = node.0.file_id;
+                let mut loaded = table(source(&node.0)?, node.0.labels.clone(), false, ctx, trace)
+                    .await?
+                    .ok_or_else(|| Error::Corrupt("graph row count changed".into()))?;
+                loaded.file_id = file_id;
+                loaded.deleted_ids = node.0.deleted_ids.clone();
+                node.0 = loaded;
+            }
+        }
+        for edge in &mut data.edges {
+            if edge
+                .table
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>()
+                != edge.table.row_count
+            {
+                let file_id = edge.table.file_id;
+                let mut loaded = table(
+                    source(&edge.table)?,
+                    edge.table.labels.clone(),
+                    true,
+                    ctx,
+                    trace,
+                )
                 .await?
                 .ok_or_else(|| Error::Corrupt("graph row count changed".into()))?;
-            loaded.file_id = file_id;
-            node.0 = loaded;
-        }
-    }
-    for edge in &mut data.edges {
-        if edge
-            .table
-            .batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>()
-            != edge.table.row_count
-        {
-            let file_id = edge.table.file_id;
-            let mut loaded = table(
-                source(&edge.table)?,
-                edge.table.labels.clone(),
-                true,
-                ctx,
-                trace,
-            )
-            .await?
-            .ok_or_else(|| Error::Corrupt("graph row count changed".into()))?;
-            loaded.file_id = file_id;
-            edge.table = loaded;
+                loaded.file_id = file_id;
+                loaded.deleted_ids = edge.table.deleted_ids.clone();
+                edge.table = loaded;
+            }
         }
     }
     plan = freeze(plan, ctx, trace, None).await?;
@@ -478,7 +482,7 @@ async fn insert_element(
         }
     }
     let mut next = data.clone();
-    if let Some(table) = table_with_empty(
+    let inserted = table_with_empty(
         plan.clone().project(expressions)?,
         labels,
         kind == ElementKind::Edge,
@@ -486,18 +490,21 @@ async fn insert_element(
         trace,
         true,
     )
-    .await?
-    {
+    .await?;
+    if let Some(table) = inserted.clone() {
         if kind == ElementKind::Node {
             if let Some(existing) = next.nodes.iter_mut().find(|node| {
-                node.0.labels == table.labels && node.0.schema.as_ref() == table.schema.as_ref()
+                node.0.file_id.is_none()
+                    && node.0.labels == table.labels
+                    && node.0.schema.as_ref() == table.schema.as_ref()
             }) {
                 existing.0.append_rows(table)?;
             } else {
                 next.nodes.push(NodeTable(table));
             }
         } else if let Some(existing) = next.edges.iter_mut().find(|edge| {
-            edge.directed == directed
+            edge.table.file_id.is_none()
+                && edge.directed == directed
                 && edge.table.labels == table.labels
                 && edge.table.schema.as_ref() == table.schema.as_ref()
         }) {
@@ -506,8 +513,14 @@ async fn insert_element(
             next.edges.push(EdgeTable { table, directed });
         }
     }
-    let next = GraphData::try_new(next.nodes, next.edges)?;
-    let (scan, binding) = graph::scan(scope, graph_id, &next, kind, None)?;
+    // IDs are allocated by the coordinator and endpoints come from validated bindings.
+    // Existing sealed fragments can remain lazy during append-only writes.
+    crate::graph::property_types(next.nodes.iter().map(|t| &t.0))?;
+    crate::graph::property_types(next.edges.iter().map(|t| &t.table))?;
+    let (scan, binding) = match inserted.as_ref() {
+        Some(table) => graph::scan_insert(scope, graph_id, &next, kind, table, directed)?,
+        None => graph::scan(scope, graph_id, &next, kind, None)?,
+    };
     // Empty input still needs typed bindings, but must not publish a new layout.
     if rows != 0 {
         *data = next;
@@ -689,16 +702,35 @@ async fn edit_graph(
         if let Some(label) = &edit.remove_label {
             labels.remove(label);
         }
-        for (plan, labels) in [
-            (kept, old.labels.clone()),
-            (changed.project(projections)?, labels),
-        ] {
-            if let Some(table) = table(plan, labels, kind == ElementKind::Edge, ctx, trace).await? {
-                if kind == ElementKind::Node {
-                    nodes.push(NodeTable(table));
-                } else {
-                    edges.push(EdgeTable { table, directed });
-                }
+        let changed = table(
+            changed.project(projections)?,
+            labels,
+            kind == ElementKind::Edge,
+            ctx,
+            trace,
+        )
+        .await?;
+        let kept = if old.file_id.is_some() || old.memory_id.is_some() {
+            let mut kept = old.clone();
+            if let Some(changed) = &changed {
+                kept.mask_rows(&changed.ids(ID).collect())?;
+            }
+            (kept.row_count != 0).then_some(kept)
+        } else {
+            table(
+                kept,
+                old.labels.clone(),
+                kind == ElementKind::Edge,
+                ctx,
+                trace,
+            )
+            .await?
+        };
+        for table in [kept, changed].into_iter().flatten() {
+            if kind == ElementKind::Node {
+                nodes.push(NodeTable(table));
+            } else {
+                edges.push(EdgeTable { table, directed });
             }
         }
     }
@@ -742,6 +774,28 @@ fn refresh(
         scope.elements.insert(name, after);
     }
     super::references::refresh(plan, scope, graph_id, data)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retained_table(
+    old: &Table,
+    plan: LogicalPlanBuilder,
+    edge: bool,
+    ctx: &SessionContext,
+    trace: &mut Trace,
+) -> Result<Option<Table>> {
+    let retained = table(plan, old.labels.clone(), edge, ctx, trace).await?;
+    if old.file_id.is_none() && old.memory_id.is_none() {
+        return Ok(retained);
+    }
+    let Some(retained) = retained else {
+        return Ok(None);
+    };
+    let keep: BTreeSet<_> = retained.ids(ID).collect();
+    let removed = old.ids(ID).filter(|id| !keep.contains(id)).collect();
+    let mut table = old.clone();
+    table.mask_rows(&removed)?;
+    Ok(Some(table))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -797,7 +851,7 @@ async fn delete_graph(
                 [col("__gf_old", ID).eq(col("__gf_delete", ID))],
             )?;
         }
-        if let Some(table) = table(plan, node.0.labels.clone(), false, ctx, trace).await? {
+        if let Some(table) = retained_table(&node.0, plan, false, ctx, trace).await? {
             new_nodes.push(NodeTable(table));
         }
     }
@@ -823,7 +877,7 @@ async fn delete_graph(
                 )?;
             }
         }
-        if let Some(table) = table(plan, edge.table.labels.clone(), true, ctx, trace).await? {
+        if let Some(table) = retained_table(&edge.table, plan, true, ctx, trace).await? {
             new_edges.push(EdgeTable {
                 table,
                 directed: edge.directed,

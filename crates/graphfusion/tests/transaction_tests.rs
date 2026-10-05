@@ -395,7 +395,7 @@ async fn import_participates_in_transactions_and_abandoned_files_are_reclaimed()
             .await
             .unwrap();
         if durable {
-            assert!(files().unwrap() > original.unwrap());
+            assert_eq!(files(), original, "uncommitted writes must stay in memory");
         }
         s.replace_graph_data(graphfusion::graph::GraphData::default())
             .unwrap();

@@ -188,7 +188,7 @@ impl Session {
         Ok(result)
     }
     /// Atomically replaces the current open graph with validated Arrow tables.
-    /// Persistent databases stage immutable Parquet files before publishing the manifest.
+    /// Persistent databases commit resident batches through WAL, sealing them to Parquet at configured thresholds.
     /// In an explicit transaction this stages a change and returns its starting snapshot
     /// sequence; durability is acknowledged separately by COMMIT.
     pub fn replace_graph_data(&mut self, data: crate::graph::GraphData) -> Result<CommitSeq> {
