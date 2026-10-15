@@ -43,8 +43,16 @@ pub(super) fn col(relation: &str, name: &str) -> Expr {
     Expr::Column(Column::new(Some(TableReference::bare(relation)), name))
 }
 pub(super) fn memory(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<LogicalPlanBuilder> {
+    memory_named("__gf_buffer", schema, batches)
+}
+
+pub(super) fn memory_named(
+    name: &str,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<LogicalPlanBuilder> {
     Ok(LogicalPlanBuilder::scan(
-        "__gf_buffer",
+        name,
         provider_as_source(Arc::new(MemTable::try_new(schema, vec![batches])?)),
         None,
     )?)

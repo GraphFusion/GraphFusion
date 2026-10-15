@@ -421,12 +421,13 @@ impl Compiler<'_> {
                             self.different,
                         )?;
                     } else {
-                        let (scan, binding) = graph::scan(
+                        let (scan, binding) = graph::scan_filtered(
                             scope,
                             self.graph_id,
                             self.data,
                             ElementKind::Edge,
                             Some(edge.direction),
+                            graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
                         )?;
                         let mut predicates = vec![state.end().eq(binding.column(FROM))];
                         if let Some(name) = &edge.variable {

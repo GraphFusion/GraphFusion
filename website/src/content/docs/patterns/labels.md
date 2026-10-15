@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-A node or edge can have several labels. Patterns support conjunction (`&`), alternative (`|`), negation (`!`) and wildcard (`%`) label expressions.
+A node or edge can have several labels. Patterns support conjunction (`&`), alternative (`|`), negation (`!`) and wildcard (`%`) label expressions. Each stored fragment has one label set. A pattern reads only fragments that can satisfy that set, so another type's columns are not scanned and do not change the property types of this match.
 
 ```gql test
 MATCH (p:Person & !Admin {name: 'Alice'})

@@ -129,6 +129,8 @@ pub enum QueryClause {
     Set(SetStatement),
     Remove(RemoveStatement),
     OrderByPage(OrderByPageClause),
+    /// Reads a binding table into the working table. Columns become query variables.
+    BindingTable(BindingTableExpression),
 }
 
 #[derive(Clone, Debug, PartialEq)]

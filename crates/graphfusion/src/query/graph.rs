@@ -27,6 +27,12 @@ pub(super) struct ElementBinding {
     pub properties: BTreeMap<String, DataType>,
     pub labels: BTreeMap<String, String>,
     pub present: BTreeMap<String, String>,
+    /// Label sets this binding was read from. A later write refreshes those
+    /// fragments instead of widening every property onto unrelated types.
+    pub source_labels: Vec<BTreeSet<String>>,
+    /// Set when a label pattern or an insert selected the source fragments.
+    /// An unconstrained match keeps the full element-kind union.
+    pub constrained: bool,
 }
 impl ElementBinding {
     pub fn column(&self, name: &str) -> Expr {
@@ -255,7 +261,16 @@ pub(super) fn node(
         }
         binding
     } else {
-        let (scan, binding) = scan(scope, graph_id, graph, ElementKind::Node, None)?;
+        let (scan, binding) = scan_tables(
+            scope,
+            graph_id,
+            graph,
+            ElementKind::Node,
+            None,
+            None,
+            label_filter(pattern.label_expression.as_ref(), &pattern.labels),
+            None,
+        )?;
         plan = if let Some(endpoint) = endpoint {
             plan.join_on(
                 scan,
@@ -312,6 +327,21 @@ pub(super) fn predicates_for(
     Ok(plan)
 }
 
+/// Label sets are uniform on each fragment, so a pattern can reject a fragment
+/// before its rows or property schema are unified with any other type.
+#[derive(Clone, Copy)]
+pub(super) struct LabelFilter<'a> {
+    pub expression: Option<&'a ast::LabelExpression>,
+    pub labels: &'a [ast::Identifier],
+}
+
+pub(super) fn label_filter<'a>(
+    expression: Option<&'a ast::LabelExpression>,
+    labels: &'a [ast::Identifier],
+) -> Option<LabelFilter<'a>> {
+    (expression.is_some() || !labels.is_empty()).then_some(LabelFilter { expression, labels })
+}
+
 pub(super) fn scan(
     scope: &mut Bindings,
     graph_id: ObjectId,
@@ -319,7 +349,18 @@ pub(super) fn scan(
     kind: ElementKind,
     direction: Option<ast::Direction>,
 ) -> Result<(LogicalPlan, ElementBinding)> {
-    scan_tables(scope, graph_id, graph, kind, direction, None)
+    scan_filtered(scope, graph_id, graph, kind, direction, None)
+}
+
+pub(super) fn scan_filtered(
+    scope: &mut Bindings,
+    graph_id: ObjectId,
+    graph: &GraphData,
+    kind: ElementKind,
+    direction: Option<ast::Direction>,
+    filter: Option<LabelFilter<'_>>,
+) -> Result<(LogicalPlan, ElementBinding)> {
+    scan_tables(scope, graph_id, graph, kind, direction, None, filter, None)
 }
 
 pub(super) fn scan_insert(
@@ -337,9 +378,31 @@ pub(super) fn scan_insert(
         kind,
         None,
         Some((inserted, directed)),
+        None,
+        None,
     )
 }
 
+/// Re-read an element after a write without adopting another type's schema.
+pub(super) fn scan_refresh(
+    scope: &mut Bindings,
+    graph_id: ObjectId,
+    graph: &GraphData,
+    before: &ElementBinding,
+) -> Result<(LogicalPlan, ElementBinding)> {
+    scan_tables(
+        scope,
+        graph_id,
+        graph,
+        before.kind,
+        None,
+        None,
+        None,
+        before.constrained.then_some(before),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn scan_tables(
     scope: &mut Bindings,
     graph_id: ObjectId,
@@ -347,8 +410,10 @@ fn scan_tables(
     kind: ElementKind,
     direction: Option<ast::Direction>,
     inserted: Option<(&Table, bool)>,
+    filter: Option<LabelFilter<'_>>,
+    refresh_of: Option<&ElementBinding>,
 ) -> Result<(LogicalPlan, ElementBinding)> {
-    let tables: Vec<(&Table, bool)> = match kind {
+    let all_tables: Vec<(&Table, bool)> = match kind {
         ElementKind::Node => graph.nodes.iter().map(|table| (&table.0, false)).collect(),
         ElementKind::Edge => graph
             .edges
@@ -356,11 +421,34 @@ fn scan_tables(
             .map(|table| (&table.table, table.directed))
             .collect(),
     };
-    let properties = graph::property_types(tables.iter().map(|(table, _)| *table))?;
-    let labels: BTreeSet<_> = tables
+    let matched: Vec<_> = all_tables
         .iter()
-        .flat_map(|(table, _)| table.labels.iter().cloned())
+        .copied()
+        .filter(|(table, _)| match refresh_of {
+            Some(before) => refreshes(table, before),
+            None => fragment_matches(&table.labels, filter),
+        })
         .collect();
+    // An insert binding is the new row's own layout. Unifying it with every
+    // other fragment would stringify a typed property whenever another label
+    // stored the same name differently.
+    let scanned: Vec<_> = match inserted {
+        Some(table) => vec![table],
+        None => matched,
+    };
+    // A label that matches nothing still names the element kind's properties.
+    // A bare null literal has no column and makes an empty aggregate emit a group.
+    let schema_source = if scanned.is_empty() && inserted.is_none() && refresh_of.is_none() {
+        all_tables
+    } else {
+        scanned.clone()
+    };
+    let properties = graph::property_types(schema_source.iter().map(|(table, _)| *table))?;
+    let source_labels: Vec<_> = scanned
+        .iter()
+        .map(|(table, _)| table.labels.clone())
+        .collect();
+    let labels: BTreeSet<_> = source_labels.iter().flatten().cloned().collect();
     let binding = ElementBinding {
         alias: format!("__gf_element_{}", scope.next),
         graph: graph_id,
@@ -376,6 +464,8 @@ fn scan_tables(
             .map(|(i, name)| (name.clone(), format!("__gf_present_{i}")))
             .collect(),
         properties,
+        source_labels,
+        constrained: filter.is_some() || inserted.is_some() || refresh_of.is_some(),
     };
     scope.next += 1;
     // Each scan needs its own qualifier. Joining two leaves that are both
@@ -383,7 +473,6 @@ fn scan_tables(
     // per element kind.
     let scan_name = format!("__gf_scan_{}", scope.next);
     let mut branches = Vec::new();
-    let scanned = inserted.map_or(tables, |t| vec![t]);
     for (table, directed) in scanned {
         let orientations = match direction {
             None => vec![false],
@@ -445,13 +534,13 @@ fn scan_tables(
                 ]);
             }
             for (name, data_type) in &binding.properties {
-                let present = table.schema.field_with_name(name).is_ok();
-                projections.push(if present {
-                    col(name)
-                } else {
-                    lit(ScalarValue::try_from(data_type)?).alias(name)
+                let present = table.schema.field_with_name(name).ok();
+                projections.push(match present {
+                    Some(field) if field.data_type() == data_type => col(name),
+                    Some(_) => cast(col(name), data_type.clone()).alias(name),
+                    None => lit(ScalarValue::try_from(data_type)?).alias(name),
                 });
-                projections.push(lit(present).alias(&binding.present[name]));
+                projections.push(lit(present.is_some()).alias(&binding.present[name]));
             }
             for (label, column) in &binding.labels {
                 projections.push(lit(table.labels.contains(label)).alias(column));
@@ -492,6 +581,74 @@ fn scan_tables(
         binding,
     ))
 }
+fn refreshes(table: &Table, before: &ElementBinding) -> bool {
+    if before
+        .source_labels
+        .iter()
+        .any(|labels| labels == &table.labels)
+    {
+        return true;
+    }
+    let neighbor = before
+        .source_labels
+        .iter()
+        .any(|labels| one_label_apart(labels, &table.labels));
+    neighbor && shares_property(table, before) && properties_fit(table, before)
+}
+
+fn one_label_apart(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    let (larger, smaller) = if left.len() >= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    larger.len() == smaller.len() + 1 && smaller.is_subset(larger)
+}
+
+fn shares_property(table: &Table, before: &ElementBinding) -> bool {
+    table.schema.fields().iter().any(|field| {
+        !field.name().starts_with("__gf_") && before.properties.contains_key(field.name())
+    })
+}
+
+fn properties_fit(table: &Table, before: &ElementBinding) -> bool {
+    table.schema.fields().iter().all(|field| {
+        field.name().starts_with("__gf_")
+            || before
+                .properties
+                .get(field.name())
+                .is_none_or(|bound| graph::property_fits(field.data_type(), bound))
+    })
+}
+
+fn fragment_matches(labels: &BTreeSet<String>, filter: Option<LabelFilter<'_>>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    if let Some(expression) = filter.expression {
+        return label_holds(labels, expression);
+    }
+    filter
+        .labels
+        .iter()
+        .all(|label| labels.contains(&label.value))
+}
+
+fn label_holds(labels: &BTreeSet<String>, expression: &ast::LabelExpression) -> bool {
+    match expression {
+        ast::LabelExpression::Label(name) => labels.contains(&name.value),
+        ast::LabelExpression::Wildcard => !labels.is_empty(),
+        ast::LabelExpression::And(left, right) => {
+            label_holds(labels, left) && label_holds(labels, right)
+        }
+        ast::LabelExpression::Or(left, right) => {
+            label_holds(labels, left) || label_holds(labels, right)
+        }
+        ast::LabelExpression::Not(inner) => !label_holds(labels, inner),
+        ast::LabelExpression::Parenthesized(inner) => label_holds(labels, inner),
+    }
+}
+
 fn col(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }

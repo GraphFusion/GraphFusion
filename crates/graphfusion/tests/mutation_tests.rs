@@ -246,6 +246,8 @@ async fn failure_in_later_clause_or_result_rolls_back_all_graph_changes() {
         "MATCH (n) SET n.v = 3 RETURN 1 / 0 AS bad",
         "MATCH (n) SET n.v = 3 LET bad = 1 / 0 FINISH",
         "INSERT (n:N {v: 2}) MATCH (m {v: 1}) SET m.v = 'incompatible'",
+        "MATCH (n) SET n.v = 'incompatible'",
+        "INSERT (:N {v: 'also incompatible'})",
         "MATCH (n) DELETE n RETURN n.v AS v",
         "INSERT (:N {__gf_bad: 1})",
     ] {

@@ -19,6 +19,8 @@ These pages describe the implementation in the repository's `main` branch. They 
 | Quantified edges, path modes, shortest selectors | Partial: resource and unbounded-search restrictions | [Quantifiers](/patterns/quantifiers/) |
 | Repeated groups, alternatives, questioned paths | Partial: binding restrictions | [Complex patterns](/patterns/groups/) |
 | Aggregation, set operations and independent nested queries | Executable | [Aggregates](/expressions/aggregates/) |
+| Linear query NEXT and YIELD | Executable for query statements | [NEXT](/query/definitions-next/) |
+| TABLE / BINDING TABLE inputs | Executable for parameters and nested queries | [Binding tables](/catalog/binding-tables/) |
 | Whole-element values, aliases and property lookups | Executable | [Element references](/patterns/element-values/) |
 | INSERT, SET, REMOVE, DELETE | Executable on open graphs | [Writes](/mutations/insert/) |
 | Catalog DDL and graph type definitions | Partial: typed graph data access is not implemented | [Graph types](/catalog/graph-types/) |
@@ -28,7 +30,7 @@ These pages describe the implementation in the repository's `main` branch. They 
 
 ## Syntax ahead of execution
 
-The parser also accepts casts, CASE, most string/numeric functions, temporal expressions, record/path constructors, type/normalization/source/destination predicates, EXISTS/VALUE subqueries, typed LET, procedure calls, NEXT chains and graph-pattern YIELD. Their dedicated reference pages state the restriction next to the syntax.
+The parser also accepts casts, CASE, most string/numeric functions, temporal expressions, record/path constructors, type/normalization/source/destination predicates, EXISTS/VALUE subqueries, typed LET, procedure calls and graph-pattern YIELD. Their dedicated reference pages state the restriction next to the syntax. Query `NEXT` chains are executable; procedure-body definitions are not.
 
 `PATH_LENGTH`, `ELEMENTS`, `COALESCE`, `NULLIF`, aggregate functions and the documented element predicates **are** executable; broad function-family names alone are not a reliable support test.
 
