@@ -16,4 +16,6 @@ Arithmetic uses checked kernels. Integer overflow, division by zero and non-fini
 
 Comparisons require compatible families, with supported numeric widening. Null operands follow nullable semantics; `NULL = NULL` is not a test for null. Use [IS NULL](/expressions/null/) or a [truth predicate](/expressions/boolean/).
 
+List comparisons use that same numeric widening. An empty list is comparable with a typed list: `[1] = [1.0]` is true, `[1] = []` is false, and `[] < [1]` is true. A list of strings is not comparable with a list of numbers.
+
 The numeric function `MOD(a, b)` has parser support only; there is no executable remainder operator. Other named numeric functions have their own syntax-only pages.

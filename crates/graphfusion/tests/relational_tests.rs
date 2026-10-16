@@ -602,6 +602,38 @@ async fn composite_null_only_rows_strings_and_graph_focus() {
 }
 
 #[tokio::test]
+async fn list_comparisons_widen_numbers_and_accept_empty_lists() {
+    let mut s = Database::new().session();
+    check(
+        &mut s,
+        "RETURN [1, 2] = [1.0, 2.0] AS same, [1] < [1.5] AS less, \
+         [3] >= [2.5] AS greater, [1] <> [1.0] AS different, \
+         [1] = [] AS empty_eq, [] < [1] AS empty_lt, [] = [] AS both_empty, \
+         [[1], []] = [[1.0], []] AS nested",
+        &[&[
+            "true", "true", "true", "false", "false", "true", "true", "true",
+        ]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN NULLIF([1, 2], [1.0, 2.0]) AS removed, NULLIF([1], []) AS kept, \
+         COALESCE([1], [2.0]) AS first",
+        &[&["NULL", "[1]", "[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [[1], [1.0], [], [2]] FILTER x = [1] OR x < [] RETURN x ORDER BY x",
+        &[&["[1.0]"], &["[1.0]"]],
+    )
+    .await;
+    for query in ["RETURN [1] = ['a'] AS bad", "RETURN [TRUE] < [1] AS bad"] {
+        assert!(s.query(query).await.is_err(), "{query}");
+    }
+}
+
+#[tokio::test]
 async fn output_aliases_shadow_elements_in_group_having_and_order_contexts() {
     let mut s = fixture().await;
     s.run("INSERT (:N {v: 4})").await.unwrap();
