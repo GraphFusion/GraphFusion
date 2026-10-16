@@ -286,6 +286,66 @@ async fn groups_match_flat_expansions_and_keep_ordered_bindings() {
 }
 
 #[tokio::test]
+async fn selective_search_uses_the_node_bound_under_different_edges() {
+    let mut s = graph().await;
+    // Four nodes and six edges. Zero-or-more selection is complete by hop 3.
+    let q =
+        "MATCH p = ANY SHORTEST (a {name:'A'})-[:E]->*(d {name:'D'}) RETURN PATH_LENGTH(p) AS hops";
+    let result = query(&mut s, q).await;
+    assert_eq!(rows(&result), vec![vec!["2"]]);
+    assert!(
+        result.logical_plan.contains("< UInt64(3)"),
+        "{}",
+        result.logical_plan
+    );
+    assert!(
+        !result.logical_plan.contains("< UInt64(6)"),
+        "{}",
+        result.logical_plan
+    );
+    let q = "MATCH p = ALL SHORTEST (a {name:'A'})-[:E]->+(d) RETURN d.name AS name, PATH_LENGTH(p) AS hops ORDER BY name, hops";
+    let open = query(&mut s, q).await;
+    assert_eq!(
+        rows(&open),
+        rows(&query(&mut s, &q.replace("->+", "->{1,8}")).await)
+    );
+    assert!(
+        open.logical_plan.contains("< UInt64(4)"),
+        "{}",
+        open.logical_plan
+    );
+
+    // The unique A-to-D route has length 3, equal to the zero-or-more bound.
+    s.execute("CREATE GRAPH line ANY; SESSION SET GRAPH line")
+        .unwrap();
+    s.run(
+        "INSERT (a:N {name:'A'})-[:E]->(b:N {name:'B'})-[:E]->(c:N {name:'C'})-[:E]->(d:N {name:'D'}), \
+         (b)-[:E]->(a), (c)-[:E]->(a), (c)-[:E]->(b), (d)-[:E]->(a), (d)-[:E]->(b)",
+    )
+    .await
+    .unwrap();
+    let q =
+        "MATCH p = ANY SHORTEST (a {name:'A'})-[:E]->*(d {name:'D'}) RETURN PATH_LENGTH(p) AS hops";
+    let result = query(&mut s, q).await;
+    assert_eq!(rows(&result), vec![vec!["3"]]);
+    assert!(
+        result.logical_plan.contains("< UInt64(3)"),
+        "{}",
+        result.logical_plan
+    );
+    for selector in ["ALL SHORTEST", "SHORTEST 2 GROUPS"] {
+        let q = format!(
+            "MATCH p = {selector} (a {{name:'A'}})-[:E]->*(b) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY name, hops"
+        );
+        assert_eq!(
+            rows(&query(&mut s, &q).await),
+            rows(&query(&mut s, &q.replace("-[:E]->*", "-[:E]->{0,8}")).await),
+            "{q}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unbounded_homogeneous_selection_uses_complete_finite_bounds() {
     let mut s = graph().await;
     for selector in [

@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Cap a selective search of one unbounded edge at the complete node-derived hop
+  bound. `ANY SHORTEST` and the other selectors no longer expand every trail out
+  to the edge count when a shorter bound is complete. `ALL` still follows the
+  match mode's own limit.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
