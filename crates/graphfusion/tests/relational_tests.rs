@@ -414,6 +414,30 @@ async fn otherwise_uses_first_nonempty_branch_and_skips_cold_runtime_errors() {
 }
 
 #[tokio::test]
+async fn otherwise_keeps_the_graph_of_the_branch_that_produced_rows() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g1 ANY; CREATE GRAPH g2 ANY; SESSION SET GRAPH g1; INSERT (:N {name:'one'}); SESSION SET GRAPH g2; INSERT (:N {name:'two'})").await.unwrap();
+    check(
+        &mut s,
+        "USE g1 MATCH (n) WHERE n.name = 'zzz' RETURN n.name AS name OTHERWISE USE g2 MATCH (n) RETURN n.name AS name NEXT MATCH (m) RETURN name AS prev, m.name AS m",
+        &[&["two", "two"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "USE g1 MATCH (n) RETURN n.name AS name OTHERWISE USE g2 MATCH (n) RETURN n.name AS name NEXT MATCH (m) RETURN name AS prev, m.name AS m",
+        &[&["one", "one"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "USE g1 MATCH (n) WHERE n.name = 'zzz' RETURN 'fallback' AS name OTHERWISE USE g2 RETURN 'from2' AS name NEXT MATCH (m) RETURN name AS prev, m.name AS m",
+        &[&["from2", "two"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn select_from_graphs_and_derived_composites() {
     let mut s = fixture().await;
     check(
