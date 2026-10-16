@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Print null cells and null list elements as `NULL`. An empty list stays `[]`,
+  and an empty string stays blank, so those values are no longer identical in
+  CLI output.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
