@@ -545,21 +545,29 @@ impl Compiler<'_> {
         .await?;
         scope.advance(&branch_scope);
         let mut empty_scope = scope.clone();
-        let (absent, node) = graph::node(
-            input.clone(),
-            &mut empty_scope,
-            self.graph_id,
-            self.data,
-            &empty_node(),
-            endpoint,
-        )?;
+        // An anchored optional segment already knows its endpoint. Joining that
+        // id back to a full node scan only copies the same value.
+        let (absent, absent_state) = if let Some(endpoint) = endpoint {
+            let absent = input.clone().filter(endpoint.clone().is_not_null())?;
+            (absent, State::new(endpoint))
+        } else {
+            let (absent, node) = graph::node(
+                input.clone(),
+                &mut empty_scope,
+                self.graph_id,
+                self.data,
+                &empty_node(),
+                None,
+            )?;
+            (absent, State::new(node.column(ID)))
+        };
         scope.advance(&empty_scope);
         self.merge(
             input,
             scope,
             vec![
                 (present, branch_scope, state),
-                (absent, empty_scope, State::new(node.column(ID))),
+                (absent, empty_scope, absent_state),
             ],
             ast::PathPatternAlternation::Multiset,
         )
