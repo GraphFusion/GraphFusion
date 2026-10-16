@@ -204,6 +204,103 @@ async fn next_passes_the_working_table() {
 }
 
 #[tokio::test]
+async fn next_keeps_element_references_readable() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (a:P {name:'Ada', age:36}), (b:P {name:'Bea', age:41}),
+                    (a)-[:E {kind:'knows'}]->(b)",
+        )
+        .await
+        .unwrap();
+
+    let people = session
+        .query(
+            "MATCH (p:P) RETURN p AS person
+             NEXT RETURN person.name AS name, person.age AS age ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        people.schema.field_with_name("age").unwrap().data_type(),
+        &DataType::Int64
+    );
+    assert_eq!(
+        strings(&people),
+        vec![
+            vec!["Ada".to_string(), "36".to_string()],
+            vec!["Bea".to_string(), "41".to_string()]
+        ]
+    );
+
+    let renamed = session
+        .query(
+            "MATCH (p:P) RETURN p
+             NEXT YIELD p AS q FILTER q.name = 'Ada'
+             RETURN q.age AS age",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&renamed), vec![vec!["36".to_string()]]);
+
+    let continued = session
+        .query(
+            "MATCH (p:P) RETURN p AS person
+             NEXT RETURN person AS q
+             NEXT RETURN q.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&continued),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let edge = session
+        .query(
+            "MATCH ()-[e:E]->() RETURN e
+             NEXT RETURN e.kind AS kind, e IS DIRECTED AS directed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&edge),
+        vec![vec!["knows".to_string(), "true".to_string()]]
+    );
+
+    let hopped = session
+        .query(
+            "MATCH (p:P {name:'Ada'}) RETURN p
+             NEXT MATCH (p)-[:E]->(f)
+             RETURN f.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&hopped), vec![vec!["Bea".to_string()]]);
+
+    let missing = session
+        .query(
+            "MATCH (p:P)
+             OPTIONAL MATCH (p)-[:E]->(f)
+             RETURN p AS person, f AS friend
+             NEXT RETURN person.name AS name, friend.name AS friend
+             ORDER BY name, friend",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&missing),
+        vec![
+            vec!["Ada".to_string(), "Bea".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string()]
+        ]
+    );
+}
+
+#[tokio::test]
 async fn binding_table_inputs_join_graph_matches() {
     let mut session = social().await;
     session

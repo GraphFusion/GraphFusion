@@ -459,6 +459,22 @@ async fn plan_body(
             scope.order.push(name);
         }
         scope.domains = incoming.domains;
+        // NEXT materializes the working table, so the next statement no longer
+        // has the previous MATCH bindings. Element references still name rows
+        // in the graphs that statement read or wrote; without those snapshots
+        // a live element looks deleted.
+        scope.sources.extend(trace.sources.clone());
+        let mut missing = Vec::new();
+        for domain in scope.domains.values() {
+            for (id, _) in domain {
+                if !scope.sources.contains_key(id) && !missing.contains(id) {
+                    missing.push(*id);
+                }
+            }
+        }
+        for id in missing {
+            scope.sources.insert(id, writes.data(tx, id)?);
+        }
         references::prepare(plan, &mut scope, ctx, trace).await?
     } else {
         LogicalPlanBuilder::empty(true)
