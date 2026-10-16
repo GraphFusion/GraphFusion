@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Compare integer lists with float lists, and compare an empty list with a typed
+  list. The operands widen to one element type first, including nested lists.
+  `COALESCE` and `NULLIF` use that same list type.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
