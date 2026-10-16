@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Reject a null INSERT endpoint as an invalid query. A failed OPTIONAL MATCH no
+  longer surfaces an internal Arrow error, and the statement inserts nothing.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
