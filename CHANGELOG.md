@@ -9,6 +9,8 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- An all-null binding-table column stays untyped, so comparing it with a
+  graph property does not fail as a string/integer mismatch.
 
 ## 0.2.0 — 2026-10-05
 
