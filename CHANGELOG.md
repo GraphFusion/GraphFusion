@@ -9,6 +9,8 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- Resolve a `LET` copy of a label-constrained element from that label set, so
+  its property types are not widened by another label that stores the same name.
 
 ## 0.2.0 — 2026-10-05
 

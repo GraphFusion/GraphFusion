@@ -251,3 +251,22 @@ async fn binding_table_inputs_join_graph_matches() {
         .unwrap();
     assert_eq!(strings(&piped), vec![vec!["1".to_string()]]);
 }
+
+#[tokio::test]
+async fn element_reference_keeps_the_matched_property_type() {
+    let mut session = social().await;
+    let typed = session
+        .query(
+            "MATCH (p:Person WHERE p.name = 'Ada')
+             LET r = p
+             RETURN r.id AS id, r.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(typed.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(typed.schema.field(1).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&typed),
+        vec![vec!["1".to_string(), "1".to_string()]]
+    );
+}
