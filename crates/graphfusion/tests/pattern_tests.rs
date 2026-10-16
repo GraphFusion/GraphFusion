@@ -28,6 +28,61 @@ fn rows(result: &QueryResult) -> Vec<Vec<String>> {
 async fn query(s: &mut Session, q: &str) -> QueryResult {
     s.query(q).await.unwrap_or_else(|e| panic!("{q}\n{e}"))
 }
+fn scans(plan: &str) -> (usize, usize) {
+    let mut nodes = 0;
+    let mut edges = 0;
+    let mut rest = plan;
+    while let Some(index) = rest.find("TableScan:") {
+        let prelude = rest[..index].rsplit("Projection:").next().unwrap_or(rest);
+        if prelude.contains("__gf_source") {
+            edges += 1;
+        } else if prelude.contains("__gf_id") {
+            nodes += 1;
+        }
+        rest = &rest[index + "TableScan:".len()..];
+    }
+    (nodes, edges)
+}
+#[tokio::test]
+async fn anonymous_path_starts_at_the_first_edge() {
+    let mut s = graph().await;
+    let q = "MATCH ()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["5"]]);
+    let q = "MATCH ()-[:E]->()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["6"]]);
+    let q = "MATCH ()<-[:E]-() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["5"]]);
+    let q = "FOR x IN [1, 2] MATCH ()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["10"]]);
+    let open = scans(
+        &query(&mut s, "MATCH ()-[e:E]->() RETURN e")
+            .await
+            .logical_plan,
+    );
+    let named = scans(
+        &query(&mut s, "MATCH (a)-[e:E]->() RETURN e")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(open.1, 1, "edge scans");
+    assert_eq!(named, (open.0 + 1, 1), "named start adds one node scan");
+    let end = scans(
+        &query(&mut s, "MATCH ()-[e:E]->(b) RETURN b.name AS name")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(end, (open.0, 1));
+    let labeled = scans(
+        &query(&mut s, "MATCH (:N)-[e:E]->() RETURN e")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(labeled.0, open.0 + 1);
+    assert_eq!(
+        rows(&query(&mut s, "MATCH (:N)-[:E]->() RETURN COUNT(*) AS n").await),
+        vec![vec!["5"]]
+    );
+}
 #[tokio::test]
 async fn parentheses_concatenation_subpaths_and_prefilters() {
     let mut s = graph().await;
