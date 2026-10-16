@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Compare lists with three-valued logic. A null element stays unknown unless an
+  earlier element, or the lengths after an equal prefix, already decides the
+  result. `NULLIF` uses that same equality, so an unknown list comparison keeps
+  the original list.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
