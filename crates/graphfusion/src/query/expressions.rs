@@ -535,7 +535,8 @@ fn parameter_type(declared: &crate::types::ValueType, inferred: &DataType) -> Re
         "any" => inferred.clone(),
         "boolean" => DataType::Boolean,
         "integer" => DataType::Int64,
-        "float" => DataType::Float64,
+        // Decimal literals and parameters are f64; precision and scale were checked at declaration.
+        "float" | "decimal" => DataType::Float64,
         "string" => DataType::Utf8,
         "bytes" => DataType::Binary,
         "list" | "array" => {
