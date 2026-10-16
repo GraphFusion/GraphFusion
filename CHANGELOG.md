@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Start an anonymous path at its first edge. `()-[]->()` no longer cross-joins
+  every node to recover a source id the edge already stores. A named, labeled,
+  or constrained start node still reads the node tables.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
