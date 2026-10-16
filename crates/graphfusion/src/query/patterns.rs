@@ -54,6 +54,15 @@ fn empty_node() -> ast::NodePattern {
         quantifier: None,
     }
 }
+fn unconstrained_anonymous(node: &ast::NodePattern) -> bool {
+    node.variable.is_none()
+        && !node.temporary
+        && node.quantifier.is_none()
+        && node.labels.is_empty()
+        && node.label_expression.is_none()
+        && node.properties.is_none()
+        && node.where_clause.is_none()
+}
 fn raw_bounds(q: &ast::PathPatternQuantifier) -> Result<(u64, Option<u64>)> {
     use ast::PathPatternQuantifier as Q;
     let bounds = match q {
@@ -378,11 +387,55 @@ impl Compiler<'_> {
             Some((ast::PathPatternFactor::Node(node), rest)) => (node, rest),
             _ => (&empty, factors),
         };
-        let (mut plan, start) =
-            graph::node(plan, scope, self.graph_id, self.data, first, endpoint)?;
-        self.defer_node(start.clone(), first);
-        let mut state = State::new(start.column(ID));
-        for factor in remaining {
+        // ()-[:E]->+() already stores its first hop on the edge. A node cross
+        // join would only rediscover sources of edges the quantifier must emit.
+        // Zero repetitions still need every node, including ones with no edge.
+        let opened = if endpoint.is_none() && unconstrained_anonymous(first) {
+            match remaining.split_first() {
+                Some((ast::PathPatternFactor::Relationship(edge), rest))
+                    if !edge.temporary
+                        && edge
+                            .quantifier
+                            .as_ref()
+                            .is_some_and(|q| matches!(raw_bounds(q), Ok((min, _)) if min >= 1)) =>
+                {
+                    Some((edge, rest))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (mut plan, mut state, rest) = if let Some((edge, rest)) = opened {
+            let mut edge = edge.clone();
+            if let Some(q) = &edge.quantifier {
+                let (min, max) = raw_bounds(q)?;
+                if max.is_none() && mode == ast::PathMode::Walk && !self.different {
+                    edge.quantifier = Some(ast::PathPatternQuantifier::Range {
+                        min: Some(min),
+                        max: finite.map(|bound| bound.max(min).max(1)),
+                    });
+                }
+            }
+            let (plan, state) = paths::expand(
+                plan,
+                scope,
+                self.session,
+                self.graph_id,
+                self.data,
+                &edge,
+                None,
+                mode,
+                self.different,
+            )?;
+            (plan.filter(state.valid(mode, self.different))?, state, rest)
+        } else {
+            let (plan, start) =
+                graph::node(plan, scope, self.graph_id, self.data, first, endpoint)?;
+            self.defer_node(start.clone(), first);
+            (plan, State::new(start.column(ID)), remaining)
+        };
+        for factor in rest {
             match factor {
                 ast::PathPatternFactor::Node(node) => {
                     let (next, binding) = graph::node(
@@ -409,6 +462,7 @@ impl Compiler<'_> {
                                 max: finite.map(|bound| bound.max(min).max(1)),
                             });
                         }
+                        let prior = state.clone();
                         (plan, state) = paths::expand(
                             plan,
                             scope,
@@ -416,7 +470,7 @@ impl Compiler<'_> {
                             self.graph_id,
                             self.data,
                             &edge,
-                            &state,
+                            Some(&prior),
                             mode,
                             self.different,
                         )?;

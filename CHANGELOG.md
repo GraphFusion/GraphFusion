@@ -2,6 +2,11 @@
 
 ## 0.3.0 — Unreleased
 
+- Read a positive-length quantified edge from the edge itself when the path
+  start is anonymous and unconstrained. `()-[:E]->+()` no longer cross-joins
+  every node before the first hop. A named, labeled, or constrained start still
+  reads the node tables, and a quantifier that allows zero repetitions still
+  anchors on every node.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
