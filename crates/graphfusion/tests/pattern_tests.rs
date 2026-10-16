@@ -28,6 +28,58 @@ fn rows(result: &QueryResult) -> Vec<Vec<String>> {
 async fn query(s: &mut Session, q: &str) -> QueryResult {
     s.query(q).await.unwrap_or_else(|e| panic!("{q}\n{e}"))
 }
+fn scans(plan: &str) -> (usize, usize) {
+    let mut nodes = 0;
+    let mut edges = 0;
+    let mut rest = plan;
+    while let Some(index) = rest.find("TableScan:") {
+        let prelude = rest[..index].rsplit("Projection:").next().unwrap_or(rest);
+        if prelude.contains("__gf_source") {
+            edges += 1;
+        } else if prelude.contains("__gf_id") {
+            nodes += 1;
+        }
+        rest = &rest[index + "TableScan:".len()..];
+    }
+    (nodes, edges)
+}
+#[tokio::test]
+async fn anonymous_endpoints_reuse_the_edge_endpoint() {
+    let mut s = graph().await;
+    s.run("INSERT (:N {name:'A'})-[:E]->({name:'Z'})")
+        .await
+        .unwrap();
+    // Five original :E edges, plus A -> Z.
+    let q = "MATCH ()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["6"]]);
+    let plan = query(&mut s, "MATCH ()-[e:E]->() RETURN e")
+        .await
+        .logical_plan;
+    let open = scans(&plan);
+    assert!(open.0 > 0 && open.1 == 1, "{plan}");
+    let named = query(&mut s, "MATCH ()-[e:E]->(b) RETURN e")
+        .await
+        .logical_plan;
+    // Naming the endpoint reads the node tables a second time.
+    assert_eq!(scans(&named), (open.0 * 2, 1), "{named}");
+    // A label or property map still has to read the endpoint node.
+    let q = "MATCH ()-[:E]->(:N) RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["5"]]);
+    let q = "MATCH (a)-[:E]->({name:'Z'}) RETURN a.name AS name";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["A"]]);
+    let q = "MATCH ()-[:E]->()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["6"]]);
+    let plan = query(&mut s, q).await.logical_plan;
+    assert_eq!(scans(&plan), (open.0, 2), "{plan}");
+    let q = "MATCH ()-[:E]->({name:'B'})-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["1"]]);
+    let plan = query(&mut s, q).await.logical_plan;
+    assert_eq!(scans(&plan), (open.0 * 2, 2), "{plan}");
+    let q = "MATCH (a {name:'A'})(()-[:E]->()) RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["3"]]);
+    let plan = query(&mut s, q).await.logical_plan;
+    assert_eq!(scans(&plan), (open.0, 1), "{plan}");
+}
 #[tokio::test]
 async fn parentheses_concatenation_subpaths_and_prefilters() {
     let mut s = graph().await;
