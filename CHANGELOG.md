@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Align a shared element across path alternatives when the branches store
+  different properties. Integers widen to float, other mixed scalars are read
+  as strings, and a property present on only one branch is null on the other.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
