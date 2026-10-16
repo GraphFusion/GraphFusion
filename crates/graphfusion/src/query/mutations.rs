@@ -426,6 +426,7 @@ async fn insert_element(
     plan = freeze(plan, ctx, trace, Some((&identity, ids))).await?;
     let mut expressions = vec![Expr::Column(Column::new_unqualified(&identity)).alias(ID)];
     let mut directed = false;
+    let has_endpoints = endpoints.is_some();
     if let Some((from, to, is_directed)) = endpoints {
         directed = is_directed;
         expressions.extend([from.alias(SOURCE), to.alias(DESTINATION)]);
@@ -437,8 +438,25 @@ async fn insert_element(
         }
     }
     let mut next = data.clone();
+    let projected = plan.clone().project(expressions)?;
+    // A failed OPTIONAL MATCH null-extends a bound endpoint. Reject that before
+    // the edge table freezes source and destination as non-null ids.
+    if has_endpoints {
+        let (schema, batches) = trace.collect(ctx, &projected.clone().build()?).await?;
+        for name in [SOURCE, DESTINATION] {
+            let index = schema
+                .index_of(name)
+                .map_err(|e| Error::Corrupt(e.to_string()))?;
+            if batches
+                .iter()
+                .any(|batch| batch.column(index).null_count() > 0)
+            {
+                return Err(Error::InvalidQuery("null INSERT endpoint".into()));
+            }
+        }
+    }
     let inserted = table_with_empty(
-        plan.clone().project(expressions)?,
+        projected,
         labels,
         kind == ElementKind::Edge,
         ctx,
