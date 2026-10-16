@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep the graph focus of the `OTHERWISE` branch that produced the rows, so a
+  following `NEXT` does not stay on an earlier empty branch.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
