@@ -241,6 +241,29 @@ async fn group_scope_limits_and_runtime_errors_are_atomic() {
 }
 
 #[tokio::test]
+async fn independent_repeated_group_reuses_one_step() {
+    let mut s = graph().await;
+    let shared = "MATCH p = (a)((x)-[:E]->(y)){1,2}(b) RETURN a.name AS a, b.name AS b, PATH_LENGTH(p) AS hops ORDER BY a, hops, b";
+    let result = query(&mut s, shared).await;
+    assert!(
+        !result.logical_plan.contains("step_row"),
+        "{}",
+        result.logical_plan
+    );
+    let flat = "MATCH p = (a)-[:E]->{1,2}(b) RETURN a.name AS a, b.name AS b, PATH_LENGTH(p) AS hops ORDER BY a, hops, b";
+    assert_eq!(rows(&result), rows(&query(&mut s, flat).await));
+    let dependent =
+        "MATCH (a)((x)-[:Loop]->(y WHERE x.name = a.name)){1}(b) RETURN a.name AS a, b.name AS b";
+    let dependent_result = query(&mut s, dependent).await;
+    assert!(
+        dependent_result.logical_plan.contains("step_row"),
+        "{}",
+        dependent_result.logical_plan
+    );
+    assert_eq!(rows(&dependent_result), vec![vec!["A", "A"]]);
+}
+
+#[tokio::test]
 async fn groups_match_flat_expansions_and_keep_ordered_bindings() {
     let mut s = graph().await;
     for mode in ["WALK", "TRAIL", "SIMPLE", "ACYCLIC"] {

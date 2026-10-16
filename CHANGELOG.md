@@ -9,6 +9,9 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- Build a repeated group's one-step relation once when it does not read an
+  outer variable, instead of crossing that relation with every input row. A
+  group that reads an outer variable still keeps a separate step per row.
 
 ## 0.2.0 — 2026-10-05
 

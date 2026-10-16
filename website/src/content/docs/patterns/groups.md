@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-Parenthesized subpaths let you constrain a segment before an enclosing selector. Repeating a group joins each iteration's endpoint to the next start.
+Parenthesized subpaths let you constrain a segment before an enclosing selector. Repeating a group joins each iteration's endpoint to the next start. A group that does not read an outer variable builds that one-step relation once and reuses it for every input row. A group that reads an outer variable keeps a separate step for each row.
 
 ```gql test
 MATCH p = (a {name: 'Alice'})((x)-[edges:Knows]->(y)){0,2}(b)
