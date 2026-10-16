@@ -178,12 +178,22 @@ pub(super) async fn matches(
         trace,
         different,
         predicates: Vec::new(),
+        match_filter: clause.where_clause.clone(),
     };
     let mut edge_lists: Vec<Expr> = Vec::new();
     for path in &clause.patterns {
         compiler.validate(path, None)?;
+        let (_, selection) = super::paths::prefix(path.prefix.as_ref(), session)?;
         let (next, state) = compiler
-            .pattern(plan, scope, path, None, None, true)
+            .pattern(
+                plan,
+                scope,
+                path,
+                None,
+                None,
+                true,
+                path.alternation.is_none() && matches!(selection, super::paths::Selection::All),
+            )
             .await?;
         plan = next;
         if different {
@@ -199,8 +209,8 @@ pub(super) async fn matches(
         edge_lists.push(state.edges);
     }
     plan = compiler.apply_predicates(plan, scope, 0)?;
-    if let Some(predicate) = &clause.where_clause {
-        let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
+    if let Some(predicate) = compiler.match_filter.take() {
+        let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(&predicate)?;
         plan = plan.filter(expr)?;
     }
     Ok(plan)

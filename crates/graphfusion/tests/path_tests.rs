@@ -462,3 +462,34 @@ async fn path_bags_match_exhaustive_walks_on_mixed_cyclic_graph() {
         }
     }
 }
+
+#[tokio::test]
+async fn match_where_conjunct_runs_before_variable_length_expansion() {
+    let mut s = graph().await;
+    let filtered = s.query("MATCH p = (a)-[:E]->{0,2}(b) WHERE a.name = 'A' AND b.name = 'D' RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY hops, name").await.unwrap();
+    assert_eq!(rows(&filtered), vec![vec!["D", "2"], vec!["D", "2"]]);
+    let plan = &filtered.logical_plan;
+    let recursive = plan.find("RecursiveQuery").expect(plan);
+    let start = plan.find("Utf8(\"A\")").expect(plan);
+    let end = plan.find("Utf8(\"D\")").expect(plan);
+    assert!(
+        recursive < start,
+        "start conjunct must sit inside the recursive anchor:\n{plan}"
+    );
+    assert!(
+        end < recursive,
+        "end conjunct stays after expansion:\n{plan}"
+    );
+    let inline = s.query("MATCH p = (a {name:'A'})-[:E]->{0,2}(b {name:'D'}) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY hops, name").await.unwrap();
+    assert_eq!(rows(&inline), rows(&filtered));
+    let across = s
+        .query("MATCH (a)-[:E]->(b), (c) WHERE a.name = c.name AND c.name = 'A' RETURN b.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(rows(&across), vec![vec!["B"], vec!["C"]]);
+    let selective = s.query("MATCH p = ANY SHORTEST (a)-[:E]->{1,4}(b {name:'B'}) WHERE PATH_LENGTH(p) > 1 RETURN a.name AS name, PATH_LENGTH(p) AS hops ORDER BY name").await.unwrap();
+    assert_eq!(
+        rows(&selective),
+        vec![vec!["B", "3"], vec!["C", "3"], vec!["D", "2"]]
+    );
+}
