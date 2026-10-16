@@ -240,6 +240,22 @@ async fn binding_table_inputs_join_graph_matches() {
     let none = session.query("TABLE $empty RETURN 1 AS n").await.unwrap();
     assert_eq!(none.row_count(), 0);
 
+    session
+        .set_parameter(
+            "blank",
+            Value::BindingTable(vec![BTreeMap::from([("id".to_string(), Value::Null)])]),
+        )
+        .unwrap();
+    let blank = session
+        .query(
+            "TABLE $blank
+             MATCH (p:Person WHERE p.id = id)
+             RETURN p.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank.row_count(), 0);
+
     let piped = session
         .query(
             "TABLE { RETURN 'Ada' AS name }

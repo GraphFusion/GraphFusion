@@ -3,7 +3,9 @@ use super::{execution, plan, unsupported, WorkingTable};
 use crate::{gql as ast, transaction::StatementTxn, Error, Result, SessionState, Value};
 use datafusion::{
     arrow::{
-        array::{ArrayRef, BinaryBuilder, BooleanArray, Float64Array, Int64Array, StringArray},
+        array::{
+            ArrayRef, BinaryBuilder, BooleanArray, Float64Array, Int64Array, NullArray, StringArray,
+        },
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     },
@@ -105,7 +107,9 @@ fn rows_to_plan(rows: &[BTreeMap<String, Value>]) -> Result<LogicalPlan> {
                 }
             });
         }
-        let data_type = unified.unwrap_or(DataType::Utf8);
+        // An all-null column has no scalar type. Utf8 would make `p.id = id`
+        // a string/integer comparison and reject a typed graph lookup.
+        let data_type = unified.unwrap_or(DataType::Null);
         columns.push(column_array(name, &data_type, rows)?);
         fields.push(Field::new(name, data_type, true));
     }
@@ -134,6 +138,7 @@ fn column_array(
 ) -> Result<ArrayRef> {
     let values = rows.iter().map(|row| row.get(name));
     let array: ArrayRef = match data_type {
+        DataType::Null => Arc::new(NullArray::new(rows.len())),
         DataType::Boolean => Arc::new(BooleanArray::from(
             values
                 .map(|value| match value {
