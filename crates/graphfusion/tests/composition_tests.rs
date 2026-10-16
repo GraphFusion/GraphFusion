@@ -251,3 +251,72 @@ async fn binding_table_inputs_join_graph_matches() {
         .unwrap();
     assert_eq!(strings(&piped), vec![vec!["1".to_string()]]);
 }
+
+#[tokio::test]
+async fn refresh_keeps_the_bound_label_set_schema() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:Person {name: 'Ada', score: 1}),
+                    (:Person&Extra {name: 'Bea', score: 2, note: 'hi'})",
+        )
+        .await
+        .unwrap();
+    let updated = session
+        .run(
+            "MATCH (p:Person&!Extra)
+             SET p.flag = true
+             SET p.note = 1
+             RETURN p.name AS name, p.note = 1 AS same, p IS LABELED Extra AS extra",
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let graphfusion::StatementOutput::Query(updated) = updated else {
+        panic!("query result expected");
+    };
+    assert_eq!(updated.schema.field(1).data_type(), &DataType::Boolean);
+    assert_eq!(
+        strings(&updated),
+        vec![vec![
+            "Ada".to_string(),
+            "true".to_string(),
+            "false".to_string()
+        ]]
+    );
+    let stored = session
+        .query("MATCH (p:Person&!Extra) RETURN p.note AS note, p.flag AS flag")
+        .await
+        .unwrap();
+    assert_eq!(stored.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(stored.schema.field(1).data_type(), &DataType::Boolean);
+    assert_eq!(
+        strings(&stored),
+        vec![vec!["1".to_string(), "true".to_string()]]
+    );
+    let labeled = session
+        .run(
+            "MATCH (p:Person&!Extra WHERE p.name = 'Ada')
+             SET p IS Retired
+             RETURN p IS LABELED Retired AS retired, p.note = 1 AS same, p.name AS name",
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let graphfusion::StatementOutput::Query(labeled) = labeled else {
+        panic!("query result expected");
+    };
+    assert_eq!(
+        strings(&labeled),
+        vec![vec![
+            "true".to_string(),
+            "true".to_string(),
+            "Ada".to_string()
+        ]]
+    );
+}
