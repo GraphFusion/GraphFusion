@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Reuse an edge endpoint for an anonymous unconstrained node. A pattern such as
+  `()-[]->()` no longer joins every node just to copy an id the edge already
+  carries. Labels, property maps, and named variables still read that node.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
