@@ -36,6 +36,10 @@ pub(super) struct Compiler<'a> {
     pub trace: &'a mut Trace,
     pub different: bool,
     pub predicates: Vec<Predicate>,
+    /// Remainder of the MATCH WHERE. Ready AND-conjuncts are applied as soon
+    /// as the variables they read are bound, before a later variable-length
+    /// expansion. Selective paths leave this untouched until after selection.
+    pub match_filter: Option<ast::Expr>,
 }
 fn narrower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -294,6 +298,7 @@ impl Compiler<'_> {
         endpoint: Option<Expr>,
         finite: Option<u64>,
         defer_predicates: bool,
+        early_where: bool,
     ) -> Result<(Plan, State)> {
         let predicate_start = self.predicates.len();
         let (mode, selection) = paths::prefix(path.prefix.as_ref(), self.session)?;
@@ -319,7 +324,16 @@ impl Compiler<'_> {
             ))
             .await?
         } else {
-            Box::pin(self.factors(plan, scope, &path.factors, endpoint, mode, finite)).await?
+            Box::pin(self.factors(
+                plan,
+                scope,
+                &path.factors,
+                endpoint,
+                mode,
+                finite,
+                early_where && matches!(selection, Selection::All),
+            ))
+            .await?
         };
         // Bind the complete path before its inline predicates, and filter
         // candidates before selection. Plain MATCH paths may refer forward
@@ -364,6 +378,7 @@ impl Compiler<'_> {
         projection.push(state.value(self.graph_id).alias(column.name));
         Ok(plan.project(projection)?)
     }
+    #[allow(clippy::too_many_arguments)]
     async fn factors(
         &mut self,
         plan: Plan,
@@ -372,15 +387,24 @@ impl Compiler<'_> {
         endpoint: Option<Expr>,
         mode: ast::PathMode,
         finite: Option<u64>,
+        early_where: bool,
     ) -> Result<(Plan, State)> {
         let empty = empty_node();
         let (first, remaining) = match factors.split_first() {
             Some((ast::PathPatternFactor::Node(node), rest)) => (node, rest),
             _ => (&empty, factors),
         };
-        let (mut plan, start) =
-            graph::node(plan, scope, self.graph_id, self.data, first, endpoint)?;
+        let mut plan = if early_where {
+            self.apply_ready_filter(plan, scope)?
+        } else {
+            plan
+        };
+        let (next, start) = graph::node(plan, scope, self.graph_id, self.data, first, endpoint)?;
+        plan = next;
         self.defer_node(start.clone(), first);
+        if early_where {
+            plan = self.apply_ready_filter(plan, scope)?;
+        }
         let mut state = State::new(start.column(ID));
         for factor in remaining {
             match factor {
@@ -490,8 +514,28 @@ impl Compiler<'_> {
                 }
             }
             plan = plan.filter(state.valid(mode, self.different))?;
+            if early_where {
+                plan = self.apply_ready_filter(plan, scope)?;
+            }
         }
         Ok((plan, state))
+    }
+    fn apply_ready_filter(&mut self, mut plan: Plan, scope: &Bindings) -> Result<Plan> {
+        let Some(filter) = self.match_filter.take() else {
+            return Ok(plan);
+        };
+        let mut waiting = Vec::new();
+        for expr in conjuncts(filter) {
+            if expr_is_bound(&expr, scope) {
+                let predicate =
+                    Binder::with_bindings(self.session, plan.schema(), scope).predicate(&expr)?;
+                plan = plan.filter(predicate)?;
+            } else {
+                waiting.push(expr);
+            }
+        }
+        self.match_filter = combine_and(waiting);
+        Ok(plan)
     }
     async fn group_once(
         &mut self,
@@ -509,7 +553,8 @@ impl Compiler<'_> {
         }
         let finite = narrower(finite, self.capacity(mode));
         let (mut plan, state) =
-            Box::pin(self.pattern(plan, scope, &group.pattern, endpoint, finite, false)).await?;
+            Box::pin(self.pattern(plan, scope, &group.pattern, endpoint, finite, false, false))
+                .await?;
         plan = plan.filter(state.valid(mode, self.different))?;
         if let Some(predicate) = &group.where_clause {
             let value =
@@ -589,6 +634,7 @@ impl Compiler<'_> {
                 endpoint.clone(),
                 mode,
                 finite,
+                false,
             ))
             .await?;
             let plan = self.apply_predicates(plan, &branch_scope, predicate_start)?;
@@ -623,5 +669,64 @@ fn depends_on(expr: &ast::Expr, name: &str) -> bool {
             variables.iter().any(|v| v.value == name)
         }
         _ => true, // A new expression kind must be audited before it enables this proof.
+    }
+}
+
+fn conjuncts(expr: ast::Expr) -> Vec<ast::Expr> {
+    match expr {
+        ast::Expr::Binary {
+            op: ast::BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mut parts = conjuncts(*left);
+            parts.extend(conjuncts(*right));
+            parts
+        }
+        other => vec![other],
+    }
+}
+
+fn combine_and(exprs: Vec<ast::Expr>) -> Option<ast::Expr> {
+    let mut exprs = exprs.into_iter();
+    let first = exprs.next()?;
+    Some(exprs.fold(first, |left, right| ast::Expr::Binary {
+        op: ast::BinaryOp::And,
+        left: Box::new(left),
+        right: Box::new(right),
+    }))
+}
+
+/// A conjunct can run when every variable it reads is already bound.
+/// Unknown expression kinds stay pending.
+fn expr_is_bound(expr: &ast::Expr, scope: &Bindings) -> bool {
+    use ast::Expr as E;
+    let bound = |name: &ast::Identifier| {
+        scope.contains(&name.value) || scope.references.contains_key(&name.value)
+    };
+    match expr {
+        E::Literal(_) | E::Parameter(_) | E::Wildcard => true,
+        E::Identifier(name) => bound(name),
+        E::Property { base, .. } => expr_is_bound(base, scope),
+        E::Unary { expr, .. }
+        | E::IsNull { expr, .. }
+        | E::IsUnknown { expr, .. }
+        | E::IsTruth { expr, .. }
+        | E::AbsoluteValue { expr }
+        | E::Elements { path: expr }
+        | E::Cast { expr, .. } => expr_is_bound(expr, scope),
+        E::Binary { left, right, .. } | E::NullIf { left, right } => {
+            expr_is_bound(left, scope) && expr_is_bound(right, scope)
+        }
+        E::NumericFunction { args, .. }
+        | E::Coalesce(args)
+        | E::List(args)
+        | E::Function { args, .. } => args.iter().all(|expr| expr_is_bound(expr, scope)),
+        E::ElementId { variable }
+        | E::PropertyExists { variable, .. }
+        | E::IsLabeled { variable, .. }
+        | E::IsDirected { variable, .. } => bound(variable),
+        E::Same { variables } | E::AllDifferent { variables } => variables.iter().all(bound),
+        _ => false,
     }
 }

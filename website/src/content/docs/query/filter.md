@@ -13,7 +13,7 @@ FILTER p.name <> 'Bob'
 RETURN p.name AS name;
 ```
 
-The result is Alice. Predicates can use bound properties, parameters, scalar operators and the supported element predicates.
+The result is Alice. Predicates can use bound properties, parameters, scalar operators and the supported element predicates. On an ordinary MATCH, each top-level AND conjunct runs once every variable it reads is bound, so a start-node condition is applied before a later variable-length expansion. A conjunct that names an element declared later stays pending until that element is matched. A WHERE on a selective path still runs after selection.
 
 An OPTIONAL MATCH predicate participates in matching before null padding. A later FILTER runs after padding and can remove unmatched rows. Put conditions on the optional neighbor inside OPTIONAL MATCH when you want to keep input rows that have no such neighbor.
 
