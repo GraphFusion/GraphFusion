@@ -154,6 +154,21 @@ async fn label_filters_scan_only_compatible_fragments() {
     );
 }
 
+#[tokio::test]
+async fn missing_label_does_not_inherit_other_property_types() {
+    let mut session = social().await;
+    let missing = session
+        .query("MATCH (n:Missing) WHERE n.id = 1 RETURN n.id AS id")
+        .await
+        .unwrap();
+    assert_eq!(missing.row_count(), 0);
+    let grouped = session
+        .query("MATCH (n:Missing) RETURN n.id AS id, COUNT(*) AS c")
+        .await
+        .unwrap();
+    assert_eq!(grouped.row_count(), 0);
+}
+
 async fn statement(session: &mut graphfusion::Session, query: &str) -> graphfusion::QueryResult {
     let output = session.run(query).await.unwrap().pop().unwrap();
     match output {
