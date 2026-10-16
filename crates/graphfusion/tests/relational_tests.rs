@@ -376,6 +376,87 @@ async fn composite_schema_names_types_and_scopes_are_checked() {
 }
 
 #[tokio::test]
+async fn composite_lists_widen_numbers_and_accept_empty_lists() {
+    let mut s = Database::new().session();
+    let result = query(
+        &mut s,
+        "RETURN [1, 2] AS x UNION ALL RETURN [1.0, 2.0] AS x UNION ALL RETURN [] AS x",
+    )
+    .await;
+    let DataType::List(field) = result.schema.field(0).data_type() else {
+        panic!("list column");
+    };
+    assert_eq!(field.data_type(), &DataType::Float64);
+    let mut actual: Vec<_> = rows(&result).into_iter().map(|r| r[0].clone()).collect();
+    actual.sort();
+    assert_eq!(actual, ["[1.0, 2.0]", "[1.0, 2.0]", "[]"]);
+    check(
+        &mut s,
+        "RETURN [1] AS x UNION RETURN [1.0] AS x",
+        &[&["[1.0]"]],
+    )
+    .await;
+    check(&mut s, "RETURN [1] AS x EXCEPT RETURN [1.0] AS x", &[]).await;
+    check(&mut s, "RETURN [1] AS x EXCEPT RETURN [] AS x", &[&["[1]"]]).await;
+    check(
+        &mut s,
+        "RETURN [1] AS x INTERSECT RETURN [1.0] AS x",
+        &[&["[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [[1], [1]] RETURN x INTERSECT ALL FOR x IN [[1.0]] RETURN x",
+        &[&["[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN [[1], []] AS x UNION RETURN [[1.0], []] AS x",
+        &[&["[[1.0], []]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN [1] AS x OTHERWISE RETURN [1.0] AS x",
+        &[&["[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FILTER FALSE RETURN [] AS x OTHERWISE RETURN [2] AS x",
+        &[&["[2]"]],
+    )
+    .await;
+    let result = query(
+        &mut s,
+        "RETURN 1 AS n, [1] AS xs UNION ALL RETURN 1.5 AS n, [] AS xs",
+    )
+    .await;
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+    let DataType::List(field) = result.schema.field(1).data_type() else {
+        panic!("list column");
+    };
+    assert_eq!(field.data_type(), &DataType::Int64);
+    let mut actual: Vec<_> = rows(&result)
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect();
+    actual.sort();
+    assert_eq!(
+        actual,
+        vec![("1".into(), "[1]".into()), ("1.5".into(), "[]".into())]
+    );
+    for sql in [
+        "RETURN [1] AS x UNION RETURN ['a'] AS x",
+        "RETURN [TRUE] AS x UNION ALL RETURN [1] AS x",
+        "RETURN [[1]] AS x OTHERWISE RETURN [['a']] AS x",
+    ] {
+        assert!(s.query(sql).await.is_err(), "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn otherwise_uses_first_nonempty_branch_and_skips_cold_runtime_errors() {
     let mut s = fixture().await;
     check(

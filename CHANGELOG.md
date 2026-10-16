@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Widen integer, float, and empty lists in `UNION`, `INTERSECT`, `EXCEPT`, and
+  `OTHERWISE`, including nested lists. String and boolean lists stay incompatible
+  with number lists.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
