@@ -251,3 +251,46 @@ async fn binding_table_inputs_join_graph_matches() {
         .unwrap();
     assert_eq!(strings(&piped), vec![vec!["1".to_string()]]);
 }
+
+#[tokio::test]
+async fn binding_table_rejects_non_numeric_mixed_columns() {
+    let mut session = Database::new().session();
+    session
+        .set_parameter(
+            "mixed",
+            Value::BindingTable(vec![
+                BTreeMap::from([("v".to_string(), Value::Boolean(true))]),
+                BTreeMap::from([("v".to_string(), Value::Integer(1))]),
+            ]),
+        )
+        .unwrap();
+    let error = session
+        .query("TABLE $mixed RETURN v AS v")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("mixed types for binding-table column v"),
+        "{error}"
+    );
+
+    session
+        .set_parameter(
+            "nums",
+            Value::BindingTable(vec![
+                BTreeMap::from([("v".to_string(), Value::Integer(1))]),
+                BTreeMap::from([("v".to_string(), Value::Float(1.5))]),
+            ]),
+        )
+        .unwrap();
+    let nums = session
+        .query("TABLE $nums RETURN v AS v ORDER BY v")
+        .await
+        .unwrap();
+    assert_eq!(nums.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&nums),
+        vec![vec!["1".to_string()], vec!["1.5".to_string()]]
+    );
+}
