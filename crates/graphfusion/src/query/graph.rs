@@ -6,12 +6,22 @@ use crate::{
     Error, Result, SessionState,
 };
 use datafusion::{
-    arrow::datatypes::DataType,
+    arrow::{
+        array::{Array, BooleanArray, NullArray},
+        datatypes::DataType,
+    },
     common::{Column, ScalarValue, TableReference},
     datasource::provider_as_source,
-    logical_expr::{cast, lit, Expr, JoinType, LogicalPlan, LogicalPlanBuilder},
+    error::DataFusionError,
+    logical_expr::{
+        cast, create_udf, lit, ColumnarValue, Expr, JoinType, LogicalPlan, LogicalPlanBuilder,
+        Volatility,
+    },
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ElementKind {
@@ -33,6 +43,12 @@ pub(super) struct ElementBinding {
     /// Set when a label pattern or an insert selected the source fragments.
     /// An unconstrained match keeps the full element-kind union.
     pub constrained: bool,
+    /// Identities deleted earlier in this statement that this variable still
+    /// carries on some rows. Other rows of the variable stay readable.
+    pub tombstones: BTreeSet<u64>,
+    /// Identity from before a post-delete refresh. The refreshed id is null
+    /// for a removed row, which would otherwise look like an optional miss.
+    pub prior_id: Option<String>,
 }
 impl ElementBinding {
     pub fn column(&self, name: &str) -> Expr {
@@ -41,21 +57,35 @@ impl ElementBinding {
             name,
         ))
     }
-    pub fn property(&self, name: &str) -> Expr {
+    fn raw_property(&self, name: &str) -> Expr {
         if self.properties.contains_key(name) {
             self.column(name)
         } else {
             lit(ScalarValue::Null)
         }
     }
+    pub fn property(&self, name: &str) -> Expr {
+        let data_type = self.properties.get(name).cloned().unwrap_or(DataType::Null);
+        self.ensure_live(self.raw_property(name), data_type)
+    }
     pub fn property_exists(&self, name: &str) -> Expr {
-        self.nullable_predicate(self.present.get(name).map_or_else(
+        let value = self.present.get(name).map_or_else(
             || lit(false),
-            |column| self.column(column).and(self.property(name).is_not_null()),
-        ))
+            |column| {
+                self.column(column)
+                    .and(self.raw_property(name).is_not_null())
+            },
+        );
+        self.ensure_live(self.nullable_predicate(value), DataType::Boolean)
     }
     pub fn label(&self, label: &ast::LabelExpression) -> Expr {
-        self.nullable_predicate(match label {
+        self.ensure_live(
+            self.nullable_predicate(self.raw_label(label)),
+            DataType::Boolean,
+        )
+    }
+    fn raw_label(&self, label: &ast::LabelExpression) -> Expr {
+        match label {
             ast::LabelExpression::Label(name) => self
                 .labels
                 .get(&name.value)
@@ -66,11 +96,11 @@ impl ElementBinding {
                 .map(|column| self.column(column))
                 .reduce(Expr::or)
                 .unwrap_or_else(|| lit(false)),
-            ast::LabelExpression::And(a, b) => self.label(a).and(self.label(b)),
-            ast::LabelExpression::Or(a, b) => self.label(a).or(self.label(b)),
-            ast::LabelExpression::Not(a) => Expr::Not(Box::new(self.label(a))),
-            ast::LabelExpression::Parenthesized(a) => self.label(a),
-        })
+            ast::LabelExpression::And(a, b) => self.raw_label(a).and(self.raw_label(b)),
+            ast::LabelExpression::Or(a, b) => self.raw_label(a).or(self.raw_label(b)),
+            ast::LabelExpression::Not(a) => Expr::Not(Box::new(self.raw_label(a))),
+            ast::LabelExpression::Parenthesized(a) => self.raw_label(a),
+        }
     }
     pub fn nullable_predicate(&self, value: Expr) -> Expr {
         Expr::Case(datafusion::logical_expr::expr::Case::new(
@@ -92,15 +122,73 @@ impl ElementBinding {
             lit(format!("g{}:{kind}:", self.graph)),
             cast(self.column(graph::ID), DataType::Utf8),
         ]);
-        Expr::Case(datafusion::logical_expr::expr::Case::new(
-            None,
-            vec![(
-                Box::new(self.column(graph::ID).is_null()),
-                Box::new(lit(ScalarValue::Utf8(None))),
-            )],
-            Some(Box::new(value)),
-        ))
+        self.ensure_live(
+            Expr::Case(datafusion::logical_expr::expr::Case::new(
+                None,
+                vec![(
+                    Box::new(self.column(graph::ID).is_null()),
+                    Box::new(lit(ScalarValue::Utf8(None))),
+                )],
+                Some(Box::new(value)),
+            )),
+            DataType::Utf8,
+        )
     }
+    /// Fail the batch when a row still names an identity deleted earlier in
+    /// the statement. Rows whose identity was not deleted pass through.
+    pub fn ensure_live(&self, value: Expr, data_type: DataType) -> Expr {
+        if self.tombstones.is_empty() {
+            return value;
+        }
+        let id = if let Some(name) = &self.prior_id {
+            Expr::Column(Column::new_unqualified(name))
+        } else {
+            self.column(graph::ID)
+        };
+        let deleted = id.in_list(self.tombstones.iter().copied().map(lit).collect(), false);
+        if data_type == DataType::Null {
+            return create_udf(
+                "gql_live_element_null",
+                vec![DataType::Boolean],
+                DataType::Null,
+                Volatility::Immutable,
+                Arc::new(|args| {
+                    let arrays = ColumnarValue::values_to_arrays(args)?;
+                    reject_deleted(&arrays[0])?;
+                    Ok(ColumnarValue::Array(Arc::new(NullArray::new(
+                        arrays[0].len(),
+                    ))))
+                }),
+            )
+            .call(vec![deleted]);
+        }
+        let name = format!("gql_live_element_{data_type:?}").to_lowercase();
+        create_udf(
+            &name,
+            vec![DataType::Boolean, data_type.clone()],
+            data_type,
+            Volatility::Immutable,
+            Arc::new(|args| {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                reject_deleted(&arrays[0])?;
+                Ok(args[1].clone())
+            }),
+        )
+        .call(vec![deleted, value])
+    }
+}
+
+fn reject_deleted(flags: &dyn Array) -> datafusion::error::Result<()> {
+    let flags = flags
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| DataFusionError::Internal("expected boolean deleted flag".into()))?;
+    if flags.iter().flatten().any(|deleted| deleted) {
+        return Err(DataFusionError::Execution(
+            "dereference of a deleted or unavailable graph element".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -466,6 +554,8 @@ fn scan_tables(
         properties,
         source_labels,
         constrained: filter.is_some() || inserted.is_some() || refresh_of.is_some(),
+        tombstones: BTreeSet::new(),
+        prior_id: None,
     };
     scope.next += 1;
     // Each scan needs its own qualifier. Joining two leaves that are both
