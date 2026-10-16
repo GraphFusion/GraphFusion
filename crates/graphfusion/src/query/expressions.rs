@@ -107,7 +107,12 @@ impl<'a> Binder<'a> {
                 ast::Literal::Unknown => ScalarValue::Boolean(None),
                 ast::Literal::Boolean(v) => ScalarValue::Boolean(Some(*v)),
                 ast::Literal::Integer(v) => ScalarValue::Int64(Some(*v)),
-                ast::Literal::Decimal(v) => ScalarValue::Float64(Some(*v)),
+                ast::Literal::Decimal(v) => {
+                    if !v.is_finite() {
+                        return Err(Error::InvalidQuery("non-finite decimal literal".into()));
+                    }
+                    ScalarValue::Float64(Some(*v))
+                }
                 ast::Literal::String(v) => ScalarValue::Utf8(Some(v.clone())),
                 ast::Literal::Bytes(v) => ScalarValue::Binary(Some(v.clone())),
                 _ => return Err(super::unsupported("temporal query literals")),
