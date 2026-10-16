@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep element references readable across `NEXT`. A later statement can read
+  properties and labels of a node or edge passed in the working table, including
+  after `YIELD` renames it. A null reference stays null.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
