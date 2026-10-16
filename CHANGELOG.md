@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Reject a grouped result that still refers to an ungrouped input, including in
+  `ORDER BY` and `HAVING`, as an invalid query.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
