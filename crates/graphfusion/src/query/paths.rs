@@ -339,12 +339,13 @@ pub(super) fn expand(
         edges: col(&edge_name),
     };
     recursive = recursive.filter(col(&depth_name).lt(lit(max)))?;
-    let (edge_scan, binding) = graph::scan(
+    let (edge_scan, binding) = graph::scan_filtered(
         scope,
         graph_id,
         data,
         ElementKind::Edge,
         Some(edge.direction),
+        graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
     )?;
     let mut local = scope.clone();
     if let Some(name) = &edge.variable {

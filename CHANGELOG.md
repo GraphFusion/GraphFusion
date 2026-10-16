@@ -2,6 +2,14 @@
 
 ## 0.3.0 — Unreleased
 
+- Scan a label pattern's compatible fragments only, so a multi-type graph keeps
+  each type's property types and does not read unrelated tables. Integers widen
+  to float when a pattern matches both; other mixed scalar properties are read
+  as strings. A label set still stores one type per property, and a write cannot
+  change it or widen a bound element with another type's schema.
+- Execute linear query `NEXT` / `YIELD` chains, and read session or nested
+  binding tables with `TABLE` / `BINDING TABLE`.
+
 ## 0.2.0 — 2026-10-05
 
 - Add typed AST visitors and deterministic tree dumps covering every stored AST

@@ -227,13 +227,22 @@ impl Parser {
     }
 
     fn starts_binding_variable_definition(&self) -> bool {
-        matches!(
-            self.peek_kind(),
-            TokenKind::Value | TokenKind::Graph | TokenKind::Table
-        ) || (self.peek_n_kind(0) == Some(TokenKind::Binding)
-            && self.peek_n_kind(1) == Some(TokenKind::Table))
+        matches!(self.peek_kind(), TokenKind::Value | TokenKind::Graph)
             || (self.peek_n_kind(0) == Some(TokenKind::Property)
                 && self.peek_n_kind(1) == Some(TokenKind::Graph))
+            || self.starts_binding_table_variable_definition()
+    }
+
+    fn starts_binding_table_variable_definition(&self) -> bool {
+        let table = self.at(TokenKind::Table)
+            || (self.at(TokenKind::Binding) && self.peek_n_kind(1) == Some(TokenKind::Table));
+        if !table {
+            return false;
+        }
+        // `TABLE name = ...` is a procedure definition. `TABLE $rows` and
+        // `TABLE { ... }` are query inputs, so a failed definition parse stays a query.
+        let mut trial = self.clone();
+        trial.parse_binding_table_variable_definition().is_ok()
     }
 
     fn parse_binding_variable_definition(&mut self) -> Result<BindingVariableDefinition> {
@@ -359,6 +368,16 @@ impl Parser {
             | TokenKind::Return
             | TokenKind::Select
             | TokenKind::Finish => Ok(Statement::Query(self.parse_query_statement()?)),
+            TokenKind::Table
+                if self
+                    .peek_n_kind(1)
+                    .is_some_and(|kind| self.is_strict_binding_table_expression_start(kind)) =>
+            {
+                Ok(Statement::Query(self.parse_query_statement()?))
+            }
+            TokenKind::Binding if self.peek_n_kind(1) == Some(TokenKind::Table) => {
+                Ok(Statement::Query(self.parse_query_statement()?))
+            }
             TokenKind::Optional if self.peek_n_kind(1) == Some(TokenKind::Call) => {
                 self.parse_call_statement_or_query()
             }
@@ -600,6 +619,14 @@ impl Parser {
         }
     }
 
+    fn parse_binding_table_clause(&mut self) -> Result<BindingTableExpression> {
+        if self.at(TokenKind::Binding) {
+            self.expect(TokenKind::Binding)?;
+        }
+        self.expect(TokenKind::Table)?;
+        self.parse_binding_table_expression()
+    }
+
     fn parse_query_body(&mut self) -> Result<QueryBody> {
         let mut clauses = Vec::new();
         while matches!(
@@ -622,6 +649,8 @@ impl Parser {
                 | TokenKind::Skip
                 | TokenKind::Limit
                 | TokenKind::LBrace
+                | TokenKind::Table
+                | TokenKind::Binding
         ) {
             match self.peek_kind() {
                 TokenKind::Use => {
@@ -631,6 +660,11 @@ impl Parser {
                     clauses.push(QueryClause::NestedQuery(Box::new(
                         self.parse_nested_query_specification()?,
                     )));
+                }
+                TokenKind::Table | TokenKind::Binding => {
+                    clauses.push(QueryClause::BindingTable(
+                        self.parse_binding_table_clause()?,
+                    ));
                 }
                 TokenKind::Optional | TokenKind::Match => {
                     if self.at(TokenKind::Optional) && self.peek_n_kind(1) == Some(TokenKind::Call)
@@ -696,6 +730,8 @@ impl Parser {
                     TokenKind::Limit,
                     TokenKind::Use,
                     TokenKind::LBrace,
+                    TokenKind::Table,
+                    TokenKind::Binding,
                     TokenKind::Return,
                     TokenKind::Select,
                     TokenKind::Finish,
@@ -7325,6 +7361,7 @@ fn query_clauses_have_non_unit_working_table(clauses: &[QueryClause]) -> bool {
         matches!(
             clause,
             QueryClause::NestedQuery(_)
+                | QueryClause::BindingTable(_)
                 | QueryClause::Match(_)
                 | QueryClause::OptionalMatchBlock(_)
                 | QueryClause::Let(_)
@@ -7801,6 +7838,7 @@ fn query_clause_contains_procedure_body(clause: &QueryClause) -> bool {
     match clause {
         QueryClause::UseGraph(graph) => graph_expression_contains_procedure_body(graph),
         QueryClause::NestedQuery(query) => query_statement_contains_procedure_body(query),
+        QueryClause::BindingTable(table) => binding_table_expression_contains_procedure_body(table),
         QueryClause::Match(match_clause) => match_clause_contains_procedure_body(match_clause),
         QueryClause::OptionalMatchBlock(matches) => {
             matches.iter().any(match_clause_contains_procedure_body)

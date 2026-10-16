@@ -470,8 +470,8 @@ async fn insert_element(
     }
     // IDs are allocated by the coordinator and endpoints come from validated bindings.
     // Existing sealed fragments can remain lazy during append-only writes.
-    crate::graph::property_types(next.nodes.iter().map(|t| &t.0))?;
-    crate::graph::property_types(next.edges.iter().map(|t| &t.table))?;
+    crate::graph::validate_property_layouts(next.nodes.iter().map(|t| &t.0))?;
+    crate::graph::validate_property_layouts(next.edges.iter().map(|t| &t.table))?;
     let (scan, binding) = match inserted.as_ref() {
         Some(table) => graph::scan_insert(scope, graph_id, &next, kind, table, directed)?,
         None => graph::scan(scope, graph_id, &next, kind, None)?,
@@ -659,6 +659,17 @@ async fn edit_graph(
         }
         for (name, value) in &edit.values {
             if let Some(column) = value {
+                if let Ok(existing) = old.schema.field_with_name(name) {
+                    let incoming = patch
+                        .schema()
+                        .field_with_name(None, column)
+                        .map_err(|_| Error::Corrupt(format!("missing patch column {column}")))?;
+                    if incoming.data_type() != existing.data_type() {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "mixed types for graph property {name}"
+                        )));
+                    }
+                }
                 projections.push(col("__gf_patch", column).alias(name));
             }
         }
@@ -711,7 +722,7 @@ fn refresh(
             .filter(|c| c.relation.as_ref() != Some(&TableReference::bare(before.alias.as_str())))
             .map(Expr::Column)
             .collect();
-        let (scan, after) = graph::scan(scope, graph_id, data, before.kind, None)?;
+        let (scan, after) = graph::scan_refresh(scope, graph_id, data, &before)?;
         let appended: Vec<_> = scan
             .schema()
             .columns()

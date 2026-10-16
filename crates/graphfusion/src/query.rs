@@ -1,6 +1,7 @@
 //! GQL binding and direct DataFusion logical/physical planning.
 mod aggregates;
 mod arithmetic;
+mod binding;
 mod execution;
 mod expressions;
 mod graph;
@@ -16,10 +17,12 @@ use crate::{
 };
 use datafusion::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
+    common::Column,
     execution::context::SessionContext,
     logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder},
 };
 use expressions::Binder;
+use std::collections::BTreeMap;
 
 pub(crate) fn write_query(statement: &ast::Statement) -> Option<ast::QueryStatement> {
     let clause = match statement {
@@ -85,6 +88,23 @@ pub(crate) async fn execute_statement(
     at_schema: Option<&ast::SchemaReference>,
     allow_writes: bool,
 ) -> Result<QueryResult> {
+    execute_chain(
+        session,
+        tx,
+        &[(None, query.clone())],
+        at_schema,
+        allow_writes,
+    )
+    .await
+}
+
+pub(crate) async fn execute_chain(
+    session: &SessionState,
+    tx: &mut StatementTxn,
+    chain: &[(Option<ast::YieldClause>, ast::QueryStatement)],
+    at_schema: Option<&ast::SchemaReference>,
+    allow_writes: bool,
+) -> Result<QueryResult> {
     // The caller owns the transaction lease across planning and materialization.
     let mut context = session.clone();
     if let Some(schema) = at_schema {
@@ -118,14 +138,14 @@ pub(crate) async fn execute_statement(
     let ctx = SessionContext::new_with_config_rt(config, std::sync::Arc::new(runtime));
     let mut writes = mutations::Writes::default();
     let mut trace = execution::Trace::default();
-    let plan = plan(
-        query,
+    let plan = drive_chain(
         &context,
         tx,
         &ctx,
+        chain,
+        allow_writes,
         &mut writes,
         &mut trace,
-        allow_writes,
     )
     .await?;
     let (schema, batches) = trace.collect(&ctx, &plan).await?;
@@ -148,8 +168,123 @@ pub(crate) async fn execute_statement(
     })
 }
 
+async fn drive_chain(
+    session: &SessionState,
+    tx: &mut StatementTxn,
+    ctx: &SessionContext,
+    chain: &[(Option<ast::YieldClause>, ast::QueryStatement)],
+    allow_writes: bool,
+    writes: &mut mutations::Writes,
+    trace: &mut execution::Trace,
+) -> Result<LogicalPlan> {
+    if chain.is_empty() {
+        return Err(Error::InvalidQuery("query chain is empty".into()));
+    }
+    let mut carried_graph = session.current_graph;
+    let mut carried_domains = BTreeMap::new();
+    let mut working = None;
+    let last = chain.len() - 1;
+    for (index, (yield_clause, query)) in chain.iter().enumerate() {
+        let mut step = session.clone();
+        step.current_graph = carried_graph;
+        let incoming = if let Some(plan) = working.take() {
+            let plan = apply_yield(plan, yield_clause.as_ref(), &mut carried_domains)?;
+            Some(WorkingTable {
+                plan,
+                domains: carried_domains.clone(),
+            })
+        } else if yield_clause.is_some() {
+            return Err(Error::InvalidQuery(
+                "YIELD requires a preceding query".into(),
+            ));
+        } else {
+            None
+        };
+        let (plan, graph) =
+            plan(query, &step, tx, ctx, writes, trace, allow_writes, incoming).await?;
+        carried_graph = graph.or(carried_graph);
+        carried_domains = trace.output_domains.clone();
+        if index == last {
+            return Ok(plan);
+        }
+        let (schema, batches) = trace.collect(ctx, &plan).await?;
+        working = Some(execution::memory_named("__gf_working", schema, batches)?.build()?);
+    }
+    Err(Error::InvalidQuery("query chain is empty".into()))
+}
+
+fn apply_yield(
+    plan: LogicalPlan,
+    yield_clause: Option<&ast::YieldClause>,
+    domains: &mut BTreeMap<String, references::Domain>,
+) -> Result<LogicalPlan> {
+    let Some(yield_clause) = yield_clause else {
+        return Ok(plan);
+    };
+    if yield_clause
+        .items
+        .iter()
+        .any(|item| matches!(item, ast::YieldItem::All))
+    {
+        if yield_clause.items.len() != 1 {
+            return Err(Error::InvalidQuery(
+                "YIELD * must be the only yield item".into(),
+            ));
+        }
+        return Ok(plan);
+    }
+    let mut projections = Vec::new();
+    let mut renamed = BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for item in &yield_clause.items {
+        let ast::YieldItem::Item { name, alias } = item else {
+            continue;
+        };
+        let output = alias.as_ref().unwrap_or(name);
+        if !seen.insert(output.value.clone()) {
+            return Err(Error::InvalidQuery(format!(
+                "duplicate yield column {}",
+                output.value
+            )));
+        }
+        let column = plan
+            .schema()
+            .columns()
+            .into_iter()
+            .find(|column| column.name() == name.value)
+            .ok_or_else(|| Error::InvalidQuery(format!("unbound yield column {}", name.value)))?;
+        projections.push(Expr::Column(column).alias(&output.value));
+        renamed.insert(output.value.clone(), name.value.clone());
+    }
+    if projections.is_empty() {
+        return Err(Error::InvalidQuery("YIELD requires a column".into()));
+    }
+    let mut next_domains = BTreeMap::new();
+    for (output, source) in &renamed {
+        if let Some(domain) = domains.get(source) {
+            next_domains.insert(output.clone(), domain.clone());
+        }
+    }
+    *domains = next_domains;
+    Ok(LogicalPlanBuilder::from(plan)
+        .project(projections)?
+        .build()?)
+}
+
 fn unsupported(feature: &str) -> Error {
     Error::UnsupportedFeature(feature.into())
+}
+
+struct WorkingTable {
+    plan: LogicalPlan,
+    domains: BTreeMap<String, references::Domain>,
+}
+
+fn clone_working(table: &Option<WorkingTable>) -> Option<WorkingTable> {
+    table.as_ref().map(|table| WorkingTable {
+        plan: table.plan.clone(),
+        domains: table.domains.clone(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -161,7 +296,8 @@ async fn plan(
     writes: &mut mutations::Writes,
     trace: &mut execution::Trace,
     allow_writes: bool,
-) -> Result<LogicalPlan> {
+    incoming: Option<WorkingTable>,
+) -> Result<(LogicalPlan, Option<crate::catalog::ObjectId>)> {
     let mut context = initial.clone();
     if let Some(schema) = &query.at_schema {
         context.current_schema = crate::session::schema_reference(tx, initial, schema)?;
@@ -189,42 +325,80 @@ async fn plan(
             validate_only: true,
             ..Default::default()
         };
-        let mut checked = plan_body(
+        let (mut checked, graph) = plan_body(
             &query.body,
             &first_context,
             tx,
             ctx,
             writes,
             &mut validation,
+            clone_working(&incoming),
         )
         .await?;
         for op in &query.set_operations {
-            let right = plan_body(&op.body, &context, tx, ctx, writes, &mut validation).await?;
+            let (right, _) = plan_body(
+                &op.body,
+                &context,
+                tx,
+                ctx,
+                writes,
+                &mut validation,
+                clone_working(&incoming),
+            )
+            .await?;
             checked =
                 relational::set_operation(checked, right, ast::QuerySetOperator::Union, true)?;
         }
         let schema = checked.schema().clone();
         if trace.validate_only {
-            return Ok(checked);
+            return Ok((checked, graph));
         }
         for (body, context) in std::iter::once((&query.body, &first_context))
             .chain(query.set_operations.iter().map(|op| (&op.body, &context)))
         {
-            let branch = plan_body(body, context, tx, ctx, writes, trace).await?;
+            let (branch, _) = plan_body(
+                body,
+                context,
+                tx,
+                ctx,
+                writes,
+                trace,
+                clone_working(&incoming),
+            )
+            .await?;
             let branch = relational::coerce(branch, &schema)?;
             let (schema, batches) = trace.collect(ctx, &branch).await?;
             if batches.iter().any(|b| b.num_rows() > 0) {
-                return Ok(execution::memory(schema, batches)?.build()?);
+                return Ok((execution::memory(schema, batches)?.build()?, graph));
             }
         }
-        return Ok(
+        return Ok((
             execution::memory(std::sync::Arc::new(schema.as_arrow().clone()), vec![])?.build()?,
-        );
+            graph,
+        ));
     }
-    let mut result = plan_body(&query.body, &first_context, tx, ctx, writes, trace).await?;
+    let (mut result, graph) = plan_body(
+        &query.body,
+        &first_context,
+        tx,
+        ctx,
+        writes,
+        trace,
+        clone_working(&incoming),
+    )
+    .await?;
     let mut domains = trace.output_domains.clone();
     for op in &query.set_operations {
-        let right = plan_body(&op.body, &context, tx, ctx, writes, trace).await?;
+        let (right, _) = plan_body(
+            &op.body,
+            &context,
+            tx,
+            ctx,
+            writes,
+            trace,
+            clone_working(&incoming),
+        )
+        .await?;
         domains.retain(|name, domain| {
             if let Some(right) = trace.output_domains.get(name) {
                 domain.extend(right.iter().copied());
@@ -241,7 +415,7 @@ async fn plan(
         )?;
     }
     trace.output_domains = domains;
-    Ok(result)
+    Ok((result, graph))
 }
 
 pub(crate) fn has_mutations(query: &ast::QueryStatement) -> bool {
@@ -250,7 +424,13 @@ pub(crate) fn has_mutations(query: &ast::QueryStatement) -> bool {
         .any(|body| {
             body.clauses.iter().any(|clause| {
                 mutations::is_mutation(clause)
-                    || matches!(clause, ast::QueryClause::NestedQuery(q) if has_mutations(q))
+                    || match clause {
+                        ast::QueryClause::NestedQuery(query) => has_mutations(query),
+                        ast::QueryClause::BindingTable(
+                            ast::BindingTableExpression::NestedQuery(query),
+                        ) => has_mutations(query),
+                        _ => false,
+                    }
             }) || body
                 .select_query
                 .as_ref()
@@ -265,10 +445,24 @@ async fn plan_body(
     ctx: &SessionContext,
     writes: &mut mutations::Writes,
     trace: &mut execution::Trace,
-) -> Result<LogicalPlan> {
+    incoming: Option<WorkingTable>,
+) -> Result<(LogicalPlan, Option<crate::catalog::ObjectId>)> {
     let mut current_graph = session.current_graph;
     let mut scope = graph::Bindings::default();
-    let mut plan = LogicalPlanBuilder::empty(true);
+    let mut plan = if let Some(incoming) = incoming {
+        let plan = LogicalPlanBuilder::from(incoming.plan);
+        for (qualifier, field) in plan.schema().iter() {
+            let name = field.name().to_string();
+            scope
+                .scalars
+                .insert(name.clone(), Column::new(qualifier.cloned(), field.name()));
+            scope.order.push(name);
+        }
+        scope.domains = incoming.domains;
+        references::prepare(plan, &mut scope, ctx, trace).await?
+    } else {
+        LogicalPlanBuilder::empty(true)
+    };
     for clause in &body.clauses {
         match clause {
             ast::QueryClause::UseGraph(expression) => {
@@ -304,13 +498,32 @@ async fn plan_body(
                     relational::optional(plan, &mut scope, session, id, &data, clauses, ctx, trace)
                         .await?;
             }
+            ast::QueryClause::BindingTable(expression) => {
+                let saved_domains = trace.output_domains.clone();
+                let nested = binding::source(
+                    expression,
+                    session,
+                    current_graph,
+                    tx,
+                    ctx,
+                    writes,
+                    trace,
+                    !scope.order.is_empty(),
+                )
+                .await?;
+                let nested_domains = std::mem::replace(&mut trace.output_domains, saved_domains);
+                scope.sources.extend(trace.sources.clone());
+                plan = relational::derived(plan, &mut scope, nested)?;
+                scope.domains.extend(nested_domains);
+                plan = references::prepare(plan, &mut scope, ctx, trace).await?;
+            }
             ast::QueryClause::NestedQuery(query) => {
                 if !scope.order.is_empty() {
                     return Err(unsupported("correlated nested queries"));
                 }
                 let mut nested_context = session.clone();
                 nested_context.current_graph = current_graph;
-                let nested = Box::pin(self::plan(
+                let (nested, _) = Box::pin(self::plan(
                     query,
                     &nested_context,
                     tx,
@@ -318,6 +531,7 @@ async fn plan_body(
                     writes,
                     trace,
                     false,
+                    None,
                 ))
                 .await?;
                 scope.sources.extend(trace.sources.clone());
@@ -426,7 +640,7 @@ async fn plan_body(
         } else {
             current_graph
         };
-        let nested = Box::pin(self::plan(
+        let (nested, _) = Box::pin(self::plan(
             &from.query,
             &nested_context,
             tx,
@@ -434,6 +648,7 @@ async fn plan_body(
             writes,
             trace,
             false,
+            None,
         ))
         .await?;
         scope.sources.extend(trace.sources.clone());
@@ -444,7 +659,7 @@ async fn plan_body(
     if body.result_clause.kind == ast::ResultKind::Finish {
         trace.output_domains.clear();
         trace.collect(ctx, &plan.build()?).await?;
-        return Ok(LogicalPlanBuilder::empty(false).build()?);
+        return Ok((LogicalPlanBuilder::empty(false).build()?, current_graph));
     }
     trace.sources.extend(scope.sources.clone());
     trace.output_domains = references::result_domains(body, &scope);
@@ -452,7 +667,10 @@ async fn plan_body(
         let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
         plan = plan.filter(expr)?;
     }
-    Ok(aggregates::result(plan, session, &scope, body)?.build()?)
+    Ok((
+        aggregates::result(plan, session, &scope, body)?.build()?,
+        current_graph,
+    ))
 }
 
 fn order_and_page(

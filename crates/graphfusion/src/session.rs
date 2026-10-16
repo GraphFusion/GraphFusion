@@ -159,13 +159,38 @@ impl Session {
                 "procedure binding definitions".into(),
             ));
         }
-        let [ast::Statement::Query(query)] = program.statements.as_slice() else {
+        let Some(chain) = linear_queries(&program.statements) else {
             return Err(Error::UnsupportedFeature(
                 "query() requires exactly one read-only query".into(),
             ));
         };
-        self.run_query(query, program.at_schema.as_ref(), false)
+        self.run_linear(&chain, program.at_schema.as_ref(), false)
             .await
+    }
+    async fn run_linear(
+        &mut self,
+        chain: &[(Option<ast::YieldClause>, ast::QueryStatement)],
+        at_schema: Option<&ast::SchemaReference>,
+        allow_writes: bool,
+    ) -> Result<crate::QueryResult> {
+        let mut work = self.begin_statement(
+            allow_writes
+                && chain
+                    .iter()
+                    .any(|(_, query)| crate::query::has_mutations(query)),
+        )?;
+        let mut result = crate::query::execute_chain(
+            &work.session.state,
+            work.tx.as_mut().unwrap(),
+            chain,
+            at_schema,
+            allow_writes,
+        )
+        .await?;
+        let outcome = work.finish(None)?;
+        result.commit_seq = outcome.commit_seq;
+        result.transaction_pending = outcome.transaction_pending;
+        Ok(result)
     }
     async fn run_query(
         &mut self,
@@ -233,9 +258,9 @@ impl Session {
         }
         let program = ast::parse(input)?;
         if program.definitions.is_empty() && program.at_schema.is_some() {
-            if let [ast::Statement::Query(query)] = program.statements.as_slice() {
+            if let Some(chain) = linear_queries(&program.statements) {
                 return Ok(vec![StatementOutput::Query(
-                    self.run_query(query, program.at_schema.as_ref(), true)
+                    self.run_linear(&chain, program.at_schema.as_ref(), true)
                         .await?,
                 )]);
             }
@@ -259,7 +284,11 @@ impl Session {
                 index += 1;
             }
             let group = &program.statements[start..index];
-            if let Some(query) = crate::query::write_query(&group[0]) {
+            if let Some(chain) = linear_queries(group) {
+                outputs.push(StatementOutput::Query(
+                    self.run_linear(&chain, None, true).await?,
+                ));
+            } else if let Some(query) = crate::query::write_query(&group[0]) {
                 if group.len() != 1 {
                     return Err(Error::UnsupportedFeature("NEXT query continuation".into()));
                 }
@@ -332,6 +361,33 @@ impl Session {
         result.affected_objects = affected;
         Ok(result)
     }
+}
+
+fn linear_queries(
+    statements: &[ast::Statement],
+) -> Option<Vec<(Option<ast::YieldClause>, ast::QueryStatement)>> {
+    if statements.is_empty() {
+        return None;
+    }
+    let mut chain = Vec::with_capacity(statements.len());
+    for (index, statement) in statements.iter().enumerate() {
+        let (yield_clause, query) = if index == 0 {
+            let ast::Statement::Query(query) = statement else {
+                return None;
+            };
+            (None, query)
+        } else {
+            let ast::Statement::Next(next) = statement else {
+                return None;
+            };
+            let ast::Statement::Query(query) = next.statement.as_ref() else {
+                return None;
+            };
+            (next.yield_clause.clone(), query)
+        };
+        chain.push((yield_clause, query.clone()));
+    }
+    Some(chain)
 }
 
 fn modifies_catalog(statement: &ast::Statement) -> bool {

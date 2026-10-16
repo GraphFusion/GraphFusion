@@ -407,8 +407,8 @@ impl GraphData {
     /// Mutations preserve IDs/endpoints from a validated snapshot. Only property
     /// layouts and newly grouped resident fragments need revalidation here.
     pub(crate) fn from_mutation(nodes: Vec<NodeTable>, edges: Vec<EdgeTable>) -> Result<Self> {
-        property_types(nodes.iter().map(|t| &t.0))?;
-        property_types(edges.iter().map(|t| &t.table))?;
+        validate_property_layouts(nodes.iter().map(|t| &t.0))?;
+        validate_property_layouts(edges.iter().map(|t| &t.table))?;
         // Keep one resident fragment per layout, even after repeated row updates.
         let mut compact_nodes: Vec<NodeTable> = Vec::new();
         for node in nodes {
@@ -451,6 +451,70 @@ impl GraphData {
         self.edges.iter().map(|t| t.table.row_count).sum()
     }
 }
+/// A stored property has one Arrow type on a label set. Different label sets may
+/// disagree; those reads unify. Binary values still cannot share a name with
+/// another type, because a scan has no coercion for them.
+pub(crate) fn validate_property_layouts<'a>(tables: impl Iterator<Item = &'a Table>) -> Result<()> {
+    let tables: Vec<&Table> = tables.collect();
+    let mut by_labels: BTreeMap<&BTreeSet<String>, BTreeMap<&str, &DataType>> = BTreeMap::new();
+    for table in &tables {
+        let layout = by_labels.entry(&table.labels).or_default();
+        for field in table.schema.fields() {
+            if field.name().starts_with("__gf_") {
+                continue;
+            }
+            if let Some(previous) = layout.get(field.name().as_str()) {
+                if *previous != field.data_type() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "mixed types for graph property {}",
+                        field.name()
+                    )));
+                }
+            } else {
+                layout.insert(field.name().as_str(), field.data_type());
+            }
+        }
+    }
+    property_types(tables.iter().copied())?;
+    Ok(())
+}
+
+/// `fragment` can be projected as `bound` without changing the bound type.
+pub(crate) fn property_fits(fragment: &DataType, bound: &DataType) -> bool {
+    fragment == bound
+        || matches!(
+            (fragment, bound),
+            (DataType::Int64, DataType::Float64)
+                | (
+                    DataType::Boolean | DataType::Int64 | DataType::Float64,
+                    DataType::Utf8
+                )
+        )
+}
+
+/// Pick one Arrow type for a property that occurs on more than one fragment.
+/// Integers widen to float. Other scalar combinations are read as strings so a
+/// multi-type scan can still return the cell. Binary values do not coerce.
+pub(crate) fn unify_property_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    if left == right {
+        return Some(left.clone());
+    }
+    match (left, right) {
+        (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64) => {
+            Some(DataType::Float64)
+        }
+        _ if property_scalar(left) && property_scalar(right) => Some(DataType::Utf8),
+        _ => None,
+    }
+}
+
+fn property_scalar(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean | DataType::Int64 | DataType::Float64 | DataType::Utf8
+    )
+}
+
 pub(crate) fn property_types<'a>(
     tables: impl Iterator<Item = &'a Table>,
 ) -> Result<BTreeMap<String, DataType>> {
@@ -460,13 +524,17 @@ pub(crate) fn property_types<'a>(
             if field.name().starts_with("__gf_") {
                 continue;
             }
-            if let Some(previous) = types.insert(field.name().clone(), field.data_type().clone()) {
-                if previous != *field.data_type() {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "mixed types for graph property {}",
-                        field.name()
-                    )));
-                }
+            if let Some(previous) = types.get(field.name()).cloned() {
+                let unified =
+                    unify_property_type(&previous, field.data_type()).ok_or_else(|| {
+                        Error::UnsupportedFeature(format!(
+                            "mixed types for graph property {}",
+                            field.name()
+                        ))
+                    })?;
+                types.insert(field.name().clone(), unified);
+            } else {
+                types.insert(field.name().clone(), field.data_type().clone());
             }
         }
     }

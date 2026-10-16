@@ -217,8 +217,8 @@ impl GraphManifest {
             .iter()
             .map(|e| e.table.empty_table(true))
             .collect::<Result<Vec<_>>>()?;
-        crate::graph::property_types(nodes.iter())?;
-        crate::graph::property_types(edges.iter())?;
+        crate::graph::validate_property_layouts(nodes.iter())?;
+        crate::graph::validate_property_layouts(edges.iter())?;
         Ok(())
     }
     pub fn open(&self, disk: &Disk) -> Result<Arc<GraphData>> {

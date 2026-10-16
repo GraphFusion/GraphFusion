@@ -397,6 +397,7 @@ define_visitor! {
             Set(value),
             Remove(value),
             OrderByPage(value),
+            BindingTable(value),
         }
         MatchMode => visit_match_mode, walk_match_mode {
             RepeatableElements { bindings },
