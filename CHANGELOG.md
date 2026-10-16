@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep working-table order when a query resolves an element reference. A
+  preceding `ORDER BY` stays in effect through `LET`, and `FOR` walks a list of
+  element references in list order.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

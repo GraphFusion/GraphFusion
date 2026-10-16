@@ -14,7 +14,7 @@ use datafusion::{
         array::{Array, BooleanArray},
         datatypes::DataType,
     },
-    common::{DFSchema, ScalarValue, TableReference},
+    common::{Column, DFSchema, ScalarValue, TableReference},
     error::DataFusionError,
     functions::core::expr_fn::{coalesce, get_field},
     logical_expr::{
@@ -318,11 +318,24 @@ pub(super) async fn prepare(
     }
     // Isolate encoded/unnested reference values from their lookup joins. Otherwise
     // DF55 common-expression and leaf-projection rewrites can duplicate aliases.
-    let plan = super::execution::freeze(plan, ctx, trace, None).await?;
+    // Number the rows first: the lookup hash joins do not keep working-table
+    // order, so a preceding ORDER BY or a FOR list would be regrouped.
+    let order = scope.fresh("ref_order");
+    let plan = super::execution::ordinal(plan, ctx, trace, &order).await?;
     let plan = resolve(plan, scope)?;
+    let plan = plan.sort(vec![
+        Expr::Column(Column::new_unqualified(&order)).sort(true, false)
+    ])?;
+    let kept: Vec<_> = plan
+        .schema()
+        .columns()
+        .into_iter()
+        .filter(|column| column.name() != order)
+        .map(Expr::Column)
+        .collect();
     // Keep subsequent repeated property/identity expressions above the lookup
     // schema too; DF55 can otherwise push their CSE aliases through these joins.
-    super::execution::freeze(plan, ctx, trace, None).await
+    super::execution::freeze(plan.project(kept)?, ctx, trace, None).await
 }
 
 pub(super) fn refresh(
