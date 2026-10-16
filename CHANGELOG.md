@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep a variable readable after `DELETE` when only some of its rows were
+  removed. Property access still fails for a deleted identity, including
+  through an alias, and that failure rolls the statement back.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
