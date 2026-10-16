@@ -9,6 +9,9 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- A label that matches no fragment keeps property names as untyped columns.
+  It does not borrow another type's Arrow type, so a filter on the empty
+  match is not rejected because unrelated labels disagree.
 
 ## 0.2.0 — 2026-10-05
 
