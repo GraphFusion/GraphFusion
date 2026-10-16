@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Reject a decimal literal that overflows to infinity. `1e999` is a bad number,
+  rather than the Float64 value `inf`, in queries and session initializers.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
