@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Accept a `DECIMAL` session parameter when the initializer fits its precision and
+  scale, and read that parameter as a float. There is no exact decimal runtime;
+  extra fractional digits, too many significant digits, and values that Float64
+  cannot represent exactly are rejected.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

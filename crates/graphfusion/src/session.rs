@@ -1029,6 +1029,70 @@ fn validate_references(tx: &mut StatementTxn, value: &Value) -> Result<()> {
     }
     Ok(())
 }
+/// `DECIMAL(p)` means scale 0. Omitted precision accepts any finite numeric value.
+/// Fractional checks stay inside the exact integer range of f64.
+fn decimal_fits(value: &Value, precision: Option<u64>, scale: Option<u64>) -> bool {
+    let scale = scale.unwrap_or(0);
+    let Some(precision) = precision else {
+        return matches!(value, Value::Integer(_) | Value::Float(_));
+    };
+    if scale > precision {
+        return false;
+    }
+    match value {
+        Value::Integer(value) => integer_decimal_fits(*value, precision, scale),
+        Value::Float(value) => float_decimal_fits(*value, precision, scale),
+        _ => false,
+    }
+}
+
+fn decimal_representable(value: &Value) -> bool {
+    match value {
+        // Integers beyond 2^53 are not exact Float64 values, which is how a decimal parameter is read.
+        Value::Integer(value) => (*value as i128).unsigned_abs() <= 1u128 << 53,
+        Value::Float(value) => value.is_finite(),
+        _ => false,
+    }
+}
+
+fn integer_decimal_fits(value: i64, precision: u64, scale: u64) -> bool {
+    let integer_digits = precision - scale;
+    if integer_digits > 38 {
+        return true;
+    }
+    if integer_digits == 0 {
+        return value == 0;
+    }
+    let limit = 10u128.pow(u32::try_from(integer_digits).unwrap_or(39));
+    (value as i128).unsigned_abs() < limit
+}
+
+fn float_decimal_fits(value: f64, precision: u64, scale: u64) -> bool {
+    if !value.is_finite() || scale > i32::MAX as u64 {
+        return false;
+    }
+    let factor = 10f64.powi(scale as i32);
+    let scaled = value * factor;
+    // Past 2^53 a binary float cannot show whether the extra fractional digit is real.
+    if !scaled.is_finite() || scaled.abs() > (1u64 << 53) as f64 {
+        return false;
+    }
+    let nearest = scaled.round();
+    if (scaled - nearest).abs() > 1e-6 {
+        return false;
+    }
+    let mut digits = 0u64;
+    let mut magnitude = nearest.abs() as u64;
+    if magnitude == 0 {
+        digits = 1;
+    }
+    while magnitude > 0 {
+        magnitude /= 10;
+        digits += 1;
+    }
+    digits <= precision
+}
+
 fn check_value(tx: &mut StatementTxn, value: &Value, t: &ValueType) -> Result<()> {
     if matches!(value, Value::Null) {
         return if t.nullable {
@@ -1036,6 +1100,28 @@ fn check_value(tx: &mut StatementTxn, value: &Value, t: &ValueType) -> Result<()
         } else {
             Err(Error::InvalidDefinition("NULL violates NOT NULL".into()))
         };
+    }
+    if t.kind == "decimal" {
+        if !matches!(value, Value::Integer(_) | Value::Float(_)) {
+            return Err(Error::InvalidDefinition(
+                "value does not satisfy decimal".into(),
+            ));
+        }
+        if !decimal_representable(value) {
+            return Err(Error::InvalidDefinition(
+                "decimal value is not exactly representable as a float".into(),
+            ));
+        }
+        if !decimal_fits(
+            value,
+            t.parameters.get("precision").copied(),
+            t.parameters.get("scale").copied(),
+        ) {
+            return Err(Error::InvalidDefinition(
+                "decimal value exceeds precision or scale".into(),
+            ));
+        }
+        return Ok(());
     }
     let valid = match (t.kind.as_str(), value) {
         ("any", _)
@@ -1146,4 +1232,27 @@ fn validate_timezone(zone: &str) -> Result<()> {
         }
     }
     Err(Error::UnsupportedFeature("time zone must be UTC or a numeric offset (+08:00); named zone evaluation is not implemented".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decimal_fits, decimal_representable, Value};
+
+    #[test]
+    fn decimal_scale_and_exact_integer_limits() {
+        assert!(decimal_representable(&Value::Integer(1_i64 << 53)));
+        assert!(!decimal_representable(&Value::Integer((1_i64 << 53) + 1)));
+        assert!(!decimal_representable(&Value::Integer(i64::MIN)));
+        assert!(!decimal_representable(&Value::Float(f64::INFINITY)));
+        assert!(decimal_fits(&Value::Float(1.25), Some(4), Some(2)));
+        assert!(!decimal_fits(&Value::Float(1.256), Some(4), Some(2)));
+        assert!(decimal_fits(&Value::Float(0.1), Some(2), Some(1)));
+        assert!(decimal_fits(&Value::Integer(10), Some(4), Some(2)));
+        assert!(!decimal_fits(&Value::Integer(100), Some(4), Some(2)));
+        assert!(decimal_fits(&Value::Integer(0), Some(2), Some(2)));
+        assert!(!decimal_fits(&Value::Integer(1), Some(2), Some(2)));
+        assert!(decimal_fits(&Value::Float(-1.5), Some(2), Some(1)));
+        assert!(!decimal_fits(&Value::Float(1.5), Some(4), None));
+        assert!(decimal_fits(&Value::Float(10.0), None, None));
+    }
 }
