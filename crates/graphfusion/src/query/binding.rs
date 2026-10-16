@@ -98,11 +98,7 @@ fn rows_to_plan(rows: &[BTreeMap<String, Value>]) -> Result<LogicalPlan> {
             let next = scalar_type(value)?;
             unified = Some(match unified {
                 None => next,
-                Some(previous) => {
-                    crate::graph::unify_property_type(&previous, &next).ok_or_else(|| {
-                        Error::InvalidQuery(format!("mixed types for binding-table column {name}"))
-                    })?
-                }
+                Some(previous) => unify_binding_column(&previous, &next, name)?,
             });
         }
         let data_type = unified.unwrap_or(DataType::Utf8);
@@ -113,6 +109,21 @@ fn rows_to_plan(rows: &[BTreeMap<String, Value>]) -> Result<LogicalPlan> {
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(datafusion::error::DataFusionError::from)?;
     Ok(execution::memory_named("__gf_binding", schema, vec![batch])?.build()?)
+}
+
+/// Integers and floats share a column as float. Any other mix is rejected:
+/// graph scans stringify mixed scalars, but a binding-table input would then
+/// compare `"true"` or `"1"` as text.
+fn unify_binding_column(left: &DataType, right: &DataType, name: &str) -> Result<DataType> {
+    if left == right {
+        return Ok(left.clone());
+    }
+    if left.is_numeric() && right.is_numeric() {
+        return Ok(DataType::Float64);
+    }
+    Err(Error::InvalidQuery(format!(
+        "mixed types for binding-table column {name}"
+    )))
 }
 
 fn scalar_type(value: &Value) -> Result<DataType> {
