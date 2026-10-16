@@ -509,7 +509,7 @@ impl<'a> Binder<'a> {
     }
 }
 
-fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
+pub(super) fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
     if left == right || *right == DataType::Null {
         return Ok(left.clone());
     }
