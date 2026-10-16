@@ -9,6 +9,9 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- An integer inserted or assigned into an existing float property widens to
+  float. The stored column type does not change, and a narrowing assignment
+  is still rejected.
 
 ## 0.2.0 — 2026-10-05
 
