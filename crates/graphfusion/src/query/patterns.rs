@@ -107,6 +107,9 @@ impl Compiler<'_> {
     // V=N*(m+1) states. A walk of length >= k*V contains k disjoint cycles;
     // successively removing them gives k strictly shorter accepted walks. Thus
     // k*V-1 is a completeness bound, including every tie in the kth length group.
+    // The same cap is sound for trails: cycle removal only drops edges. It is
+    // applied under DIFFERENT EDGES as well as repeatable WALK, and narrowed by
+    // any smaller mode limit.
     fn hint(
         &self,
         path: &ast::PathPattern,
@@ -115,11 +118,11 @@ impl Compiler<'_> {
         inherited: Option<u64>,
     ) -> Result<Option<u64>> {
         let finite = narrower(inherited, self.capacity(mode));
-        if finite.is_some() || path.alternation.is_some() {
+        if path.alternation.is_some() {
             return Ok(finite);
         }
         let count = match selection {
-            Selection::All => return Ok(None),
+            Selection::All => return Ok(finite),
             Selection::Any(k) | Selection::Shortest(k) | Selection::Groups(k) => k,
         };
         let mut edge = None;
@@ -127,11 +130,11 @@ impl Compiler<'_> {
             match factor {
                 ast::PathPatternFactor::Node(node) if node.quantifier.is_none() => (),
                 ast::PathPatternFactor::Relationship(value) if edge.is_none() => edge = Some(value),
-                _ => return Ok(None),
+                _ => return Ok(finite),
             }
         }
         let Some(edge) = edge else {
-            return Ok(None);
+            return Ok(finite);
         };
         // Endpoint predicates over the group list can constrain the entire walk;
         // cycle removal is not sound for those history-dependent predicates.
@@ -147,7 +150,7 @@ impl Compiler<'_> {
                         .as_ref()
                         .is_some_and(|p| p.entries.iter().any(|(_, e)| depends_on(e, history)))
                 {
-                    return Ok(None);
+                    return Ok(finite);
                 }
             }
         }
@@ -162,14 +165,14 @@ impl Compiler<'_> {
                 .as_ref()
                 .is_some_and(|p| p.entries.iter().any(|(_, e)| depends_on(e, "\0")))
         {
-            return Ok(None);
+            return Ok(finite);
         }
         let Some(q) = edge.quantifier.as_ref() else {
-            return Ok(None);
+            return Ok(finite);
         };
         let (min, max) = raw_bounds(q)?;
         if max.is_some() {
-            return Ok(None);
+            return Ok(finite);
         }
         let nodes = self.data.node_count() as u64;
         let bound = if count == 1 {
@@ -180,7 +183,11 @@ impl Compiler<'_> {
                 .saturating_mul(count)
                 .saturating_sub(1)
         };
-        Ok(Some(bound.max(min).max(1)))
+        let bound = bound.max(min).max(1);
+        Ok(Some(match finite {
+            Some(finite) => finite.min(bound),
+            None => bound,
+        }))
     }
     fn capacity(&self, mode: ast::PathMode) -> Option<u64> {
         let mode_bound = match mode {
@@ -193,6 +200,20 @@ impl Compiler<'_> {
             mode_bound,
             self.different.then_some(self.data.edge_count() as u64),
         )
+    }
+    /// Hop cap already applied inside quantified expansion. A tighter selective
+    /// bound has to be written into the quantifier; an equal cap must stay unset
+    /// so an empty edge set does not become an illegal explicit maximum of zero.
+    fn expansion_limit(&self, mode: ast::PathMode) -> Option<u64> {
+        if self.different || mode == ast::PathMode::Trail {
+            Some(self.data.edge_count() as u64)
+        } else if mode == ast::PathMode::Acyclic {
+            Some((self.data.node_count() as u64).saturating_sub(1))
+        } else if mode == ast::PathMode::Simple {
+            Some(self.data.node_count() as u64)
+        } else {
+            None
+        }
     }
     pub(super) fn validate(
         &self,
@@ -403,11 +424,19 @@ impl Compiler<'_> {
                     if let Some(q) = &edge.quantifier {
                         let mut edge = edge.clone();
                         let (min, max) = raw_bounds(q)?;
-                        if max.is_none() && mode == ast::PathMode::Walk && !self.different {
-                            edge.quantifier = Some(ast::PathPatternQuantifier::Range {
-                                min: Some(min),
-                                max: finite.map(|bound| bound.max(min).max(1)),
-                            });
+                        if max.is_none() {
+                            if let Some(bound) = finite.filter(|bound| {
+                                self.expansion_limit(mode)
+                                    .is_none_or(|natural| *bound < natural)
+                            }) {
+                                // A selective search can stop before the trail cap. Writing a
+                                // zero cap would reject a quantifier that the natural limit
+                                // still treats as unbounded.
+                                edge.quantifier = Some(ast::PathPatternQuantifier::Range {
+                                    min: Some(min),
+                                    max: Some(bound.max(min).max(1)),
+                                });
+                            }
                         }
                         (plan, state) = paths::expand(
                             plan,
