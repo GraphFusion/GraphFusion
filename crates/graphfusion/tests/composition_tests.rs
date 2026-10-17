@@ -1,5 +1,5 @@
 use datafusion::arrow::datatypes::DataType;
-use graphfusion::{Database, Value};
+use graphfusion::{Database, Error, Value};
 use std::collections::BTreeMap;
 
 fn strings(result: &graphfusion::QueryResult) -> Vec<Vec<String>> {
@@ -329,4 +329,88 @@ async fn mixed_label_filters_compare_stored_types() {
         strings(&both),
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
+}
+
+#[tokio::test]
+async fn where_identity_tests_keep_stored_types() {
+    let mut session = social().await;
+
+    let same = session
+        .query(
+            "MATCH (n:Person|Document) WHERE SAME(n, n) AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&same), vec![vec!["Ada".to_string()]]);
+
+    let repeated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE SAME(n, n, n) AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&repeated), vec![vec!["Ada".to_string()]]);
+
+    let different = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR ALL_DIFFERENT(n, n)
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&different), vec![vec!["Ada".to_string()]]);
+
+    let everyone = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR SAME(n, n)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&everyone),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE NOT SAME(n, n) OR n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let document = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 'doc' OR ALL_DIFFERENT(n, n, n)
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&document), vec![vec!["Spec".to_string()]]);
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE SAME(n, n) AND n.id = 1)
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&inline), vec![vec!["Ada".to_string()]]);
+
+    let error = session
+        .query("MATCH (d:Document) WHERE d.id = 1 OR SAME(d, d) RETURN d.title AS title")
+        .await
+        .unwrap_err();
+    match error {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
 }
