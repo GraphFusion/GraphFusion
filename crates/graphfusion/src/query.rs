@@ -318,6 +318,11 @@ async fn plan(
         .set_operations
         .iter()
         .any(|op| op.operator == ast::QuerySetOperator::Otherwise);
+    // A trailing ORDER BY, OFFSET, or LIMIT belongs to the combined rows. The
+    // parser stores it on the last branch, which would page that branch alone.
+    let trailing_page = query.set_operations.last().filter(|op| {
+        !op.body.order_by.is_empty() || op.body.offset.is_some() || op.body.limit.is_some()
+    });
     if otherwise {
         // Bind every branch before execution. Empty barrier results retain their schema,
         // so a cold branch is checked without evaluating any of its expressions.
@@ -335,9 +340,10 @@ async fn plan(
             clone_working(&incoming),
         )
         .await?;
-        for op in &query.set_operations {
+        for (index, op) in query.set_operations.iter().enumerate() {
+            let body = without_trailing_page(query, index, &op.body);
             let (right, _) = plan_body(
-                &op.body,
+                &body,
                 &context,
                 tx,
                 ctx,
@@ -351,13 +357,21 @@ async fn plan(
         }
         let schema = checked.schema().clone();
         if trace.validate_only {
+            let checked = apply_trailing_page(checked, &context, trailing_page)?;
             return Ok((checked, graph));
         }
-        for (body, context) in std::iter::once((&query.body, &first_context))
+        for (index, (body, context)) in std::iter::once((&query.body, &first_context))
             .chain(query.set_operations.iter().map(|op| (&op.body, &context)))
+            .enumerate()
         {
+            // Index 0 is the leading query. Later indexes are set-operation branches.
+            let body = if index == 0 {
+                std::borrow::Cow::Borrowed(body)
+            } else {
+                without_trailing_page(query, index - 1, body)
+            };
             let (branch, _) = plan_body(
-                body,
+                &body,
                 context,
                 tx,
                 ctx,
@@ -369,13 +383,13 @@ async fn plan(
             let branch = relational::coerce(branch, &schema)?;
             let (schema, batches) = trace.collect(ctx, &branch).await?;
             if batches.iter().any(|b| b.num_rows() > 0) {
-                return Ok((execution::memory(schema, batches)?.build()?, graph));
+                let chosen = execution::memory(schema, batches)?.build()?;
+                return Ok((apply_trailing_page(chosen, context, trailing_page)?, graph));
             }
         }
-        return Ok((
-            execution::memory(std::sync::Arc::new(schema.as_arrow().clone()), vec![])?.build()?,
-            graph,
-        ));
+        let empty =
+            execution::memory(std::sync::Arc::new(schema.as_arrow().clone()), vec![])?.build()?;
+        return Ok((apply_trailing_page(empty, &context, trailing_page)?, graph));
     }
     let (mut result, graph) = plan_body(
         &query.body,
@@ -388,9 +402,10 @@ async fn plan(
     )
     .await?;
     let mut domains = trace.output_domains.clone();
-    for op in &query.set_operations {
+    for (index, op) in query.set_operations.iter().enumerate() {
+        let body = without_trailing_page(query, index, &op.body);
         let (right, _) = plan_body(
-            &op.body,
+            &body,
             &context,
             tx,
             ctx,
@@ -415,7 +430,43 @@ async fn plan(
         )?;
     }
     trace.output_domains = domains;
-    Ok((result, graph))
+    Ok((apply_trailing_page(result, &context, trailing_page)?, graph))
+}
+
+fn without_trailing_page<'a>(
+    query: &ast::QueryStatement,
+    set_index: usize,
+    body: &'a ast::QueryBody,
+) -> std::borrow::Cow<'a, ast::QueryBody> {
+    if set_index + 1 != query.set_operations.len()
+        || (body.order_by.is_empty() && body.offset.is_none() && body.limit.is_none())
+    {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut body = body.clone();
+    body.order_by.clear();
+    body.offset = None;
+    body.limit = None;
+    std::borrow::Cow::Owned(body)
+}
+
+fn apply_trailing_page(
+    plan: LogicalPlan,
+    session: &SessionState,
+    trailing: Option<&ast::QuerySetOperation>,
+) -> Result<LogicalPlan> {
+    let Some(trailing) = trailing else {
+        return Ok(plan);
+    };
+    Ok(order_and_page(
+        LogicalPlanBuilder::from(plan),
+        session,
+        &trailing.body.order_by,
+        trailing.body.offset.as_ref(),
+        trailing.body.limit.as_ref(),
+        None,
+    )?
+    .build()?)
 }
 
 pub(crate) fn has_mutations(query: &ast::QueryStatement) -> bool {

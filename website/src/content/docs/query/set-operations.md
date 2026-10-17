@@ -24,3 +24,5 @@ For a complete row that appears L times on the left and R times on the right:
 Null fields compare equal for matching result rows. Branch schemas must have the same column names, count and order. Types must match or permit supported null/numeric widening; differently named columns are not automatically aligned.
 
 Each branch has an independent binding scope. A branch-local graph selection does not modify another branch or the session. Only one conjunction kind is accepted at a composite level; use nested query braces to combine levels. Composite writes are rejected before branch execution.
+
+`ORDER BY`, `OFFSET`, and `LIMIT` written on the last branch apply to the combined rows and see those result columns. Put a branch-local page inside braces when it should not page the composite.

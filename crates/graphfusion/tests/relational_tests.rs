@@ -613,3 +613,72 @@ async fn output_aliases_shadow_elements_in_group_having_and_order_contexts() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn trailing_page_applies_to_the_composite_result() {
+    let mut s = Database::new().session();
+    check(
+        &mut s,
+        "FOR n IN [3, 1, 2] RETURN n UNION ALL RETURN 0 AS n ORDER BY n",
+        &[&["0"], &["1"], &["2"], &["3"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN 3 AS n UNION RETURN 1 AS n UNION RETURN 2 AS n ORDER BY n DESC",
+        &[&["3"], &["2"], &["1"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3] RETURN n UNION ALL RETURN 4 AS n ORDER BY n OFFSET 1 LIMIT 2",
+        &[&["2"], &["3"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3] RETURN n EXCEPT RETURN 2 AS n ORDER BY n DESC",
+        &[&["3"], &["1"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3] RETURN n INTERSECT FOR n IN [3, 1] RETURN n ORDER BY n",
+        &[&["1"], &["3"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN NULL AS n UNION ALL RETURN 1 AS n ORDER BY n DESC",
+        &[&["NULL"], &["1"]],
+    )
+    .await;
+    let limited = query(
+        &mut s,
+        "FOR n IN [1, 2, 3, 4] RETURN n UNION ALL RETURN 5 AS n LIMIT 2",
+    )
+    .await;
+    assert_eq!(limited.row_count(), 2);
+    check(
+        &mut s,
+        "FOR n IN [3, 1] RETURN n OTHERWISE RETURN 0 AS n ORDER BY n",
+        &[&["1"], &["3"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [] RETURN n OTHERWISE FOR n IN [2, 1] RETURN n ORDER BY n DESC",
+        &[&["2"], &["1"]],
+    )
+    .await;
+    // A page before the conjunction stays on that branch. UNION ALL does not
+    // promise the concatenation order, so compare the bag.
+    let branch = query(
+        &mut s,
+        "FOR n IN [3, 1, 2] RETURN n ORDER BY n DESC LIMIT 1 UNION ALL RETURN 0 AS n",
+    )
+    .await;
+    let mut values = rows(&branch);
+    values.sort();
+    assert_eq!(values, vec![vec!["0"], vec!["3"]]);
+}
