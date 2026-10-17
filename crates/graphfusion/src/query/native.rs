@@ -21,6 +21,12 @@ pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// `SAME` or `ALL_DIFFERENT` whose arguments are all this one element.
+    /// Fewer than two arguments is vacuously true, matching the unified binder.
+    Identity {
+        different: bool,
+        copies: usize,
+    },
     Compare {
         property: String,
         op: Operator,
@@ -89,8 +95,9 @@ impl NativePush {
 /// Split a match-level `WHERE` into per-variable fragment predicates.
 ///
 /// `AND` can be split across variables. `OR` and `NOT` stay together, so they
-/// are pushed only when every comparison names the same variable. A value that
-/// reads another column stays on the unified plan.
+/// are pushed only when every comparison or same-element identity test names
+/// the same variable. That identity test stays with the stored-type comparison.
+/// A value that reads another column stays on the unified plan.
 pub(super) fn clause_filters(
     session: &SessionState,
     schema: &DFSchema,
@@ -128,6 +135,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(right, tables)
         }
         NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Identity { .. } => Ok(()),
         NativeAtom::Compare {
             property,
             value_type,
@@ -158,6 +166,7 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
         NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
         NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::Identity { different, copies } => identity_expr(*different, *copies),
         NativeAtom::Compare {
             property,
             op,
@@ -212,6 +221,20 @@ fn unknown() -> Expr {
     lit(ScalarValue::Boolean(None))
 }
 
+/// One element compared with itself. A null id stays unknown, matching `x = x`.
+/// A single argument has no pairs, so both predicates are true.
+fn identity_expr(different: bool, copies: usize) -> Expr {
+    if copies < 2 {
+        return lit(true);
+    }
+    let same = column(crate::graph::ID).eq(column(crate::graph::ID));
+    if different {
+        Expr::Not(Box::new(same))
+    } else {
+        same
+    }
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -227,6 +250,10 @@ enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Identity {
+        different: bool,
+        copies: usize,
+    },
     Atom {
         property: String,
         op: Operator,
@@ -290,12 +317,28 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
+        ast::Expr::Same { variables } if same_element(variables, variable) => {
+            Some(Local::Identity {
+                different: false,
+                copies: variables.len(),
+            })
+        }
+        ast::Expr::AllDifferent { variables } if same_element(variables, variable) => {
+            Some(Local::Identity {
+                different: true,
+                copies: variables.len(),
+            })
+        }
         other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
             property,
             op,
             value,
         }),
     }
+}
+
+fn same_element(variables: &[ast::Identifier], variable: &str) -> bool {
+    !variables.is_empty() && variables.iter().all(|name| name.value == variable)
 }
 
 fn comparison(expr: &ast::Expr, variable: &str) -> Option<(String, Operator, ast::Expr)> {
@@ -370,6 +413,10 @@ fn bind_local(
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
         }
+        Local::Identity { different, copies } => Some(NativeAtom::Identity {
+            different: *different,
+            copies: *copies,
+        }),
         Local::Atom {
             property,
             op,
@@ -407,6 +454,11 @@ fn bind_closed(
 fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
     if let ast::Expr::Property { base, .. } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
+            names.insert(name.value.clone());
+        }
+    }
+    if let ast::Expr::Same { variables } | ast::Expr::AllDifferent { variables } = expr {
+        for name in variables {
             names.insert(name.value.clone());
         }
     }
