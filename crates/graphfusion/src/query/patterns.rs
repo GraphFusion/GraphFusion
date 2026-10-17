@@ -1,6 +1,7 @@
 //! Compositional path-pattern compiler; every match is a DataFusion relation.
 mod groups;
 mod union;
+use super::casefold::{CaseFoldMap, CaseFoldSet};
 use super::{
     execution::{self, Trace},
     expressions::Binder,
@@ -19,7 +20,6 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::{Expr, JoinType, LogicalPlanBuilder},
 };
-use std::collections::{BTreeMap, BTreeSet};
 
 type Plan = LogicalPlanBuilder;
 type Built = (Plan, Bindings, State);
@@ -40,9 +40,9 @@ pub(super) struct Compiler<'a> {
     pub different: bool,
     pub predicates: Vec<Predicate>,
     /// Match-level comparisons already safe to apply on each fragment.
-    pub clause_filters: BTreeMap<String, NativeAtom>,
+    pub clause_filters: CaseFoldMap<NativeAtom>,
     pub clause_push: bool,
-    pub clause_hit: BTreeSet<String>,
+    pub clause_hit: CaseFoldSet,
 }
 fn narrower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -392,7 +392,7 @@ impl Compiler<'_> {
         }
         let column = scope.scalar(name);
         scope.domains.insert(
-            name.into(),
+            name,
             [
                 (self.graph_id, ElementKind::Node),
                 (self.graph_id, ElementKind::Edge),

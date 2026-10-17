@@ -546,6 +546,14 @@ fn property_target(expr: &ast::Expr) -> Result<(String, String)> {
     ))
 }
 
+fn edit_mentions(edit: &Edit, name: &str) -> bool {
+    edit.values.keys().any(|key| key.eq_ignore_ascii_case(name))
+        || edit
+            .remove
+            .as_ref()
+            .is_some_and(|key| key.eq_ignore_ascii_case(name))
+}
+
 #[derive(Default)]
 struct Edit {
     values: BTreeMap<String, Option<String>>,
@@ -649,28 +657,29 @@ async fn edit_graph(
         let mut projections = Vec::new();
         for field in old.schema.fields() {
             let name = field.name();
-            if name.starts_with("__gf_")
-                || (!edit.replace
-                    && !edit.values.contains_key(name)
-                    && edit.remove.as_ref() != Some(name))
-            {
+            if name.starts_with("__gf_") || (!edit.replace && !edit_mentions(edit, name)) {
                 projections.push(col("__gf_old", name).alias(name));
             }
         }
         for (name, value) in &edit.values {
             if let Some(column) = value {
-                if let Ok(existing) = old.schema.field_with_name(name) {
+                let stored = crate::graph::property_field(old.schema.as_ref(), name);
+                if let Some(existing) = stored {
                     let incoming = patch
                         .schema()
                         .field_with_name(None, column)
                         .map_err(|_| Error::Corrupt(format!("missing patch column {column}")))?;
                     if incoming.data_type() != existing.data_type() {
                         return Err(Error::UnsupportedFeature(format!(
-                            "mixed types for graph property {name}"
+                            "mixed types for graph property {}",
+                            existing.name()
                         )));
                     }
                 }
-                projections.push(col("__gf_patch", column).alias(name));
+                let output = stored
+                    .map(|field| field.name().to_owned())
+                    .unwrap_or_else(|| name.clone());
+                projections.push(col("__gf_patch", column).alias(&output));
             }
         }
         let mut labels = old.labels.clone();

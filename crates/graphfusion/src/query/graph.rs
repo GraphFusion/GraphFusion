@@ -1,3 +1,4 @@
+use super::casefold::{CaseFoldMap, CaseFoldSet};
 use super::{expressions::Binder, native::NativePush};
 use crate::{
     catalog::ObjectId,
@@ -41,17 +42,28 @@ impl ElementBinding {
             name,
         ))
     }
+    fn stored_property<'a>(&'a self, name: &str) -> Option<&'a str> {
+        self.properties
+            .keys()
+            .find(|stored| stored.eq_ignore_ascii_case(name))
+            .map(String::as_str)
+    }
     pub fn property(&self, name: &str) -> Expr {
-        if self.properties.contains_key(name) {
-            self.column(name)
-        } else {
-            lit(ScalarValue::Null)
+        match self.stored_property(name) {
+            Some(stored) => self.column(stored),
+            None => lit(ScalarValue::Null),
         }
     }
     pub fn property_exists(&self, name: &str) -> Expr {
-        self.nullable_predicate(self.present.get(name).map_or_else(
+        let stored = self.stored_property(name);
+        self.nullable_predicate(stored.map_or_else(
             || lit(false),
-            |column| self.column(column).and(self.property(name).is_not_null()),
+            |name| {
+                self.present.get(name).map_or_else(
+                    || lit(false),
+                    |column| self.column(column).and(self.property(name).is_not_null()),
+                )
+            },
         ))
     }
     pub fn label(&self, label: &ast::LabelExpression) -> Expr {
@@ -105,14 +117,14 @@ impl ElementBinding {
 
 #[derive(Clone, Default)]
 pub(super) struct Bindings {
-    pub scalars: BTreeMap<String, Column>,
-    pub elements: BTreeMap<String, ElementBinding>,
+    pub scalars: CaseFoldMap<Column>,
+    pub elements: CaseFoldMap<ElementBinding>,
     pub order: Vec<String>,
-    pub conditional: BTreeSet<String>,
-    pub groups: BTreeSet<String>,
-    pub references: BTreeMap<String, super::references::ReferenceBinding>,
+    pub conditional: CaseFoldSet,
+    pub groups: CaseFoldSet,
+    pub references: CaseFoldMap<super::references::ReferenceBinding>,
     pub sources: BTreeMap<ObjectId, std::sync::Arc<GraphData>>,
-    pub domains: BTreeMap<String, super::references::Domain>,
+    pub domains: CaseFoldMap<super::references::Domain>,
     next: usize,
 }
 impl Bindings {
@@ -128,9 +140,12 @@ impl Bindings {
         self.scalars.contains_key(name) || self.elements.contains_key(name)
     }
     pub fn scalar(&mut self, name: &str) -> Column {
+        if let Some(column) = self.scalars.get(name) {
+            return column.clone();
+        }
         let column = Column::new_unqualified(format!("__gf_scalar_{}", self.next));
         self.next += 1;
-        self.scalars.insert(name.into(), column.clone());
+        self.scalars.insert(name, column.clone());
         self.order.push(name.into());
         column
     }
@@ -174,10 +189,10 @@ pub(super) async fn matches(
         Some(predicate) if !where_runs_after_search(clause, session)? => {
             match super::native::clause_filters(session, plan.schema(), scope, predicate)? {
                 Some(filters) => (filters, true),
-                None => (BTreeMap::new(), false),
+                None => (CaseFoldMap::new(), false),
             }
         }
-        _ => (BTreeMap::new(), false),
+        _ => (CaseFoldMap::new(), false),
     };
     let mut compiler = super::patterns::Compiler {
         session,
@@ -189,7 +204,7 @@ pub(super) async fn matches(
         predicates: Vec::new(),
         clause_filters,
         clause_push,
-        clause_hit: BTreeSet::new(),
+        clause_hit: CaseFoldSet::new(),
     };
     let mut edge_lists: Vec<Expr> = Vec::new();
     for path in &clause.patterns {
@@ -300,7 +315,7 @@ pub(super) fn declare(scope: &mut Bindings, name: &str, binding: &ElementBinding
             "variable {name} is already bound"
         )));
     }
-    scope.elements.insert(name.into(), binding.clone());
+    scope.elements.insert(name, binding.clone());
     scope.order.push(name.into());
     Ok(())
 }
@@ -643,10 +658,10 @@ fn scan_tables(
                 ]);
             }
             for (name, data_type) in &binding.properties {
-                let present = table.schema.field_with_name(name).ok();
+                let present = graph::property_field(table.schema.as_ref(), name);
                 projections.push(match present {
-                    Some(field) if field.data_type() == data_type => col(name),
-                    Some(_) => cast(col(name), data_type.clone()).alias(name),
+                    Some(field) if field.data_type() == data_type => col(field.name()).alias(name),
+                    Some(field) => cast(col(field.name()), data_type.clone()).alias(name),
                     None => lit(ScalarValue::try_from(data_type)?).alias(name),
                 });
                 projections.push(lit(present.is_some()).alias(&binding.present[name]));
@@ -716,7 +731,11 @@ fn one_label_apart(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
 
 fn shares_property(table: &Table, before: &ElementBinding) -> bool {
     table.schema.fields().iter().any(|field| {
-        !field.name().starts_with("__gf_") && before.properties.contains_key(field.name())
+        !field.name().starts_with("__gf_")
+            && before
+                .properties
+                .keys()
+                .any(|stored| stored.eq_ignore_ascii_case(field.name()))
     })
 }
 
@@ -725,8 +744,9 @@ fn properties_fit(table: &Table, before: &ElementBinding) -> bool {
         field.name().starts_with("__gf_")
             || before
                 .properties
-                .get(field.name())
-                .is_none_or(|bound| graph::property_fits(field.data_type(), bound))
+                .iter()
+                .find(|(stored, _)| stored.eq_ignore_ascii_case(field.name()))
+                .is_none_or(|(_, bound)| graph::property_fits(field.data_type(), bound))
     })
 }
 

@@ -133,7 +133,11 @@ impl ReferenceBinding {
         let values: Vec<_> = self
             .parts
             .iter()
-            .filter(|p| p.properties.contains_key(key))
+            .filter(|p| {
+                p.properties
+                    .keys()
+                    .any(|stored| stored.eq_ignore_ascii_case(key))
+            })
             .map(|p| p.property(key))
             .collect();
         let mut previous = DataType::Null;
@@ -252,7 +256,7 @@ pub(super) fn resolve(
     let names = scope
         .scalars
         .iter()
-        .filter(|(name, _)| !scope.references.contains_key(*name))
+        .filter(|(name, _)| !scope.references.contains_key(name))
         .map(|(name, column)| (name.clone(), column.clone()))
         .collect::<Vec<_>>();
     for (name, column) in names {
