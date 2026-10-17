@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Compare a mixed property with a working-table value on each fragment's stored
+  type. `WHERE n.id = k` no longer fails when `k` is bound, and a string value
+  does not match a stringified integer.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

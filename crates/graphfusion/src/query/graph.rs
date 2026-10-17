@@ -218,8 +218,7 @@ pub(super) async fn matches(
             .all(|name| compiler.clause_hit.contains(name));
     if let Some(predicate) = &clause.where_clause {
         if !pushed {
-            let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
-            plan = plan.filter(expr)?;
+            plan = super::native::apply_stored_predicate(plan, session, scope, predicate)?;
         }
     }
     Ok(plan)
@@ -403,9 +402,7 @@ pub(super) fn predicates_for(
         }
     }
     if let Some(predicate) = predicate.filter(|_| !native.pushed_where) {
-        let expression =
-            Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
-        plan = plan.filter(expression)?;
+        plan = super::native::apply_stored_predicate(plan, session, scope, predicate)?;
     }
     Ok(plan)
 }
