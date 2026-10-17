@@ -3,11 +3,24 @@ use datafusion::{
     arrow::{array::Float64Array, compute::kernels::numeric, datatypes::DataType},
     common::ScalarValue,
     error::DataFusionError,
-    logical_expr::{create_udf, ColumnarValue, Expr, Operator, Volatility},
+    logical_expr::{create_udf, ColumnarValue, Expr, Operator, ScalarUDF, Volatility},
 };
 use std::sync::Arc;
 
 pub(super) fn finite(value: Expr) -> Expr {
+    // One function value for every finite check. A fresh closure would not
+    // compare equal, so DISTINCT could not recognize the same float aggregate
+    // in ORDER BY.
+    finite_udf().call(vec![value])
+}
+
+fn finite_udf() -> ScalarUDF {
+    use std::sync::OnceLock;
+    static UDF: OnceLock<ScalarUDF> = OnceLock::new();
+    UDF.get_or_init(finite_udf_new).clone()
+}
+
+fn finite_udf_new() -> ScalarUDF {
     create_udf(
         "gql_finite_float",
         vec![DataType::Float64],
@@ -29,7 +42,6 @@ pub(super) fn finite(value: Expr) -> Expr {
             Ok(args[0].clone())
         }),
     )
-    .call(vec![value])
 }
 
 pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType) -> Expr {
@@ -98,6 +110,11 @@ mod tests {
         logical_expr::col,
         prelude::SessionContext,
     };
+
+    #[test]
+    fn identical_finite_checks_compare_equal() {
+        assert_eq!(finite(col("n")), finite(col("n")));
+    }
 
     #[tokio::test]
     async fn checked_arithmetic_executes_on_arrow_columns_with_nulls() {

@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Recognize a repeated float aggregate as the same `ORDER BY` key. `DISTINCT`
+  results can sort by `AVG`, a floating `SUM`, `MIN`, `MAX`, standard deviation,
+  or a percentile when that call is already projected, instead of failing while
+  planning.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

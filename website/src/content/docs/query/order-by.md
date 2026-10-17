@@ -20,6 +20,13 @@ FOR n IN [2, NULL, 1]
 RETURN n ORDER BY n ASC NULLS LAST;
 ```
 
-Ordering can refer to output aliases, including element aliases and their properties. With DISTINCT, ordering expressions must depend on projected results. Aggregate queries may order by available grouping and aggregate expressions.
+Ordering can refer to output aliases, including element aliases and their properties. With DISTINCT, ordering expressions must depend on projected results. Aggregate queries may order by available grouping and aggregate expressions. The same float aggregate can be repeated:
+
+```gql test
+FOR n IN [1, 2, 1]
+RETURN DISTINCT n AS k, AVG(n) AS average ORDER BY AVG(n) DESC;
+```
+
+This returns 2/2.0 then 1/1.0. Sums, minimums, maximums, standard deviations and percentiles follow the same rule.
 
 ORDER BY can also appear in the linear pipeline before the result clause. A later operation can affect row order; put the final ORDER BY with the result when ordering matters to the caller.
