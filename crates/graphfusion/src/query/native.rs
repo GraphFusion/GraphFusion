@@ -7,12 +7,17 @@
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
 //! unknown stays unknown and does not keep the row.
 
-use super::{expressions::Binder, graph::Bindings};
+use super::{
+    expressions::Binder,
+    graph::{Bindings, ElementBinding, ElementKind},
+};
 use crate::{gql as ast, graph::Table, Error, Result, SessionState};
 use datafusion::{
-    arrow::datatypes::{DataType, Schema},
-    common::{Column, DFSchema, ScalarValue},
-    logical_expr::{cast, lit, Expr, ExprSchemable, Operator},
+    arrow::datatypes::{DataType, Schema, SchemaRef},
+    common::{Column, DFSchema, ScalarValue, TableReference},
+    datasource::provider_as_source,
+    functions::core::expr_fn::coalesce,
+    logical_expr::{cast, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -154,16 +159,24 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
 }
 
 pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
+    compile_in(atom, schema, None)
+}
+
+fn compile_in(atom: &NativeAtom, schema: &Schema, alias: Option<&str>) -> Result<Expr> {
     Ok(match atom {
-        NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
-        NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
-        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::And(left, right) => {
+            compile_in(left, schema, alias)?.and(compile_in(right, schema, alias)?)
+        }
+        NativeAtom::Or(left, right) => {
+            compile_in(left, schema, alias)?.or(compile_in(right, schema, alias)?)
+        }
+        NativeAtom::Not(inner) => Expr::Not(Box::new(compile_in(inner, schema, alias)?)),
         NativeAtom::Compare {
             property,
             op,
             value,
             value_type,
-        } => compare_property(schema, property, *op, value.clone(), value_type)?,
+        } => compare_property(schema, property, *op, value.clone(), value_type, alias)?,
     })
 }
 
@@ -173,6 +186,7 @@ fn compare_property(
     op: Operator,
     value: Expr,
     value_type: &DataType,
+    alias: Option<&str>,
 ) -> Result<Expr> {
     let Some(stored) = schema
         .field_with_name(property)
@@ -184,7 +198,10 @@ fn compare_property(
     if !comparable(&stored, value_type) {
         return Ok(unknown());
     }
-    let mut left = column(property);
+    let mut left = match alias {
+        Some(alias) => Expr::Column(Column::new(Some(TableReference::bare(alias)), property)),
+        None => column(property),
+    };
     let mut right = value;
     if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
         left = cast(left, DataType::Float64);
@@ -548,5 +565,169 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
         | E::IsDirected { .. }
         | E::IsLabeled { .. }
         | E::Identifier(_) => vec![],
+    }
+}
+
+/// A parenthesized path predicate runs after its pattern has been unified.
+/// When a property mixes stored types, compare each fragment before that cast.
+pub(super) fn group_stored_predicate(
+    mut plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    expr: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
+    let Some(filters) = clause_filters(session, plan.schema(), scope, expr)? else {
+        return Ok((plan, None));
+    };
+    let mut prepared = Vec::new();
+    for (variable, atom) in filters {
+        let Some(binding) = scope.elements.get(&variable).cloned() else {
+            return Ok((plan, None));
+        };
+        let sources = fragment_sources(scope, &binding);
+        if sources.is_empty() {
+            return Ok((plan, None));
+        }
+        prepared.push((binding, atom, sources));
+    }
+    if !prepared
+        .iter()
+        .any(|(_, atom, sources)| atom_needs_stored_types(atom, sources))
+    {
+        return Ok((plan, None));
+    }
+    for (_, atom, sources) in &prepared {
+        validate_schemas(atom, sources)?;
+    }
+    let mut parts = Vec::new();
+    for (binding, atom, sources) in &prepared {
+        let mut compiled = Vec::new();
+        for (schema, provider) in sources {
+            let alias = scope.fresh("pred");
+            let scan =
+                LogicalPlanBuilder::scan(&alias, provider_as_source(provider.clone()), None)?
+                    .build()?;
+            let id = Expr::Column(Column::new(
+                Some(TableReference::bare(alias.as_str())),
+                crate::graph::ID,
+            ));
+            plan = std::mem::replace(&mut plan, LogicalPlanBuilder::empty(false)).join_on(
+                scan,
+                JoinType::Left,
+                [binding.column(crate::graph::ID).eq(id)],
+            )?;
+            compiled.push(compile_in(atom, schema, Some(&alias))?);
+        }
+        parts.push(coalesce_exprs(compiled));
+    }
+    let predicate = parts
+        .into_iter()
+        .reduce(|left, right| left.and(right))
+        .unwrap_or_else(|| lit(true));
+    Ok((plan, Some(predicate)))
+}
+
+type FragmentSource = (
+    SchemaRef,
+    std::sync::Arc<dyn datafusion::datasource::TableProvider>,
+);
+
+fn atom_needs_stored_types(atom: &NativeAtom, sources: &[FragmentSource]) -> bool {
+    let mut names = BTreeSet::new();
+    atom_properties(atom, &mut names);
+    names
+        .iter()
+        .any(|property| property_mixes(sources, property))
+}
+
+fn atom_properties(atom: &NativeAtom, names: &mut BTreeSet<String>) {
+    match atom {
+        NativeAtom::And(left, right) | NativeAtom::Or(left, right) => {
+            atom_properties(left, names);
+            atom_properties(right, names);
+        }
+        NativeAtom::Not(inner) => atom_properties(inner, names),
+        NativeAtom::Compare { property, .. } => {
+            names.insert(property.clone());
+        }
+    }
+}
+
+fn property_mixes(sources: &[FragmentSource], property: &str) -> bool {
+    let mut seen: Vec<&DataType> = Vec::new();
+    for (schema, _) in sources {
+        let Some(field) = schema.field_with_name(property).ok() else {
+            continue;
+        };
+        let data_type = field.data_type();
+        if seen.iter().any(|previous| {
+            *previous != data_type && !(previous.is_numeric() && data_type.is_numeric())
+        }) {
+            return true;
+        }
+        if !seen.contains(&data_type) {
+            seen.push(data_type);
+        }
+    }
+    false
+}
+
+fn fragment_sources(scope: &Bindings, binding: &ElementBinding) -> Vec<FragmentSource> {
+    let Some(data) = scope.sources.get(&binding.graph) else {
+        return Vec::new();
+    };
+    let tables: Vec<&Table> = match binding.kind {
+        ElementKind::Node => data.nodes.iter().map(|node| &node.0).collect(),
+        ElementKind::Edge => data.edges.iter().map(|edge| &edge.table).collect(),
+    };
+    tables
+        .into_iter()
+        .filter(|table| {
+            binding
+                .source_labels
+                .iter()
+                .any(|labels| labels == &table.labels)
+        })
+        .map(|table| (table.schema.clone(), table.provider.clone()))
+        .collect()
+}
+
+fn validate_schemas(atom: &NativeAtom, sources: &[FragmentSource]) -> Result<()> {
+    match atom {
+        NativeAtom::And(left, right) | NativeAtom::Or(left, right) => {
+            validate_schemas(left, sources)?;
+            validate_schemas(right, sources)
+        }
+        NativeAtom::Not(inner) => validate_schemas(inner, sources),
+        NativeAtom::Compare {
+            property,
+            value_type,
+            ..
+        } => {
+            let mut stored = None;
+            for (schema, _) in sources {
+                let Some(field) = schema.field_with_name(property).ok() else {
+                    continue;
+                };
+                if comparable(field.data_type(), value_type) {
+                    return Ok(());
+                }
+                stored.get_or_insert_with(|| field.data_type().clone());
+            }
+            match stored {
+                Some(stored) => Err(Error::InvalidQuery(format!(
+                    "incomparable types {stored} and {value_type}"
+                ))),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+fn coalesce_exprs(parts: Vec<Expr>) -> Expr {
+    match parts.len() {
+        0 => unknown(),
+        1 => parts.into_iter().next().expect("fragment predicate"),
+        _ => coalesce(parts),
     }
 }

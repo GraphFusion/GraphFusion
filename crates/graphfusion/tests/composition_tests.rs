@@ -330,3 +330,75 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn parenthesized_where_compares_stored_types() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:P {name: 'ten', v: 10}),
+                    (:P {name: 'nine', v: 9}),
+                    (:D {name: 'doc', v: 'x'}),
+                    (:D {name: 'text', v: '10'})",
+        )
+        .await
+        .unwrap();
+
+    let greater = session
+        .query("MATCH ((n) WHERE n.v > 9) RETURN n.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert!(
+        greater.logical_plan.contains("__gf_pred_"),
+        "parenthesized predicate stayed on the unified column:\n{}",
+        greater.logical_plan
+    );
+    assert_eq!(strings(&greater), vec![vec!["ten".to_string()]]);
+
+    let either = session
+        .query(
+            "MATCH ((n) WHERE n.v > 9 OR n.name = 'doc')
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![vec!["doc".to_string()], vec!["ten".to_string()]]
+    );
+
+    let text = session
+        .query("MATCH ((n) WHERE n.v = '10') RETURN n.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&text), vec![vec!["text".to_string()]]);
+
+    let negated = session
+        .query("MATCH ((n) WHERE NOT n.v = 9) RETURN n.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["ten".to_string()]]);
+
+    let same_label = session
+        .query("MATCH ((n:P) WHERE n.v > 9) RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert!(
+        !same_label.logical_plan.contains("__gf_pred_"),
+        "single-type parenthesized predicate joined fragments:\n{}",
+        same_label.logical_plan
+    );
+    assert_eq!(strings(&same_label), vec![vec!["ten".to_string()]]);
+
+    let mismatch = session
+        .query("MATCH ((n:D) WHERE n.v > 9) RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("incomparable types"),
+        "{mismatch}"
+    );
+}
