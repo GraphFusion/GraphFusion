@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-`RETURN` projects expressions into an Arrow result table. A variable keeps its name; give computed expressions an explicit `AS` alias to make result schemas stable. Otherwise scalar expressions receive names such as `column_1`.
+`RETURN` projects expressions into an Arrow result table. A variable keeps its name; give computed expressions an explicit `AS` alias to make result schemas stable. Otherwise scalar expressions receive names such as `column_1`. Arithmetic and concatenation on a mixed property use each source fragment's stored type. A fragment that cannot apply the operator contributes null instead of a stringified value.
 
 ```gql test
 MATCH (p:Person)
