@@ -33,6 +33,30 @@ pub(super) struct ElementBinding {
     /// Set when a label pattern or an insert selected the source fragments.
     /// An unconstrained match keeps the full element-kind union.
     pub constrained: bool,
+    /// Fragments unified into this binding, in scan order. A lossy property
+    /// keeps one native column per fragment so a later comparison can use the
+    /// stored type instead of the stringified column.
+    pub fragments: Vec<FragmentLayout>,
+    /// Distinguishes scan branches when a stored value is kept beside the
+    /// unified column. Label sets alone can repeat across resident and sealed
+    /// fragments.
+    pub fragment_id: Option<String>,
+}
+
+/// One label set contributing to a binding, with the stored property types.
+#[derive(Clone, Debug)]
+pub(super) struct FragmentLayout {
+    pub properties: BTreeMap<String, DataType>,
+    /// Columns holding stored values that a string unification would destroy.
+    pub native: BTreeMap<String, String>,
+}
+
+/// A fragment-local property value. The marker is true only on that fragment.
+/// A missing marker means the value is already a single expression.
+pub(super) struct StoredVariant {
+    pub marker: Option<Expr>,
+    pub value: Expr,
+    pub data_type: DataType,
 }
 impl ElementBinding {
     pub fn column(&self, name: &str) -> Expr {
@@ -47,6 +71,51 @@ impl ElementBinding {
         } else {
             lit(ScalarValue::Null)
         }
+    }
+
+    /// Stored values for a property whose unified column no longer compares
+    /// correctly. `None` means every selected fragment can use that column.
+    pub fn stored_variants(&self, name: &str) -> Option<Vec<StoredVariant>> {
+        let unified = self.properties.get(name)?;
+        let mut pending = Vec::new();
+        let mut lossy = false;
+        for (index, fragment) in self.fragments.iter().enumerate() {
+            let Some(stored) = fragment.properties.get(name) else {
+                continue;
+            };
+            if !stored_value_kept(stored, unified) {
+                lossy = true;
+            }
+            pending.push((index, stored.clone(), fragment.native.get(name).cloned()));
+        }
+        if !lossy {
+            return None;
+        }
+        Some(
+            pending
+                .into_iter()
+                .map(|(index, stored, native)| {
+                    let value = match native {
+                        Some(column) => self.column(&column),
+                        None => self.column(name),
+                    };
+                    StoredVariant {
+                        marker: Some(self.fragment_marker(index)),
+                        value,
+                        data_type: stored,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn fragment_marker(&self, index: usize) -> Expr {
+        let column = self
+            .fragment_id
+            .as_ref()
+            .expect("stored fragment values have a fragment id");
+        self.column(column)
+            .eq(lit(i32::try_from(index).expect("fragment index")))
     }
     pub fn property_exists(&self, name: &str) -> Expr {
         self.nullable_predicate(self.present.get(name).map_or_else(
@@ -555,6 +624,11 @@ fn scan_tables(
         .map(|(table, _)| table.labels.clone())
         .collect();
     let labels: BTreeSet<_> = source_labels.iter().flatten().cloned().collect();
+    let fragments = fragment_layouts(&schema_source, &properties);
+    let fragment_id = fragments
+        .iter()
+        .any(|fragment| !fragment.native.is_empty())
+        .then(|| "__gf_fragment".to_string());
     let binding = ElementBinding {
         alias: format!("__gf_element_{}", scope.next),
         graph: graph_id,
@@ -572,6 +646,8 @@ fn scan_tables(
         properties,
         source_labels,
         constrained: filter.is_some() || inserted.is_some() || refresh_of.is_some(),
+        fragments,
+        fragment_id,
     };
     scope.next += 1;
     // Each scan needs its own qualifier. Joining two leaves that are both
@@ -579,7 +655,7 @@ fn scan_tables(
     // per element kind.
     let scan_name = format!("__gf_scan_{}", scope.next);
     let mut branches = Vec::new();
-    for (table, directed) in scanned {
+    for (table_index, &(table, directed)) in scanned.iter().enumerate() {
         let orientations = match direction {
             None => vec![false],
             Some(ast::Direction::Right) if directed => vec![false],
@@ -654,6 +730,11 @@ fn scan_tables(
             for (label, column) in &binding.labels {
                 projections.push(lit(table.labels.contains(label)).alias(column));
             }
+            projections.extend(native_columns(&binding, Some(table_index)));
+            if let Some(column) = &binding.fragment_id {
+                projections
+                    .push(lit(i32::try_from(table_index).expect("fragment index")).alias(column));
+            }
             branches.push(scan.project(projections)?.build()?);
         }
     }
@@ -675,6 +756,10 @@ fn scan_tables(
         for column in binding.labels.values() {
             fields.push(lit(false).alias(column));
         }
+        fields.extend(native_columns(&binding, None));
+        if let Some(column) = &binding.fragment_id {
+            fields.push(lit(ScalarValue::Int32(None)).alias(column));
+        }
         LogicalPlanBuilder::empty(false).project(fields)?
     } else {
         let mut iter = branches.into_iter();
@@ -690,6 +775,57 @@ fn scan_tables(
         binding,
     ))
 }
+/// Integers widened to float still compare as numbers. A cast to string does not.
+fn stored_value_kept(stored: &DataType, unified: &DataType) -> bool {
+    stored == unified || (*stored == DataType::Int64 && *unified == DataType::Float64)
+}
+
+fn fragment_layouts(
+    tables: &[(&Table, bool)],
+    unified: &BTreeMap<String, DataType>,
+) -> Vec<FragmentLayout> {
+    let mut native_count = 0;
+    tables
+        .iter()
+        .map(|(table, _)| {
+            let mut properties = BTreeMap::new();
+            let mut native = BTreeMap::new();
+            for field in table.schema.fields() {
+                if field.name().starts_with("__gf_") {
+                    continue;
+                }
+                let stored = field.data_type().clone();
+                properties.insert(field.name().clone(), stored.clone());
+                let Some(unified_type) = unified.get(field.name()) else {
+                    continue;
+                };
+                if stored_value_kept(&stored, unified_type) {
+                    continue;
+                }
+                native.insert(field.name().clone(), format!("__gf_native_{native_count}"));
+                native_count += 1;
+            }
+            FragmentLayout { properties, native }
+        })
+        .collect()
+}
+
+fn native_columns(binding: &ElementBinding, table_index: Option<usize>) -> Vec<Expr> {
+    let mut columns = Vec::new();
+    for (index, fragment) in binding.fragments.iter().enumerate() {
+        for (property, column) in &fragment.native {
+            let data_type = &fragment.properties[property];
+            let value = if table_index == Some(index) {
+                col(property)
+            } else {
+                lit(ScalarValue::try_from(data_type).expect("null of a stored property type"))
+            };
+            columns.push(value.alias(column));
+        }
+    }
+    columns
+}
+
 fn refreshes(table: &Table, before: &ElementBinding) -> bool {
     if before
         .source_labels

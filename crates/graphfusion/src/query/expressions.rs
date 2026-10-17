@@ -2,7 +2,7 @@ use crate::{gql as ast, Error, Result, SessionState, Value};
 use datafusion::{
     arrow::datatypes::DataType,
     common::{Column, DFSchema, ScalarValue},
-    logical_expr::{expr::BinaryExpr, Expr, ExprSchemable, Operator},
+    logical_expr::{cast, expr::BinaryExpr, lit, Expr, ExprSchemable, Operator},
 };
 
 pub(super) struct Binder<'a> {
@@ -306,6 +306,9 @@ impl<'a> Binder<'a> {
                 }
             }
             E::Binary { left, op, right } => {
+                if let Some(compared) = self.compare_across_elements(left, right, op)? {
+                    return Ok(compared);
+                }
                 let mut left = self.bind(left)?;
                 let mut right = self.bind(right)?;
                 use ast::BinaryOp as B;
@@ -500,12 +503,160 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// Compare element properties in each fragment's stored type.
+    ///
+    /// A multi-type scan stringifies the unified column. Two elements are
+    /// joined before that predicate runs, so the comparison has to recover
+    /// each side's stored value. A fragment pair that cannot compare is
+    /// unknown. The predicate is a type error only when no selected pair can.
+    fn compare_across_elements(
+        &self,
+        left: &ast::Expr,
+        right: &ast::Expr,
+        op: &ast::BinaryOp,
+    ) -> Result<Option<Expr>> {
+        let operator = match op {
+            ast::BinaryOp::Eq => Operator::Eq,
+            ast::BinaryOp::Neq => Operator::NotEq,
+            ast::BinaryOp::Lt => Operator::Lt,
+            ast::BinaryOp::Le => Operator::LtEq,
+            ast::BinaryOp::Gt => Operator::Gt,
+            ast::BinaryOp::Ge => Operator::GtEq,
+            _ => return Ok(None),
+        };
+        let left_stored = stored_property(self.bindings, left);
+        let right_stored = stored_property(self.bindings, right);
+        if left_stored.is_none() && right_stored.is_none() {
+            return Ok(None);
+        }
+        let left_side = match left_stored {
+            Some(values) => values,
+            None => vec![self.plain_variant(left)?],
+        };
+        let right_side = match right_stored {
+            Some(values) => values,
+            None => vec![self.plain_variant(right)?],
+        };
+        if left_side.is_empty() || right_side.is_empty() {
+            return Ok(Some(lit(ScalarValue::Boolean(None))));
+        }
+        let comparable_pair = left_side.iter().any(|left| {
+            right_side
+                .iter()
+                .any(|right| types_comparable(&left.data_type, &right.data_type))
+        });
+        let left_real = left_side
+            .iter()
+            .any(|side| side.data_type != DataType::Null);
+        let right_real = right_side
+            .iter()
+            .any(|side| side.data_type != DataType::Null);
+        if left_real && right_real && !comparable_pair {
+            let left_type = &left_side
+                .iter()
+                .find(|side| side.data_type != DataType::Null)
+                .expect("real left type")
+                .data_type;
+            let right_type = &right_side
+                .iter()
+                .find(|side| side.data_type != DataType::Null)
+                .expect("real right type")
+                .data_type;
+            return Err(Error::InvalidQuery(format!(
+                "incomparable types {left_type} and {right_type}"
+            )));
+        }
+        let mut when = Vec::new();
+        for left in &left_side {
+            for right in &right_side {
+                if !types_comparable(&left.data_type, &right.data_type) {
+                    continue;
+                }
+                let condition = match (&left.marker, &right.marker) {
+                    (Some(left), Some(right)) => left.clone().and(right.clone()),
+                    (Some(marker), None) | (None, Some(marker)) => marker.clone(),
+                    (None, None) => lit(true),
+                };
+                when.push((
+                    Box::new(condition),
+                    Box::new(apply_comparison(
+                        operator,
+                        left.value.clone(),
+                        &left.data_type,
+                        right.value.clone(),
+                        &right.data_type,
+                    )),
+                ));
+            }
+        }
+        Ok(Some(Expr::Case(datafusion::logical_expr::expr::Case::new(
+            None,
+            when,
+            Some(Box::new(lit(ScalarValue::Boolean(None)))),
+        ))))
+    }
+
+    fn plain_variant(&self, expr: &ast::Expr) -> Result<super::graph::StoredVariant> {
+        let value = self.bind(expr)?;
+        let data_type = value.get_type(self.schema)?;
+        Ok(super::graph::StoredVariant {
+            marker: None,
+            value,
+            data_type,
+        })
+    }
+
     fn compatible(&self, expressions: &[Expr]) -> Result<()> {
         let mut previous = DataType::Null;
         for expr in expressions {
             previous = common_value_type(&previous, &expr.get_type(self.schema)?)?;
         }
         Ok(())
+    }
+}
+
+fn stored_property(
+    bindings: Option<&super::graph::Bindings>,
+    expr: &ast::Expr,
+) -> Option<Vec<super::graph::StoredVariant>> {
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    bindings?
+        .elements
+        .get(&name.value)?
+        .stored_variants(&key.value)
+}
+
+fn types_comparable(left: &DataType, right: &DataType) -> bool {
+    left == right
+        || *left == DataType::Null
+        || *right == DataType::Null
+        || (left.is_numeric() && right.is_numeric())
+}
+
+fn apply_comparison(
+    op: Operator,
+    mut left: Expr,
+    left_type: &DataType,
+    mut right: Expr,
+    right_type: &DataType,
+) -> Expr {
+    if left_type != right_type && left_type.is_numeric() && right_type.is_numeric() {
+        left = cast(left, DataType::Float64);
+        right = cast(right, DataType::Float64);
+    }
+    match op {
+        Operator::Eq => left.eq(right),
+        Operator::NotEq => left.not_eq(right),
+        Operator::Lt => left.lt(right),
+        Operator::LtEq => left.lt_eq(right),
+        Operator::Gt => left.gt(right),
+        Operator::GtEq => left.gt_eq(right),
+        _ => lit(ScalarValue::Boolean(None)),
     }
 }
 

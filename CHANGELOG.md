@@ -12,6 +12,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Compare properties of two elements in each side's stored type. A property
+  read back as a string can still match a number on the other element, and a
+  fragment that cannot compare stays unknown instead of failing the query.
 
 ## 0.2.0 — 2026-10-05
 
