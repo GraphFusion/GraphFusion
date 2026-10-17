@@ -370,3 +370,64 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         Err(Error::SessionClosed)
     ));
 }
+
+#[tokio::test]
+async fn integer_arithmetic_errors_name_overflow_and_division_by_zero() {
+    let mut session = Database::new().session();
+    let division = session.query("RETURN 1 / 0 AS q").await.unwrap_err();
+    assert!(
+        division.to_string().contains("division by zero"),
+        "{division}"
+    );
+    assert!(!division.to_string().contains("Arrow"), "{division}");
+    let zero = session.query("RETURN 0 / 0 AS q").await.unwrap_err();
+    assert!(zero.to_string().contains("division by zero"), "{zero}");
+    let missing = session.query("RETURN NULL / 0 AS q").await.unwrap();
+    assert_eq!(row(&missing), vec![ScalarValue::Int64(None)]);
+
+    let sum = session
+        .query("RETURN 9223372036854775807 + 1 AS q")
+        .await
+        .unwrap_err();
+    assert!(sum.to_string().contains("integer overflow"), "{sum}");
+    assert!(!sum.to_string().contains("Arrow"), "{sum}");
+    let product = session
+        .query("RETURN 9223372036854775807 * 2 AS q")
+        .await
+        .unwrap_err();
+    assert!(
+        product.to_string().contains("integer overflow"),
+        "{product}"
+    );
+    let negated = session
+        .query("RETURN -(-9223372036854775808) AS q")
+        .await
+        .unwrap_err();
+    assert!(
+        negated.to_string().contains("integer overflow"),
+        "{negated}"
+    );
+    let quotient = session
+        .query("RETURN -9223372036854775808 / -1 AS q")
+        .await
+        .unwrap_err();
+    assert!(
+        quotient.to_string().contains("integer overflow"),
+        "{quotient}"
+    );
+
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run("INSERT (:N {a: 4, b: 2}), (:N {a: 4, b: 0})")
+        .await
+        .unwrap();
+    let stored = session
+        .query("MATCH (n) RETURN n.a / n.b AS q")
+        .await
+        .unwrap_err();
+    assert!(stored.to_string().contains("division by zero"), "{stored}");
+    let finite = session.query("RETURN 1.0 / 0.0 AS q").await.unwrap_err();
+    assert!(finite.to_string().contains("division by zero"), "{finite}");
+}

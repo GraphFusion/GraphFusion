@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Report integer overflow and division by zero as execution errors
+  (`integer overflow`, `division by zero`). `1 / 0`, `9223372036854775807 + 1`,
+  and `i64::MIN / -1` no longer surface an Arrow error. A null dividend divided
+  by zero stays null.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
