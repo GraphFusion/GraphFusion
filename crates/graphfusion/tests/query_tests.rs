@@ -370,3 +370,42 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         Err(Error::SessionClosed)
     ));
 }
+
+#[tokio::test]
+async fn integer_sum_overflow_is_an_execution_error() {
+    let mut session = Database::new().session();
+    let overflow = session
+        .query("FOR x IN [9223372036854775807, 1] RETURN SUM(x) AS s")
+        .await
+        .unwrap_err();
+    assert!(
+        overflow.to_string().contains("integer overflow"),
+        "{overflow}"
+    );
+    assert!(!overflow.to_string().contains("Arrow"), "{overflow}");
+    let negative = session
+        .query("FOR x IN [-9223372036854775808, -1] RETURN SUM(x) AS s")
+        .await
+        .unwrap_err();
+    assert!(
+        negative.to_string().contains("integer overflow"),
+        "{negative}"
+    );
+
+    let total = session
+        .query("FOR x IN [10, 20, NULL] RETURN SUM(x) AS s")
+        .await
+        .unwrap();
+    assert_eq!(row(&total), vec![ScalarValue::Int64(Some(30))]);
+    assert_eq!(total.schema.field(0).data_type(), &DataType::Int64);
+    let empty = session.query("RETURN SUM(NULL) AS s").await.unwrap();
+    assert_eq!(row(&empty), vec![ScalarValue::Int64(None)]);
+    let boundary = session
+        .query("FOR x IN [9223372036854775807, -1, 1] RETURN SUM(x) AS s")
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&boundary),
+        vec![ScalarValue::Int64(Some(9223372036854775807))]
+    );
+}

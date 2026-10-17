@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Report an integer SUM outside Int64 as `integer overflow`. The wide decimal
+  total is checked before it becomes an Int64, so `SUM` of
+  `9223372036854775807` and `1` is no longer an Arrow cast error. A sum that
+  fits, including the Int64 limits, is unchanged, and an empty sum stays null.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

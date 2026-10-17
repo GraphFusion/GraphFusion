@@ -32,6 +32,57 @@ pub(super) fn finite(value: Expr) -> Expr {
     .call(vec![value])
 }
 
+/// Integer SUM accumulates in Decimal128. Convert back to Int64 here so a sum
+/// outside that range is an execution error instead of an Arrow cast failure.
+pub(super) fn checked_int_sum(value: Expr, data_type: DataType) -> Result<Expr, DataFusionError> {
+    let DataType::Decimal128(_, scale) = data_type.clone() else {
+        return Err(DataFusionError::Internal(format!(
+            "integer sum accumulator has type {data_type}"
+        )));
+    };
+    if scale < 0 {
+        return Err(DataFusionError::Internal(format!(
+            "integer sum accumulator has scale {scale}"
+        )));
+    }
+    let scale = scale as u32;
+    Ok(create_udf(
+        "gql_checked_int_sum",
+        vec![data_type],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(move |args| {
+            use datafusion::arrow::array::{Decimal128Array, Int64Builder};
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let values = arrays[0]
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("expected Decimal128 integer sum".into())
+                })?;
+            let factor = 10i128
+                .checked_pow(scale)
+                .ok_or_else(|| DataFusionError::Execution("integer overflow".into()))?;
+            let mut output = Int64Builder::with_capacity(values.len());
+            for value in values.iter() {
+                let Some(value) = value else {
+                    output.append_null();
+                    continue;
+                };
+                if value % factor != 0 {
+                    return Err(DataFusionError::Execution("integer overflow".into()));
+                }
+                let value = value / factor;
+                let value = i64::try_from(value)
+                    .map_err(|_| DataFusionError::Execution("integer overflow".into()))?;
+                output.append_value(value);
+            }
+            Ok(ColumnarValue::Array(std::sync::Arc::new(output.finish())))
+        }),
+    )
+    .call(vec![value]))
+}
+
 pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType) -> Expr {
     let name = format!("gql_checked_{op:?}_{data_type:?}").to_lowercase();
     create_udf(

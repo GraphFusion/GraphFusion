@@ -12,6 +12,6 @@ FOR value IN [10, 20, NULL]
 RETURN SUM(value) AS total, AVG(value) AS average;
 ```
 
-The total is 30 and average is 15. Empty/all-null numeric input produces null. Integer SUM uses wide accumulation followed by a checked Int64 conversion; a value outside the result range is an error. Non-finite floating aggregate results are also rejected.
+The total is 30 and average is 15. Empty/all-null numeric input produces null. Integer SUM uses wide accumulation and then checks that the total fits in Int64. A total outside that range is `integer overflow`. Non-finite floating aggregate results are also rejected.
 
 [GROUP BY](/query/group-by/) applies these aggregates independently to each group. Nested aggregates are not supported.

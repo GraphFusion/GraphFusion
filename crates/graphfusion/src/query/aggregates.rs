@@ -64,7 +64,7 @@ pub(super) fn call(
     let mut expression = match name.as_str() {
         "COUNT" => agg::expr_fn::count(value),
         "SUM" => {
-            // Widen accumulation, then use a strict cast to detect an Int64 result overflow.
+            // Widen accumulation, then convert back with an explicit range check.
             sum_integer = data_type == DataType::Int64;
             agg::expr_fn::sum(if sum_integer {
                 cast(value, DataType::Decimal128(38, 0))
@@ -107,7 +107,8 @@ pub(super) fn call(
         function.params.distinct = distinct;
     }
     if sum_integer {
-        expression = cast(expression, DataType::Int64);
+        let decimal = expression.get_type(schema)?;
+        expression = super::arithmetic::checked_int_sum(expression, decimal)?;
     }
     if collect {
         let empty = ScalarValue::List(ScalarValue::new_list(&[], &data_type, true));
