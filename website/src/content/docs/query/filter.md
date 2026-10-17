@@ -7,6 +7,8 @@ sidebar:
 
 `WHERE` attaches a predicate to MATCH or SELECT. `FILTER` filters the current working table; `FILTER WHERE` is an accepted spelling. Only true passes: false and unknown/null do not.
 
+A `MATCH` `WHERE` comparison combined with `TRUE`, `FALSE`, `UNKNOWN`, or a boolean parameter is still evaluated on each fragment's stored type. `OR TRUE` keeps a row when that fragment cannot compare the other side. `OR FALSE` does not.
+
 ```gql test
 MATCH (p:Person) WHERE p.age >= 30
 FILTER p.name <> 'Bob'

@@ -330,3 +330,134 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn mixed_label_where_keeps_boolean_literals() {
+    let mut session = social().await;
+    let or_false = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR FALSE
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&or_false), vec![vec!["Ada".to_string()]]);
+
+    let or_true = session
+        .query(
+            "MATCH (n:Person|Document) WHERE FALSE OR n.id = 1 OR TRUE
+             RETURN n.id AS id ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&or_true),
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["doc".to_string()]
+        ]
+    );
+
+    let and_true = session
+        .query(
+            "MATCH (n:Person|Document) WHERE TRUE AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&and_true), vec![vec!["Ada".to_string()]]);
+
+    let and_false = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 AND FALSE RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(and_false.row_count(), 0);
+
+    let not_stringified = session
+        .query("MATCH (n:Person|Document) WHERE n.id = '1' OR FALSE RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(not_stringified.row_count(), 0);
+
+    let xor_false = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 XOR FALSE
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&xor_false), vec![vec!["Ada".to_string()]]);
+
+    let xor_true = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 XOR TRUE
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&xor_true), vec![vec!["Bea".to_string()]]);
+
+    let unknown = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR UNKNOWN
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&unknown), vec![vec!["Ada".to_string()]]);
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE NOT FALSE AND n.id = 1)
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&inline), vec![vec!["Ada".to_string()]]);
+
+    let widened = session
+        .query(
+            "MATCH (n:Person|Metric) WHERE n.score > 1 OR FALSE
+             RETURN n.score AS score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
+
+    let both = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE (n.id = 1 OR FALSE) AND m.name = 'load' AND TRUE
+             RETURN n.name AS name, m.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&both),
+        vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
+
+    session
+        .execute("SESSION SET VALUE $keep BOOLEAN = FALSE")
+        .unwrap();
+    let parameter = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR $keep
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&parameter), vec![vec!["Ada".to_string()]]);
+
+    let incompatible = session
+        .query("MATCH (d:Document) WHERE d.id = 1 OR TRUE RETURN d.title AS title")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+}
