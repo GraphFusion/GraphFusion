@@ -557,3 +557,118 @@ async fn detach_indexes_handle_parallel_edges_loops_directions_and_separate_id_s
         }
     }
 }
+
+#[tokio::test]
+async fn identifier_case_matches_the_parser() {
+    let db = Database::new();
+    let mut s = session(&db);
+    assert_eq!(
+        rows(&run(&mut s, "INSERT (:N {age: 30, name: 'Ann'}), (:N {AGE: 40, name: 'Bea'}) MATCH (n) WHERE n.AGE > 0 RETURN n.name AS name, n.age AS age ORDER BY name").await),
+        vec![vec!["Ann", "30"], vec!["Bea", "40"]]
+    );
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n {AGE: 30}) RETURN N.name AS name").await),
+        vec![vec!["Ann"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
+                "MATCH (n) SET n.AGE = n.age + 1 RETURN n.name AS name, n.age AS age ORDER BY name"
+            )
+            .await
+        ),
+        vec![vec!["Ann", "31"], vec!["Bea", "41"]]
+    );
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:N WHERE N.AGE = 41) RETURN n.name AS name").await),
+        vec![vec!["Bea"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
+                "MATCH (n {name: 'Ann'}) REMOVE n.AGE RETURN PROPERTY_EXISTS(n, age) AS has_age"
+            )
+            .await
+        ),
+        vec![vec!["false"]]
+    );
+    assert_eq!(
+        rows(&run(&mut s, "INSERT (a:N {name: 'Self'})-[:E]->(A) MATCH (n {name: 'Self'})-[e:E]->(n) RETURN n.name AS name").await),
+        vec![vec!["Self"]]
+    );
+    assert!(run(
+        &mut s,
+        "MATCH (a {name: 'Ann'})-[:E]->(A) RETURN a.name AS name"
+    )
+    .await
+    .batches
+    .iter()
+    .all(|batch| batch.num_rows() == 0));
+    assert_eq!(
+        rows(&run(&mut s, "LET name = 'Ann' RETURN NAME AS name").await),
+        vec![vec!["Ann"]]
+    );
+    assert_eq!(
+        rows(&run(&mut s, "RETURN 2 AS AGE ORDER BY age").await),
+        vec![vec!["2"]]
+    );
+    s.execute("SESSION SET VALUE $name = 'Ann'").unwrap();
+    assert_eq!(
+        rows(&run(&mut s, "RETURN $NAME AS name").await),
+        vec![vec!["Ann"]]
+    );
+    s.execute("SESSION SET VALUE IF NOT EXISTS $NAME = 'Bea'")
+        .unwrap();
+    assert_eq!(
+        rows(&run(&mut s, "RETURN $name AS name").await),
+        vec![vec!["Ann"]]
+    );
+    s.execute("SESSION RESET $NAME").unwrap();
+    assert!(s
+        .run("RETURN $name AS name")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("parameter"));
+    assert_eq!(
+        rows(&run(&mut s, "RETURN 1 AS name UNION ALL RETURN 2 AS NAME").await),
+        vec![vec!["1"], vec!["2"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
+                "RETURN 1 AS name NEXT YIELD NAME RETURN NAME AS name"
+            )
+            .await
+        ),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&run(&mut s, "RETURN 1 AS k, COUNT(*) AS c GROUP BY K").await),
+        vec![vec!["1", "1"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
+                "INSERT (:Person {name: 'Pat'}) MATCH (n:person) RETURN n.name AS name"
+            )
+            .await
+        )
+        .len(),
+        0
+    );
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:Person) RETURN n.name AS name").await),
+        vec![vec!["Pat"]]
+    );
+    assert!(s
+        .run("SESSION SET GRAPH G")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not found"));
+}

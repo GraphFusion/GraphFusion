@@ -175,7 +175,7 @@ pub(super) fn coerce(
     }
     let mut output = Vec::new();
     for ((qualifier, field), expected) in plan.schema().iter().zip(target.fields()) {
-        if field.name() != expected.name() {
+        if !field.name().eq_ignore_ascii_case(expected.name()) {
             return Err(Error::InvalidQuery(
                 "composite result column names or order differ".into(),
             ));
@@ -194,7 +194,7 @@ pub(super) fn coerce(
         if from != to {
             expr = cast(expr, to.clone());
         }
-        output.push(expr.alias(field.name()));
+        output.push(expr.alias(expected.name()));
     }
     Ok(LogicalPlanBuilder::from(plan).project(output)?.build()?)
 }

@@ -157,7 +157,7 @@ pub(super) fn prefix(
             None => 1,
             Some(ast::UnsignedIntegerSpecification::Literal(n)) => *n,
             Some(ast::UnsignedIntegerSpecification::Parameter(name)) => {
-                match session.parameters.get(name).map(|p| &p.value) {
+                match session.parameter(name).map(|p| &p.value) {
                     Some(Value::Integer(n)) if *n > 0 => *n as u64,
                     _ => {
                         return Err(Error::InvalidQuery(format!(

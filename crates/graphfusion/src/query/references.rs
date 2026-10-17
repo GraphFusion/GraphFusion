@@ -252,7 +252,7 @@ pub(super) fn resolve(
     let names = scope
         .scalars
         .iter()
-        .filter(|(name, _)| !scope.references.contains_key(*name))
+        .filter(|(name, _)| !scope.references.contains_key(name))
         .map(|(name, column)| (name.clone(), column.clone()))
         .collect::<Vec<_>>();
     for (name, column) in names {

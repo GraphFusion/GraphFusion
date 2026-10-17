@@ -2,6 +2,7 @@
 mod aggregates;
 mod arithmetic;
 mod binding;
+mod casefold;
 mod execution;
 mod expressions;
 mod graph;
@@ -252,7 +253,7 @@ fn apply_yield(
             .schema()
             .columns()
             .into_iter()
-            .find(|column| column.name() == name.value)
+            .find(|column| column.name().eq_ignore_ascii_case(&name.value))
             .ok_or_else(|| Error::InvalidQuery(format!("unbound yield column {}", name.value)))?;
         projections.push(Expr::Column(column).alias(&output.value));
         renamed.insert(output.value.clone(), name.value.clone());
@@ -262,7 +263,12 @@ fn apply_yield(
     }
     let mut next_domains = BTreeMap::new();
     for (output, source) in &renamed {
-        if let Some(domain) = domains.get(source) {
+        if let Some(domain) = domains.get(source).or_else(|| {
+            domains
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(source))
+                .map(|(_, domain)| domain)
+        }) {
             next_domains.insert(output.clone(), domain.clone());
         }
     }
@@ -459,7 +465,7 @@ async fn plan_body(
                 .insert(name.clone(), Column::new(qualifier.cloned(), field.name()));
             scope.order.push(name);
         }
-        scope.domains = incoming.domains;
+        scope.domains = incoming.domains.into();
         references::prepare(plan, &mut scope, ctx, trace).await?
     } else {
         LogicalPlanBuilder::empty(true)
@@ -718,8 +724,7 @@ fn page_count(value: &ast::UnsignedIntegerSpecification, session: &SessionState)
         ast::UnsignedIntegerSpecification::Literal(n) => *n,
         ast::UnsignedIntegerSpecification::Parameter(name) => {
             let value = session
-                .parameters
-                .get(name)
+                .parameter(name)
                 .ok_or_else(|| Error::NotFound(format!("parameter {name}")))?;
             match value.value {
                 Value::Integer(n) if n >= 0 => n as u64,

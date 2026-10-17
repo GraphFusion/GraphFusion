@@ -12,6 +12,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Treat query variables, property names and parameters as the same name when
+  they differ only by ASCII case. `SET n.AGE` updates `age`, and `MATCH (n)
+  RETURN N.name` reads `n`. Labels and catalog names stay case-sensitive.
 
 ## 0.2.0 — 2026-10-05
 

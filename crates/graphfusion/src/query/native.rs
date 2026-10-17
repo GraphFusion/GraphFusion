@@ -7,7 +7,7 @@
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
 //! unknown stays unknown and does not keep the row.
 
-use super::{expressions::Binder, graph::Bindings};
+use super::{casefold::CaseFoldMap, expressions::Binder, graph::Bindings};
 use crate::{gql as ast, graph::Table, Error, Result, SessionState};
 use datafusion::{
     arrow::datatypes::{DataType, Schema},
@@ -96,14 +96,19 @@ pub(super) fn clause_filters(
     schema: &DFSchema,
     scope: &Bindings,
     expr: &ast::Expr,
-) -> Result<Option<BTreeMap<String, NativeAtom>>> {
+) -> Result<Option<CaseFoldMap<NativeAtom>>> {
     let Some(parts) = partition(expr) else {
         return Ok(None);
     };
-    let mut filters = BTreeMap::new();
+    let mut filters = CaseFoldMap::new();
     for (variable, local) in parts {
         let Some(atom) = bind_local(session, schema, scope, &local)? else {
             return Ok(None);
+        };
+        // `n` and `N` are one variable, so combine their conjuncts.
+        let atom = match filters.remove(&variable) {
+            Some(existing) => NativeAtom::And(Box::new(existing), Box::new(atom)),
+            None => atom,
         };
         filters.insert(variable, atom);
     }
@@ -135,7 +140,8 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
         } => {
             let mut stored = None;
             for table in tables {
-                let Some(field) = table.schema.field_with_name(property).ok() else {
+                let Some(field) = crate::graph::property_field(table.schema.as_ref(), property)
+                else {
                     continue;
                 };
                 if comparable(field.data_type(), value_type) {
@@ -174,17 +180,14 @@ fn compare_property(
     value: Expr,
     value_type: &DataType,
 ) -> Result<Expr> {
-    let Some(stored) = schema
-        .field_with_name(property)
-        .ok()
-        .map(|field| field.data_type().clone())
-    else {
+    let Some(field) = crate::graph::property_field(schema, property) else {
         return Ok(unknown());
     };
+    let stored = field.data_type().clone();
     if !comparable(&stored, value_type) {
         return Ok(unknown());
     }
-    let mut left = column(property);
+    let mut left = column(field.name());
     let mut right = value;
     if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
         left = cast(left, DataType::Float64);
@@ -333,7 +336,9 @@ fn property_of(expr: &ast::Expr, variable: &str) -> Option<String> {
     let ast::Expr::Identifier(name) = base.as_ref() else {
         return None;
     };
-    (name.value == variable).then(|| key.value.clone())
+    name.value
+        .eq_ignore_ascii_case(variable)
+        .then(|| key.value.clone())
 }
 
 fn flip(op: Operator) -> Operator {
@@ -407,7 +412,12 @@ fn bind_closed(
 fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
     if let ast::Expr::Property { base, .. } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
-            names.insert(name.value.clone());
+            if !names
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&name.value))
+            {
+                names.insert(name.value.clone());
+            }
         }
     }
     for child in children(expr) {
@@ -443,12 +453,12 @@ fn named_variable(expr: &ast::Expr, variable: &str) -> bool {
         | ast::Expr::PropertyExists { variable: name, .. }
         | ast::Expr::ElementId { variable: name }
         | ast::Expr::IsDirected { variable: name, .. }
-        | ast::Expr::IsLabeled { variable: name, .. } => name.value == variable,
-        ast::Expr::Same { variables } | ast::Expr::AllDifferent { variables } => {
-            variables.iter().any(|name| name.value == variable)
-        }
+        | ast::Expr::IsLabeled { variable: name, .. } => name.value.eq_ignore_ascii_case(variable),
+        ast::Expr::Same { variables } | ast::Expr::AllDifferent { variables } => variables
+            .iter()
+            .any(|name| name.value.eq_ignore_ascii_case(variable)),
         ast::Expr::SourceDestination { node, edge, .. } => {
-            node.value == variable || edge.value == variable
+            node.value.eq_ignore_ascii_case(variable) || edge.value.eq_ignore_ascii_case(variable)
         }
         _ => false,
     }
