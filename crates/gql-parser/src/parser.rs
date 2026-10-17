@@ -4647,10 +4647,11 @@ impl Parser {
     fn parse_insert_label_set(&mut self) -> Result<(Vec<Identifier>, Option<LabelExpression>)> {
         let mut labels = Vec::new();
         let label = self.parse_identifier()?;
-        push_identifier_if_absent(&mut labels, Some(&label));
+        // Labels stay case-sensitive. `A & a` is two labels; only an exact repeat collapses.
+        push_exact_label(&mut labels, label);
         while self.eat(TokenKind::Ampersand).is_some() {
             let label = self.parse_identifier()?;
-            push_identifier_if_absent(&mut labels, Some(&label));
+            push_exact_label(&mut labels, label);
         }
 
         let mut iter = labels.iter().cloned();
@@ -7029,6 +7030,12 @@ fn push_identifier_if_absent(variables: &mut Vec<Identifier>, candidate: Option<
         .any(|variable| variable.value.eq_ignore_ascii_case(&candidate.value))
     {
         variables.push(candidate.clone());
+    }
+}
+
+fn push_exact_label(labels: &mut Vec<Identifier>, label: Identifier) {
+    if !labels.iter().any(|existing| existing.value == label.value) {
+        labels.push(label);
     }
 }
 

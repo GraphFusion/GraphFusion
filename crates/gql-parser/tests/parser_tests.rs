@@ -1562,13 +1562,16 @@ fn parses_insert_undirected_edge_pattern() {
     assert_eq!(pattern.start.variable, Some(ident("a")));
     assert_eq!(
         pattern.start.labels,
-        vec![ident("Person"), ident("Employee")]
+        vec![ident("Person"), ident("person"), ident("Employee")]
     );
     assert_eq!(pattern.chains.len(), 1);
     let relationship = &pattern.chains[0].relationship;
     assert_eq!(relationship.direction, Direction::Undirected);
     assert_eq!(relationship.variable, Some(ident("r")));
-    assert_eq!(relationship.labels, vec![ident("KNOWS"), ident("RELATED")]);
+    assert_eq!(
+        relationship.labels,
+        vec![ident("KNOWS"), ident("knows"), ident("RELATED")]
+    );
     assert_eq!(
         relationship
             .properties
@@ -1580,6 +1583,42 @@ fn parses_insert_undirected_edge_pattern() {
     );
     assert_eq!(pattern.chains[0].node.variable, Some(ident("b")));
     assert_eq!(pattern.chains[0].node.labels, vec![ident("Person")]);
+}
+
+#[test]
+fn parses_insert_label_sets_that_differ_only_by_case() {
+    let program = parse("INSERT (A & a & A {name: 'n'})-[A & a]->()").unwrap();
+
+    let Statement::Insert(insert) = &program.statements[0] else {
+        panic!("expected insert statement");
+    };
+    let pattern = &insert.patterns[0];
+    assert_eq!(pattern.start.labels, vec![ident("A"), ident("a")]);
+    assert_eq!(
+        pattern.start.label_expression,
+        Some(LabelExpression::And(
+            Box::new(LabelExpression::Label(ident("A"))),
+            Box::new(LabelExpression::Label(ident("a"))),
+        ))
+    );
+    let relationship = &pattern.chains[0].relationship;
+    assert_eq!(relationship.labels, vec![ident("A"), ident("a")]);
+    assert_eq!(
+        relationship.label_expression,
+        Some(LabelExpression::And(
+            Box::new(LabelExpression::Label(ident("A"))),
+            Box::new(LabelExpression::Label(ident("a"))),
+        ))
+    );
+
+    let colon = parse("INSERT (:A & a {name: 'n'})").unwrap();
+    let Statement::Insert(insert) = &colon.statements[0] else {
+        panic!("expected insert statement");
+    };
+    assert_eq!(
+        insert.patterns[0].start.labels,
+        vec![ident("A"), ident("a")]
+    );
 }
 
 #[test]
