@@ -461,8 +461,7 @@ impl<'a> Binder<'a> {
                     .iter()
                     .map(|e| self.bind(e))
                     .collect::<Result<Vec<_>>>()?;
-                self.compatible(&values)?;
-                datafusion::functions_nested::expr_fn::make_array(values)
+                self.array(values)?
             }
             E::Function {
                 name,
@@ -506,6 +505,27 @@ impl<'a> Binder<'a> {
             previous = common_value_type(&previous, &expr.get_type(self.schema)?)?;
         }
         Ok(())
+    }
+
+    /// Build a list after finding one element type. An untyped null does not
+    /// coerce into a byte string inside `make_array`, so cast it to the element
+    /// type first. Other families already accept a null argument.
+    fn array(&self, values: Vec<Expr>) -> Result<Expr> {
+        let mut element = DataType::Null;
+        for expr in &values {
+            element = common_value_type(&element, &expr.get_type(self.schema)?)?;
+        }
+        let values = values
+            .into_iter()
+            .map(|expr| {
+                if element != DataType::Null && expr.get_type(self.schema)? == DataType::Null {
+                    Ok(expr.cast_to(&element, self.schema)?)
+                } else {
+                    Ok(expr)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(datafusion::functions_nested::expr_fn::make_array(values))
     }
 }
 
@@ -570,8 +590,7 @@ fn list_parameter(values: &[Value], binder: &Binder<'_>) -> Result<Expr> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    binder.compatible(&args)?;
-    Ok(datafusion::functions_nested::expr_fn::make_array(args))
+    binder.array(args)
 }
 
 fn boolean(data_type: &DataType) -> bool {
