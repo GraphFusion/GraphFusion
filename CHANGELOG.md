@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Match every orientation in `<~[]~>` and `<~/label/~>`. The closing `>` adds
+  rightward directed edges to the left-or-undirected pattern.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
