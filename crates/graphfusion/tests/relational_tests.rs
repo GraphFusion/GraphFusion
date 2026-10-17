@@ -257,6 +257,61 @@ async fn empty_groups_and_collect_have_consistent_null_behavior() {
         &[],
     )
     .await;
+    // A property no fragment stores is a per-row null, not a query constant.
+    check(
+        &mut s,
+        "MATCH (n:N) RETURN n.missing AS m, COUNT(*) AS c",
+        &[&["NULL", "3"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (n:N) WHERE n.v = -1 RETURN n.missing AS m, COUNT(*) AS c",
+        &[],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (n:Absent) RETURN n.missing AS m, COUNT(*) AS c",
+        &[],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (n:Absent) RETURN NULL AS m, COUNT(*) AS c",
+        &[&["NULL", "0"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (n:N) RETURN COALESCE(n.missing, 0) AS m, COUNT(*) AS c",
+        &[&["0", "3"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (n:Absent) RETURN COALESCE(n.missing, 0) AS m, COUNT(*) AS c",
+        &[],
+    )
+    .await;
+    check(
+        &mut s,
+        "SELECT n.missing AS m, COUNT(*) AS c FROM g MATCH (n:N) WHERE n.v = -1",
+        &[],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH ()-[e:E]->() RETURN e.missing AS m, COUNT(*) AS c",
+        &[&["NULL", "1"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (n:Absent) RETURN n.missing AS m, COUNT(*) AS c GROUP BY ()",
+        &[&["NULL", "0"]],
+    )
+    .await;
     check(
         &mut s,
         "MATCH (n:Absent) RETURN 7 AS v GROUP BY ()",
