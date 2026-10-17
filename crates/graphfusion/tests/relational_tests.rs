@@ -319,6 +319,106 @@ async fn statistical_aggregates_use_datafusion_and_percentile_is_fractional() {
 }
 
 #[tokio::test]
+async fn integer_stddev_uses_exact_moments() {
+    let mut s = Database::new().session();
+    let result = query(
+        &mut s,
+        "FOR x IN [9007199254740993, NULL, 1] RETURN STDDEV_POP(x) AS p, STDDEV_SAMP(x) AS s",
+    )
+    .await;
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        float_at(&result, 0, 0).to_bits(),
+        4503599627370496.0f64.to_bits()
+    );
+    assert_eq!(float_at(&result, 0, 1).to_bits(), 0x4336a09e667f3bcd);
+    check(
+        &mut s,
+        "FOR x IN [1, 2, 3, 4] RETURN STDDEV_POP(x) AS p, STDDEV_SAMP(x) AS s",
+        &[&["1.118033988749895", "1.2909944487358056"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [10, 20, 30] RETURN STDDEV_POP(x) AS p, STDDEV_SAMP(x) AS s",
+        &[&["8.16496580927726", "10"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [1, NULL] RETURN STDDEV_POP(x) AS p, STDDEV_SAMP(x) AS s",
+        &[&["0", "NULL"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [NULL, NULL] RETURN STDDEV_POP(x) AS p, STDDEV_SAMP(x) AS s",
+        &[&["NULL", "NULL"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [-2, 2] RETURN STDDEV_POP(x) AS p, STDDEV_SAMP(x) AS s",
+        &[&["2", "2.8284271247461903"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [1.0, 3.0] RETURN STDDEV_POP(x) AS p",
+        &[&["1"]],
+    )
+    .await;
+    let distinct = query(
+        &mut s,
+        "FOR x IN [9007199254740993, 9007199254740993, 1] RETURN STDDEV_POP(DISTINCT x) AS d, STDDEV_POP(x) AS a",
+    )
+    .await;
+    assert_eq!(
+        float_at(&distinct, 0, 0).to_bits(),
+        4503599627370496.0f64.to_bits()
+    );
+    assert_eq!(float_at(&distinct, 0, 1).to_bits(), 0x432e2b7dddfefa66);
+    let grouped = query(
+        &mut s,
+        "FOR x IN [9007199254740993, 1, 4, 4] RETURN x = 4 AS four, STDDEV_POP(x) AS p GROUP BY four ORDER BY four",
+    )
+    .await;
+    assert_eq!(scalar_at(&grouped, 0, 0), ScalarValue::Boolean(Some(false)));
+    assert_eq!(
+        float_at(&grouped, 0, 1).to_bits(),
+        4503599627370496.0f64.to_bits()
+    );
+    assert_eq!(scalar_at(&grouped, 1, 0), ScalarValue::Boolean(Some(true)));
+    assert_eq!(float_at(&grouped, 1, 1), 0.0);
+    s.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {v: 9007199254740993}), (:N {v: 1})")
+        .await
+        .unwrap();
+    let graph = query(&mut s, "MATCH (n) RETURN STDDEV_POP(n.v) AS p").await;
+    assert_eq!(
+        float_at(&graph, 0, 0).to_bits(),
+        4503599627370496.0f64.to_bits()
+    );
+}
+
+fn scalar_at(result: &QueryResult, row: usize, column: usize) -> ScalarValue {
+    let mut seen = 0;
+    for batch in &result.batches {
+        if row < seen + batch.num_rows() {
+            return ScalarValue::try_from_array(batch.column(column), row - seen).unwrap();
+        }
+        seen += batch.num_rows();
+    }
+    panic!("missing row {row}");
+}
+
+fn float_at(result: &QueryResult, row: usize, column: usize) -> f64 {
+    match scalar_at(result, row, column) {
+        ScalarValue::Float64(Some(value)) => value,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn composite_all_counts_each_null_and_duplicate_occurrence() {
     let mut s = Database::new().session();
     for (op, expected) in [
