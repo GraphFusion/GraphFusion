@@ -25,6 +25,8 @@ This returns Alice/0, Bob/1 and Cara/2. A zero-hop match applies both endpoint c
 
 An explicit upper bound must be positive. Unbounded forms require the planner to prove a finite complete search for the chosen mode/selector; unsupported cases return an error. [Search limits](/storage/limits/) are checked against the required bound, rather than silently truncating paths.
 
+A quantifier after a simplified path repeats the whole slash pattern. `-/E F/->{2}` is two E-then-F sequences, not one E and two F edges. `-/L|R/->{1,2}` may mix the labels from one repetition to the next. A quantifier written on a label stays on that edge and does not discard the outer quantifier. Repeating a slash pattern whose minimum length is zero is rejected, because the repeated primary would not make progress.
+
 The `edges` variable above is an ordered list outside the repeated segment. Within an edge predicate it denotes the current edge. Zero repetitions expose an empty list. Group declarations must be fresh.
 
 ```gql test
