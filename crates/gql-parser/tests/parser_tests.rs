@@ -831,6 +831,64 @@ fn parses_simplified_path_pattern_expressions() {
 }
 
 #[test]
+fn simplified_outer_quantifier_wraps_the_slash_pattern() {
+    let program =
+        parse("MATCH (a)-/E F/->{1,2}(b), (a)-/L|R/->{2}(c), (a)-/E{2}/->{3}(d) RETURN a").unwrap();
+    let Statement::Query(query) = &program.statements[0] else {
+        panic!("expected query statement");
+    };
+    let patterns = &first_match(query).patterns;
+
+    let PathPatternFactor::Parenthesized(sequence) = &patterns[0].factors[1] else {
+        panic!("expected a repeated E F sequence");
+    };
+    assert_eq!(
+        sequence.quantifier,
+        Some(PathPatternQuantifier::Range {
+            min: Some(1),
+            max: Some(2)
+        })
+    );
+    let labels: Vec<_> = sequence
+        .pattern
+        .factors
+        .iter()
+        .filter_map(|factor| match factor {
+            PathPatternFactor::Relationship(edge) => {
+                assert!(edge.quantifier.is_none());
+                edge.labels.first().map(|label| label.value.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels, vec!["E", "F"]);
+
+    let PathPatternFactor::Parenthesized(choice) = &patterns[1].factors[1] else {
+        panic!("expected a repeated label alternation");
+    };
+    assert_eq!(choice.quantifier, Some(PathPatternQuantifier::Fixed(2)));
+    assert!(matches!(
+        choice.pattern.factors.first(),
+        Some(PathPatternFactor::Alternation { .. })
+    ));
+
+    let PathPatternFactor::Parenthesized(nested) = &patterns[2].factors[1] else {
+        panic!("expected an outer quantifier around E{{2}}");
+    };
+    assert_eq!(nested.quantifier, Some(PathPatternQuantifier::Fixed(3)));
+    let PathPatternFactor::Relationship(edge) = nested
+        .pattern
+        .factors
+        .iter()
+        .find(|factor| matches!(factor, PathPatternFactor::Relationship(_)))
+        .expect("inner edge")
+    else {
+        unreachable!("inner edge");
+    };
+    assert_eq!(edge.quantifier, Some(PathPatternQuantifier::Fixed(2)));
+}
+
+#[test]
 fn parses_optional_match_statement_block() {
     let program = parse(
         "OPTIONAL { MATCH (a)-[:KNOWS]->(b) OPTIONAL MATCH (b)-[:LIKES]->(c) } RETURN a, b, c; \
