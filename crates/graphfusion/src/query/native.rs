@@ -5,13 +5,17 @@
 //! column, and casting both sides to strings would make `10 > 9` false.
 //! Each fragment therefore keeps its stored type. A missing property, or a
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
-//! unknown stays unknown and does not keep the row.
+//! unknown stays unknown and does not keep the row. `COALESCE` and `NULLIF`
+//! of those comparisons use the same per-fragment result, as do
+//! `NULLIF(property, value) IS NULL` and a comparison of
+//! `COALESCE(property, fallback)`.
 
 use super::{expressions::Binder, graph::Bindings};
 use crate::{gql as ast, graph::Table, Error, Result, SessionState};
 use datafusion::{
     arrow::datatypes::{DataType, Schema},
     common::{Column, DFSchema, ScalarValue},
+    functions::core::expr_fn::{coalesce, nullif},
     logical_expr::{cast, lit, Expr, ExprSchemable, Operator},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +30,27 @@ pub(super) enum NativeAtom {
         op: Operator,
         value: Expr,
         value_type: DataType,
+    },
+    /// Boolean `COALESCE` of per-fragment predicates and closed booleans.
+    Coalesce(Vec<NativeAtom>),
+    /// Boolean `NULLIF` of per-fragment predicates and closed booleans.
+    NullIf(Box<NativeAtom>, Box<NativeAtom>),
+    /// Closed boolean. Null is unknown.
+    Literal(Expr),
+    /// `NULLIF(property, value) IS [NOT] NULL` on the stored type.
+    NullIfNull {
+        property: String,
+        value: Expr,
+        value_type: DataType,
+        negated: bool,
+    },
+    /// `COALESCE(property, fallback, ...) <op> value` on the stored type.
+    ValueCoalesce {
+        property: String,
+        fallbacks: Vec<(Expr, DataType)>,
+        op: Operator,
+        right: Expr,
+        right_type: DataType,
     },
 }
 
@@ -132,24 +157,82 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             property,
             value_type,
             ..
+        } => validate_comparison(property, value_type, tables, false),
+        NativeAtom::Coalesce(args) => {
+            for arg in args {
+                validate_atom(arg, tables)?;
+            }
+            Ok(())
+        }
+        NativeAtom::NullIf(left, right) => {
+            validate_atom(left, tables)?;
+            validate_atom(right, tables)
+        }
+        NativeAtom::Literal(_) => Ok(()),
+        NativeAtom::NullIfNull {
+            property,
+            value_type,
+            ..
+        } => validate_comparison(property, value_type, tables, true),
+        NativeAtom::ValueCoalesce {
+            property,
+            fallbacks,
+            right_type,
+            ..
         } => {
-            let mut stored = None;
+            let mut conflict = None;
             for table in tables {
-                let Some(field) = table.schema.field_with_name(property).ok() else {
-                    continue;
-                };
-                if comparable(field.data_type(), value_type) {
+                let stored = table
+                    .schema
+                    .field_with_name(property)
+                    .ok()
+                    .map(|field| field.data_type().clone());
+                if unify_coalesce(stored.as_ref(), fallbacks, right_type).is_some() {
                     return Ok(());
                 }
-                stored.get_or_insert_with(|| field.data_type().clone());
+                if conflict.is_none() {
+                    conflict = type_conflict(stored.as_ref(), fallbacks, right_type);
+                }
             }
-            match stored {
-                Some(stored) => Err(Error::InvalidQuery(format!(
-                    "incomparable types {stored} and {value_type}"
+            match conflict {
+                Some((left, right)) => Err(Error::InvalidQuery(format!(
+                    "incomparable types {left} and {right}"
                 ))),
                 None => Ok(()),
             }
         }
+    }
+}
+
+/// A fragment that does not store `property` can still evaluate `NULLIF` of
+/// that null. A comparison cannot: a missing property is unknown, and the
+/// caller reports a type error only when some stored type is incomparable.
+fn validate_comparison(
+    property: &str,
+    value_type: &DataType,
+    tables: &[&Table],
+    absent_is_value: bool,
+) -> Result<()> {
+    let mut stored = None;
+    let mut absent = false;
+    for table in tables {
+        let Some(field) = table.schema.field_with_name(property).ok() else {
+            absent = true;
+            continue;
+        };
+        if comparable(field.data_type(), value_type) {
+            return Ok(());
+        }
+        stored.get_or_insert_with(|| field.data_type().clone());
+    }
+    if absent && absent_is_value {
+        return Ok(());
+    }
+    match stored {
+        Some(stored) => Err(Error::InvalidQuery(format!(
+            "incomparable types {stored} and {value_type}"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -164,6 +247,32 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
             value,
             value_type,
         } => compare_property(schema, property, *op, value.clone(), value_type)?,
+        NativeAtom::Coalesce(args) => {
+            let exprs = args
+                .iter()
+                .map(|arg| compile(arg, schema))
+                .collect::<Result<Vec<_>>>()?;
+            if exprs.is_empty() {
+                unknown()
+            } else {
+                coalesce(exprs)
+            }
+        }
+        NativeAtom::NullIf(left, right) => nullif(compile(left, schema)?, compile(right, schema)?),
+        NativeAtom::Literal(expr) => expr.clone(),
+        NativeAtom::NullIfNull {
+            property,
+            value,
+            value_type,
+            negated,
+        } => nullif_is_null(schema, property, value.clone(), value_type, *negated)?,
+        NativeAtom::ValueCoalesce {
+            property,
+            fallbacks,
+            op,
+            right,
+            right_type,
+        } => value_coalesce(schema, property, fallbacks, *op, right.clone(), right_type)?,
     })
 }
 
@@ -190,7 +299,77 @@ fn compare_property(
         left = cast(left, DataType::Float64);
         right = cast(right, DataType::Float64);
     }
-    Ok(match op {
+    Ok(apply_compare(left, right, op))
+}
+
+fn nullif_is_null(
+    schema: &Schema,
+    property: &str,
+    value: Expr,
+    value_type: &DataType,
+    negated: bool,
+) -> Result<Expr> {
+    let Some(stored) = schema
+        .field_with_name(property)
+        .ok()
+        .map(|field| field.data_type().clone())
+    else {
+        // The property is absent, so it is null. NULLIF of null is null.
+        return Ok(lit(!negated));
+    };
+    if !comparable(&stored, value_type) {
+        return Ok(unknown());
+    }
+    let mut left = column(property);
+    let mut right = value;
+    if *value_type == DataType::Null {
+        right = cast(right, stored);
+    } else if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
+        left = cast(left, DataType::Float64);
+        right = cast(right, DataType::Float64);
+    }
+    let compared = nullif(left, right);
+    Ok(if negated {
+        compared.is_not_null()
+    } else {
+        compared.is_null()
+    })
+}
+
+fn value_coalesce(
+    schema: &Schema,
+    property: &str,
+    fallbacks: &[(Expr, DataType)],
+    op: Operator,
+    right: Expr,
+    right_type: &DataType,
+) -> Result<Expr> {
+    let stored = schema
+        .field_with_name(property)
+        .ok()
+        .map(|field| field.data_type().clone());
+    let Some(unified) = unify_coalesce(stored.as_ref(), fallbacks, right_type) else {
+        return Ok(unknown());
+    };
+    let mut args = Vec::new();
+    if let Some(stored) = &stored {
+        args.push(cast_to(column(property), stored, &unified));
+    }
+    for (expr, data_type) in fallbacks {
+        args.push(cast_to(expr.clone(), data_type, &unified));
+    }
+    if args.is_empty() {
+        return Ok(unknown());
+    }
+    Ok(apply_compare(
+        coalesce(args),
+        cast_to(right, right_type, &unified),
+        op,
+    ))
+}
+
+fn apply_compare(left: Expr, right: Expr, op: Operator) -> Expr {
+    match op {
         Operator::Eq => left.eq(right),
         Operator::NotEq => left.not_eq(right),
         Operator::Lt => left.lt(right),
@@ -198,7 +377,69 @@ fn compare_property(
         Operator::Gt => left.gt(right),
         Operator::GtEq => left.gt_eq(right),
         _ => unknown(),
-    })
+    }
+}
+
+fn cast_to(expr: Expr, from: &DataType, to: &DataType) -> Expr {
+    if from == to {
+        expr
+    } else {
+        cast(expr, to.clone())
+    }
+}
+
+fn unify_coalesce(
+    stored: Option<&DataType>,
+    fallbacks: &[(Expr, DataType)],
+    right: &DataType,
+) -> Option<DataType> {
+    let mut types = Vec::new();
+    if let Some(stored) = stored {
+        types.push(stored.clone());
+    }
+    types.extend(fallbacks.iter().map(|(_, data_type)| data_type.clone()));
+    types.push(right.clone());
+    let concrete: Vec<&DataType> = types
+        .iter()
+        .filter(|data_type| **data_type != DataType::Null)
+        .collect();
+    if concrete.is_empty() {
+        return Some(DataType::Null);
+    }
+    if concrete.iter().all(|data_type| *data_type == concrete[0]) {
+        return Some(concrete[0].clone());
+    }
+    if concrete.iter().all(|data_type| data_type.is_numeric()) {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
+}
+
+fn type_conflict(
+    stored: Option<&DataType>,
+    fallbacks: &[(Expr, DataType)],
+    right: &DataType,
+) -> Option<(DataType, DataType)> {
+    let mut concrete = Vec::new();
+    if let Some(stored) = stored {
+        if *stored != DataType::Null {
+            concrete.push(stored.clone());
+        }
+    }
+    for (_, data_type) in fallbacks {
+        if *data_type != DataType::Null {
+            concrete.push(data_type.clone());
+        }
+    }
+    if *right != DataType::Null {
+        concrete.push(right.clone());
+    }
+    let first = concrete.first()?.clone();
+    concrete
+        .into_iter()
+        .find(|data_type| data_type != &first && !(first.is_numeric() && data_type.is_numeric()))
+        .map(|data_type| (first, data_type))
 }
 
 fn comparable(stored: &DataType, value: &DataType) -> bool {
@@ -229,6 +470,20 @@ enum Local {
     Not(Box<Local>),
     Atom {
         property: String,
+        op: Operator,
+        value: ast::Expr,
+    },
+    Coalesce(Vec<Local>),
+    NullIf(Box<Local>, Box<Local>),
+    Literal(ast::Expr),
+    NullIfNull {
+        property: String,
+        value: ast::Expr,
+        negated: bool,
+    },
+    ValueCoalesce {
+        property: String,
+        fallbacks: Vec<ast::Expr>,
         op: Operator,
         value: ast::Expr,
     },
@@ -290,19 +545,88 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
-        other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
-            property,
-            op,
-            value,
+        ast::Expr::Coalesce(args) => {
+            if args.is_empty() {
+                return None;
+            }
+            Some(Local::Coalesce(
+                args.iter()
+                    .map(|arg| predicate_or_literal(arg, variable))
+                    .collect::<Option<Vec<_>>>()?,
+            ))
+        }
+        ast::Expr::NullIf { left, right } => Some(Local::NullIf(
+            Box::new(predicate_or_literal(left, variable)?),
+            Box::new(predicate_or_literal(right, variable)?),
+        )),
+        ast::Expr::IsNull { expr, negated } => {
+            let ast::Expr::NullIf { left, right } = expr.as_ref() else {
+                return None;
+            };
+            let property = property_of(left, variable)?;
+            if mentions(right, variable) {
+                return None;
+            }
+            Some(Local::NullIfNull {
+                property,
+                value: right.as_ref().clone(),
+                negated: *negated,
+            })
+        }
+        other => value_coalesce_comparison(other, variable).or_else(|| {
+            comparison(other, variable).map(|(property, op, value)| Local::Atom {
+                property,
+                op,
+                value,
+            })
         }),
     }
 }
 
-fn comparison(expr: &ast::Expr, variable: &str) -> Option<(String, Operator, ast::Expr)> {
+/// A per-fragment predicate, or a closed literal standing in for one.
+fn predicate_or_literal(expr: &ast::Expr, variable: &str) -> Option<Local> {
+    if let Some(local) = local_tree(expr, variable) {
+        return Some(local);
+    }
+    if mentions(expr, variable) {
+        return None;
+    }
+    Some(Local::Literal(expr.clone()))
+}
+
+fn value_coalesce_comparison(expr: &ast::Expr, variable: &str) -> Option<Local> {
     let ast::Expr::Binary { left, op, right } = expr else {
         return None;
     };
-    let op = match op {
+    let op = comparison_op(op)?;
+    coalesce_comparison(left, op, right, variable)
+        .or_else(|| coalesce_comparison(right, flip(op), left, variable))
+}
+
+fn coalesce_comparison(
+    coalesced: &ast::Expr,
+    op: Operator,
+    value: &ast::Expr,
+    variable: &str,
+) -> Option<Local> {
+    let ast::Expr::Coalesce(args) = coalesced else {
+        return None;
+    };
+    let (first, fallbacks) = args.split_first()?;
+    let property = property_of(first, variable)?;
+    if mentions(value, variable) || fallbacks.iter().any(|arg| mentions(arg, variable)) {
+        return None;
+    }
+    Some(Local::ValueCoalesce {
+        property,
+        fallbacks: fallbacks.to_vec(),
+        op,
+        value: value.clone(),
+    })
+}
+
+fn comparison_op(op: &ast::BinaryOp) -> Option<Operator> {
+    Some(match op {
         ast::BinaryOp::Eq => Operator::Eq,
         ast::BinaryOp::Neq => Operator::NotEq,
         ast::BinaryOp::Lt => Operator::Lt,
@@ -310,7 +634,14 @@ fn comparison(expr: &ast::Expr, variable: &str) -> Option<(String, Operator, ast
         ast::BinaryOp::Gt => Operator::Gt,
         ast::BinaryOp::Ge => Operator::GtEq,
         _ => return None,
+    })
+}
+
+fn comparison(expr: &ast::Expr, variable: &str) -> Option<(String, Operator, ast::Expr)> {
+    let ast::Expr::Binary { left, op, right } = expr else {
+        return None;
     };
+    let op = comparison_op(op)?;
     if let Some(property) = property_of(left, variable) {
         if mentions(right, variable) {
             return None;
@@ -382,6 +713,71 @@ fn bind_local(
                 value_type,
             }
         }),
+        Local::Coalesce(args) => {
+            let mut bound = Vec::with_capacity(args.len());
+            for arg in args {
+                let Some(atom) = bind_local(session, schema, scope, arg)? else {
+                    return Ok(None);
+                };
+                bound.push(atom);
+            }
+            Some(NativeAtom::Coalesce(bound))
+        }
+        Local::NullIf(left, right) => match (
+            bind_local(session, schema, scope, left)?,
+            bind_local(session, schema, scope, right)?,
+        ) {
+            (Some(left), Some(right)) => Some(NativeAtom::NullIf(Box::new(left), Box::new(right))),
+            _ => None,
+        },
+        Local::Literal(value) => {
+            let Some((expr, value_type)) = bind_closed(session, schema, scope, value)? else {
+                return Ok(None);
+            };
+            if value_type == DataType::Null {
+                Some(NativeAtom::Literal(unknown()))
+            } else if value_type == DataType::Boolean {
+                Some(NativeAtom::Literal(expr))
+            } else {
+                return Ok(None);
+            }
+        }
+        Local::NullIfNull {
+            property,
+            value,
+            negated,
+        } => bind_closed(session, schema, scope, value)?.map(|(expr, value_type)| {
+            NativeAtom::NullIfNull {
+                property: property.clone(),
+                value: expr,
+                value_type,
+                negated: *negated,
+            }
+        }),
+        Local::ValueCoalesce {
+            property,
+            fallbacks,
+            op,
+            value,
+        } => {
+            let mut bound = Vec::with_capacity(fallbacks.len());
+            for fallback in fallbacks {
+                let Some((expr, data_type)) = bind_closed(session, schema, scope, fallback)? else {
+                    return Ok(None);
+                };
+                bound.push((expr, data_type));
+            }
+            let Some((right, right_type)) = bind_closed(session, schema, scope, value)? else {
+                return Ok(None);
+            };
+            Some(NativeAtom::ValueCoalesce {
+                property: property.clone(),
+                fallbacks: bound,
+                op: *op,
+                right,
+                right_type,
+            })
+        }
     })
 }
 
