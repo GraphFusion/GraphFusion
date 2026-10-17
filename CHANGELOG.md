@@ -12,6 +12,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Keep every distinct spelling in a bare `INSERT` label set. `(A & a)` stores
+  both labels, the same as `(:A & a)`. An exact repeat still collapses.
 
 ## 0.2.0 — 2026-10-05
 
