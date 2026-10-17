@@ -12,6 +12,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Compute `STDDEV_POP(DISTINCT)` and `STDDEV_SAMP(DISTINCT)` from each distinct
+  number. Repeated inputs do not change the deviation; one distinct value has
+  population deviation 0 and a null sample deviation.
 
 ## 0.2.0 — 2026-10-05
 
