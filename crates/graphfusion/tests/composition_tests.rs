@@ -1,5 +1,5 @@
 use datafusion::arrow::datatypes::DataType;
-use graphfusion::{Database, Value};
+use graphfusion::{Database, Error, Value};
 use std::collections::BTreeMap;
 
 fn strings(result: &graphfusion::QueryResult) -> Vec<Vec<String>> {
@@ -329,4 +329,111 @@ async fn mixed_label_filters_compare_stored_types() {
         strings(&both),
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
+}
+
+#[tokio::test]
+async fn where_element_id_tests_keep_stored_types() {
+    let mut session = social().await;
+    let ada = session
+        .query("MATCH (n:Person {name: 'Ada'}) RETURN ELEMENT_ID(n) AS id")
+        .await
+        .unwrap();
+    let ada_id = strings(&ada)[0][0].clone();
+
+    let present = session
+        .query(
+            "MATCH (n:Person|Document) WHERE ELEMENT_ID(n) IS NOT NULL AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&present), vec![vec!["Ada".to_string()]]);
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE NOT ELEMENT_ID(n) IS NULL AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let everyone = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR ELEMENT_ID(n) = ELEMENT_ID(n)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&everyone),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let only_ada = session
+        .query(
+            "MATCH (n:Person|Document) WHERE ELEMENT_ID(n) <> ELEMENT_ID(n) OR n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&only_ada), vec![vec!["Ada".to_string()]]);
+
+    let by_id = session
+        .query(&format!(
+            "MATCH (n:Person|Document) WHERE n.id = 9 OR ELEMENT_ID(n) = '{ada_id}'
+             RETURN n.name AS name"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(strings(&by_id), vec![vec!["Ada".to_string()]]);
+
+    let missing = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR ELEMENT_ID(n) = 'missing'
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&missing), vec![vec!["Ada".to_string()]]);
+
+    let inline = session
+        .query(&format!(
+            "MATCH (n:Person|Document WHERE ELEMENT_ID(n) = '{ada_id}' OR n.id = 2)
+             RETURN n.name AS name ORDER BY name"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&inline),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let error = session
+        .query(
+            "MATCH (d:Document) WHERE d.id = 1 OR ELEMENT_ID(d) IS NOT NULL
+             RETURN d.title AS title",
+        )
+        .await
+        .unwrap_err();
+    match error {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
+
+    let typed = session
+        .query(
+            "MATCH (n:Person|Document) WHERE ELEMENT_ID(n) = 1 AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap_err();
+    match typed {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
 }
