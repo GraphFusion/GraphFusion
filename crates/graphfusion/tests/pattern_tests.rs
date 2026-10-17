@@ -328,3 +328,42 @@ async fn unbounded_homogeneous_selection_uses_complete_finite_bounds() {
     let q = q.replace("->*(b", "->{0,8}(b");
     assert_eq!(rows(&query(&mut s, &q).await), vec![vec!["8"]]);
 }
+
+#[tokio::test]
+async fn plain_repeated_group_expands_from_the_frontier() {
+    let mut s = graph().await;
+    let q =
+        "MATCH (a {name:'A'})((x)-[:E]->(m)-[:E]->(y)){1,2}(b) RETURN b.name AS name ORDER BY name";
+    let result = query(&mut s, q).await;
+    assert_eq!(
+        rows(&result),
+        vec![vec!["B"], vec!["C"], vec!["D"], vec!["D"]]
+    );
+    let plan = &result.logical_plan;
+    let recursive = plan.find("RecursiveQuery").expect(plan);
+    let body = &plan[recursive..];
+    assert!(
+        body.contains("__gf_from"),
+        "plain group must read edges inside the recursive term:\n{plan}"
+    );
+    assert!(
+        !body.contains("__gf_step_row"),
+        "plain group must not join a precomputed step:\n{plan}"
+    );
+    let outer = "MATCH (a {name:'A'})((x)-[:E]->(y) WHERE y.name <> a.name){1,3}(b) RETURN b.name AS name ORDER BY name";
+    assert_eq!(
+        rows(&query(&mut s, outer).await),
+        vec![vec!["B"], vec!["C"], vec!["D"], vec!["D"]]
+    );
+    let nested = query(
+        &mut s,
+        "MATCH p = (a {name:'A'})((x)-[:E]->{1,2}(y)){1,2}(b) RETURN MAX(PATH_LENGTH(p)) AS longest",
+    )
+    .await;
+    assert_eq!(rows(&nested), vec![vec!["4"]]);
+    assert!(
+        nested.logical_plan.contains("__gf_step_row"),
+        "a quantified body still freezes its step:\n{}",
+        nested.logical_plan
+    );
+}

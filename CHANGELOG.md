@@ -9,6 +9,10 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- Expand a repeated group of plain nodes and edges from the current endpoint
+  inside the recursive term, instead of first materializing every one-step
+  match in the graph. A quantifier, alternative, or optional subpath inside
+  the group still precomputes that one-step relation.
 
 ## 0.2.0 — 2026-10-05
 
