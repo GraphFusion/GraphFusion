@@ -601,10 +601,74 @@ async fn patch(
     if ids.is_empty() {
         return Ok(None);
     }
+    // A null result removes the property. Keeping an all-null typed column
+    // would make the property look absent while still blocking a later type.
+    let (schema, batches) = without_null_assignments(edit, schema, batches)?;
     Ok(Some((
         memory(schema, batches)?.alias("__gf_patch")?.build()?,
         ids,
     )))
+}
+
+/// Drop patch columns that are null on every row and record those properties
+/// as removals. A literal NULL never creates a column; this covers expressions
+/// such as `1 + NULL` whose result type is not `Null`.
+fn without_null_assignments(
+    edit: &mut Edit,
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+    let mut null_columns = BTreeSet::new();
+    for column in edit.values.values().flatten() {
+        let mut all_null = true;
+        for batch in &batches {
+            let index = batch
+                .schema()
+                .index_of(column)
+                .map_err(|_| Error::Corrupt(format!("missing patch column {column}")))?;
+            let values = batch.column(index);
+            all_null &= values.null_count() == values.len();
+        }
+        if all_null {
+            null_columns.insert(column.clone());
+        }
+    }
+    if null_columns.is_empty() {
+        return Ok((schema, batches));
+    }
+    for column in edit.values.values_mut() {
+        if column
+            .as_ref()
+            .is_some_and(|name| null_columns.contains(name))
+        {
+            *column = None;
+        }
+    }
+    let keep: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| !null_columns.contains(field.name()))
+        .map(|(index, _)| index)
+        .collect();
+    let projected = Arc::new(Schema::new(
+        keep.iter()
+            .map(|index| schema.field(*index).clone())
+            .collect::<Vec<_>>(),
+    ));
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            RecordBatch::try_new(
+                projected.clone(),
+                keep.iter()
+                    .map(|index| batch.column(*index).clone())
+                    .collect(),
+            )
+            .map_err(|err| Error::Corrupt(format!("invalid null assignment patch: {err}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((projected, batches))
 }
 
 async fn edit_graph(

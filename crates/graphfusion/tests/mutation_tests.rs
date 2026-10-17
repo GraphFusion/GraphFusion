@@ -192,6 +192,60 @@ async fn writes_refresh_aliases_and_observe_previous_clauses() {
 }
 
 #[tokio::test]
+async fn null_expression_removes_property_instead_of_pinning_its_type() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (:A {k: 1, v: 1})").await;
+    let result = run(
+        &mut s,
+        "MATCH (n) SET n.v = 1 + NULL RETURN PROPERTY_EXISTS(n, v) AS exists, n.v IS NULL AS missing",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["false", "true"]]);
+    let result = run(&mut s, "MATCH (n) SET n.v = 'hi' RETURN n.v AS v").await;
+    assert_eq!(rows(&result), vec![vec!["hi"]]);
+
+    run(&mut s, "MATCH (n) REMOVE n.v").await;
+    run(&mut s, "MATCH (n) SET n.w = 1.5 * NULL").await;
+    let result = run(&mut s, "MATCH (n) RETURN PROPERTY_EXISTS(n, w) AS exists").await;
+    assert_eq!(rows(&result), vec![vec!["false"]]);
+    let result = run(&mut s, "MATCH (n) SET n.w = TRUE RETURN n.w AS w").await;
+    assert_eq!(rows(&result), vec![vec!["true"]]);
+
+    run(&mut s, "MATCH (n) SET n.flag = NULL AND TRUE").await;
+    let result = run(
+        &mut s,
+        "MATCH (n) SET n.flag = 7 RETURN n.flag AS flag, PROPERTY_EXISTS(n, w) AS kept",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["7", "true"]]);
+
+    run(&mut s, "INSERT (:B {k: 2, v: 2})").await;
+    run(&mut s, "MATCH (n:B) SET n = {k: n.k, v: n.v + NULL}").await;
+    let result = run(
+        &mut s,
+        "MATCH (n:B) RETURN n.k AS k, PROPERTY_EXISTS(n, v) AS exists",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["2", "false"]]);
+    let result = run(&mut s, "MATCH (n:B) SET n.v = 'x' RETURN n.v AS v").await;
+    assert_eq!(rows(&result), vec![vec!["x"]]);
+
+    // A non-null value in the same assignment still stores that type.
+    run(&mut s, "INSERT (:C {k: 3, src: 5}), (:C {k: 4})").await;
+    run(&mut s, "MATCH (n:C) SET n.v = n.src").await;
+    let result = run(
+        &mut s,
+        "MATCH (n:C) RETURN n.k AS k, n.v AS v, PROPERTY_EXISTS(n, v) AS exists ORDER BY k",
+    )
+    .await;
+    assert_eq!(
+        rows(&result),
+        vec![vec!["3", "5", "true"], vec!["4", "NULL", "false"]]
+    );
+}
+
+#[tokio::test]
 async fn delete_restrict_detach_and_explicit_edges_enforce_endpoints() {
     let db = Database::new();
     let mut s = session(&db);
