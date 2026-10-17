@@ -37,6 +37,9 @@ pub(super) struct NativePush {
     /// The pattern `WHERE` was applied on each fragment, so the unified
     /// predicate must not bind it again.
     pub pushed_where: bool,
+    /// Boolean columns evaluated on this element's stored type. A match
+    /// `WHERE` that combines several elements reads these after the join.
+    pub flags: Vec<(String, NativeAtom)>,
 }
 
 impl NativePush {
@@ -90,7 +93,8 @@ impl NativePush {
 ///
 /// `AND` can be split across variables. `OR` and `NOT` stay together, so they
 /// are pushed only when every comparison names the same variable. A value that
-/// reads another column stays on the unified plan.
+/// reads another column stays on the unified plan. A boolean combination of
+/// several elements is lowered by [`clause_residue`] instead of this split.
 pub(super) fn clause_filters(
     session: &SessionState,
     schema: &DFSchema,
@@ -108,6 +112,204 @@ pub(super) fn clause_filters(
         filters.insert(variable, atom);
     }
     Ok((!filters.is_empty()).then_some(filters))
+}
+
+/// A match `WHERE` whose comparisons belong to different elements.
+///
+/// Pushing `n.id = 1 OR m.id = 'x'` into either scan would drop a row that
+/// fails that side even when the other side is true. Each comparison is
+/// therefore a boolean column on its own fragment, and the boolean operators
+/// run after the elements are joined.
+pub(super) struct ClauseResidue {
+    pub columns: BTreeMap<String, Vec<(String, NativeAtom)>>,
+    pub predicate: ClausePred,
+}
+
+pub(super) enum ClausePred {
+    And(Box<ClausePred>, Box<ClausePred>),
+    Or(Box<ClausePred>, Box<ClausePred>),
+    Xor(Box<ClausePred>, Box<ClausePred>),
+    Not(Box<ClausePred>),
+    /// `__gf_pred_N` projected by the named element's scan.
+    Column {
+        variable: String,
+        name: String,
+    },
+    /// A closed boolean value, such as `1 = 1`, with no element property.
+    Bool(Expr),
+}
+
+pub(super) fn clause_residue(
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    expr: &ast::Expr,
+) -> Result<Option<ClauseResidue>> {
+    let mut builder = ResidueBuilder {
+        session,
+        schema,
+        scope,
+        columns: BTreeMap::new(),
+        next: 0,
+    };
+    let Some(predicate) = builder.walk(expr)? else {
+        return Ok(None);
+    };
+    // A single element stays on its fragment filter. Combining stored-type
+    // booleans is only needed when the predicate names two or more elements.
+    if builder.columns.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(ClauseResidue {
+        columns: builder.columns,
+        predicate,
+    }))
+}
+
+pub(super) fn compile_residue(pred: &ClausePred, scope: &Bindings) -> Result<Expr> {
+    Ok(match pred {
+        ClausePred::And(left, right) => {
+            compile_residue(left, scope)?.and(compile_residue(right, scope)?)
+        }
+        ClausePred::Or(left, right) => {
+            compile_residue(left, scope)?.or(compile_residue(right, scope)?)
+        }
+        ClausePred::Xor(left, right) => {
+            compile_residue(left, scope)?.not_eq(compile_residue(right, scope)?)
+        }
+        ClausePred::Not(inner) => Expr::Not(Box::new(compile_residue(inner, scope)?)),
+        ClausePred::Bool(expr) => expr.clone(),
+        ClausePred::Column { variable, name } => {
+            let Some(binding) = scope.elements.get(variable) else {
+                return Err(Error::InvalidQuery(format!("unbound variable {variable}")));
+            };
+            binding.column(name)
+        }
+    })
+}
+
+struct ResidueBuilder<'a> {
+    session: &'a SessionState,
+    schema: &'a DFSchema,
+    scope: &'a Bindings,
+    columns: BTreeMap<String, Vec<(String, NativeAtom)>>,
+    next: usize,
+}
+
+impl ResidueBuilder<'_> {
+    fn walk(&mut self, expr: &ast::Expr) -> Result<Option<ClausePred>> {
+        match expr {
+            ast::Expr::Binary {
+                left,
+                op: ast::BinaryOp::And,
+                right,
+            } => self.combine(left, right, ClauseOp::And),
+            ast::Expr::Binary {
+                left,
+                op: ast::BinaryOp::Or,
+                right,
+            } => self.combine(left, right, ClauseOp::Or),
+            ast::Expr::Binary {
+                left,
+                op: ast::BinaryOp::Xor,
+                right,
+            } => self.combine(left, right, ClauseOp::Xor),
+            ast::Expr::Unary {
+                op: ast::UnaryOp::Not,
+                expr,
+            } => {
+                let Some(inner) = self.walk(expr)? else {
+                    return Ok(None);
+                };
+                Ok(Some(ClausePred::Not(Box::new(inner))))
+            }
+            other => self.leaf(other),
+        }
+    }
+
+    fn combine(
+        &mut self,
+        left: &ast::Expr,
+        right: &ast::Expr,
+        op: ClauseOp,
+    ) -> Result<Option<ClausePred>> {
+        let (Some(left), Some(right)) = (self.walk(left)?, self.walk(right)?) else {
+            return Ok(None);
+        };
+        let left = Box::new(left);
+        let right = Box::new(right);
+        Ok(Some(match op {
+            ClauseOp::And => ClausePred::And(left, right),
+            ClauseOp::Or => ClausePred::Or(left, right),
+            ClauseOp::Xor => ClausePred::Xor(left, right),
+        }))
+    }
+
+    fn leaf(&mut self, expr: &ast::Expr) -> Result<Option<ClausePred>> {
+        let mut names = BTreeSet::new();
+        property_bases(expr, &mut names);
+        if names.len() > 1 {
+            return Ok(None);
+        }
+        if let Some(variable) = names.into_iter().next() {
+            let Some(local) = local_tree(expr, &variable) else {
+                return Ok(None);
+            };
+            let Some(atom) = bind_local(self.session, self.schema, self.scope, &local)? else {
+                return Ok(None);
+            };
+            let name = format!("__gf_pred_{}", self.next);
+            self.next += 1;
+            self.columns
+                .entry(variable.clone())
+                .or_default()
+                .push((name.clone(), atom));
+            return Ok(Some(ClausePred::Column { variable, name }));
+        }
+        if !grounded(expr) {
+            return Ok(None);
+        }
+        let Some((bound, value_type)) = bind_closed(self.session, self.schema, self.scope, expr)?
+        else {
+            return Ok(None);
+        };
+        if !matches!(value_type, DataType::Boolean | DataType::Null) {
+            return Ok(None);
+        }
+        Ok(Some(ClausePred::Bool(bound)))
+    }
+}
+
+enum ClauseOp {
+    And,
+    Or,
+    Xor,
+}
+
+/// A boolean expression that does not read an element: `TRUE`, `1 = 1`.
+fn grounded(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(_) | ast::Expr::Parameter(_) => true,
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => grounded(expr),
+        ast::Expr::Binary {
+            left,
+            op:
+                ast::BinaryOp::Or
+                | ast::BinaryOp::Xor
+                | ast::BinaryOp::And
+                | ast::BinaryOp::Eq
+                | ast::BinaryOp::Neq
+                | ast::BinaryOp::Lt
+                | ast::BinaryOp::Le
+                | ast::BinaryOp::Gt
+                | ast::BinaryOp::Ge,
+            right,
+        } => grounded(left) && grounded(right),
+        _ => false,
+    }
 }
 
 /// A comparison that no selected fragment can evaluate is a type error, matching

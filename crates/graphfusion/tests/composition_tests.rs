@@ -2,6 +2,10 @@ use datafusion::arrow::datatypes::DataType;
 use graphfusion::{Database, Value};
 use std::collections::BTreeMap;
 
+async fn names(session: &mut graphfusion::Session, query: &str) -> Vec<Vec<String>> {
+    strings(&session.query(query).await.unwrap())
+}
+
 fn strings(result: &graphfusion::QueryResult) -> Vec<Vec<String>> {
     result
         .batches
@@ -328,5 +332,232 @@ async fn mixed_label_filters_compare_stored_types() {
     assert_eq!(
         strings(&both),
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn cross_element_or_compares_stored_types() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:A {name: 'A', id: 1}),
+                    (:B {name: 'B', id: 'x'}),
+                    (:C {name: 'C', id: 2}),
+                    (:D {name: 'D', id: '1'})",
+        )
+        .await
+        .unwrap();
+    let either = "MATCH (n), (m) WHERE n.id = 1 OR m.id = 'x'
+         RETURN n.name AS n, m.name AS m ORDER BY n, m";
+    let pairs = vec![
+        vec!["A".to_string(), "A".to_string()],
+        vec!["A".to_string(), "B".to_string()],
+        vec!["A".to_string(), "C".to_string()],
+        vec!["A".to_string(), "D".to_string()],
+        vec!["B".to_string(), "B".to_string()],
+        vec!["C".to_string(), "B".to_string()],
+        vec!["D".to_string(), "B".to_string()],
+    ];
+    assert_eq!(names(&mut session, either).await, pairs);
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE 1 = n.id OR 'x' = m.id
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        pairs
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE n.id = 1 OR m.id = 'x' OR FALSE
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        pairs
+    );
+    session.execute("SESSION SET VALUE $k INTEGER = 1").unwrap();
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE n.id = $k OR m.id = 'x'
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        pairs
+    );
+
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE n.id = 1 XOR m.id = 'x'
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        vec![
+            vec!["A".to_string(), "D".to_string()],
+            vec!["C".to_string(), "B".to_string()],
+        ]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE NOT n.id = 1 OR m.id = 'x'
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["B".to_string(), "B".to_string()],
+            vec!["C".to_string(), "A".to_string()],
+            vec!["C".to_string(), "B".to_string()],
+            vec!["C".to_string(), "C".to_string()],
+            vec!["C".to_string(), "D".to_string()],
+            vec!["D".to_string(), "B".to_string()],
+        ]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n:A|C), (m:A|C) WHERE NOT (n.id = 1 OR m.id = 2)
+             RETURN n.name AS n, m.name AS m"
+        )
+        .await,
+        vec![vec!["C".to_string(), "A".to_string()]]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE (n.id = 1 AND m.id = 2) OR m.id = 'x'
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["A".to_string(), "C".to_string()],
+            vec!["B".to_string(), "B".to_string()],
+            vec!["C".to_string(), "B".to_string()],
+            vec!["D".to_string(), "B".to_string()],
+        ]
+    );
+    // Integer 1 does not match the string '1', and 2 is not greater than 9.
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE n.id = 1 OR m.id = 'missing'
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        vec![
+            vec!["A".to_string(), "A".to_string()],
+            vec!["A".to_string(), "B".to_string()],
+            vec!["A".to_string(), "C".to_string()],
+            vec!["A".to_string(), "D".to_string()],
+        ]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE n.id > 9 OR m.id = 'x'
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["B".to_string(), "B".to_string()],
+            vec!["C".to_string(), "B".to_string()],
+            vec!["D".to_string(), "B".to_string()],
+        ]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n), (m) WHERE n.id = 1 AND m.id = 'x'
+             RETURN n.name AS n, m.name AS m"
+        )
+        .await,
+        vec![vec!["A".to_string(), "B".to_string()]]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE n.id = 1 OR n.id = 'x' RETURN n.name AS n ORDER BY n"
+        )
+        .await,
+        vec![vec!["A".to_string()], vec!["B".to_string()]]
+    );
+
+    let incompatible = session
+        .query("MATCH (n:B), (m:B) WHERE n.id = 1 OR m.id = 1 RETURN n.name AS n")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(ref message)) if message.contains("incomparable")),
+        "{incompatible:?}"
+    );
+
+    session
+        .run("MATCH (a:A), (b:B), (c:C) INSERT (a)-[:E]->(b), (c)-[:E]->(:Y {name: 'Y', id: 'y'})")
+        .await
+        .unwrap();
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n)-[:E]->(m) WHERE n.id = 1 OR m.id = 'y'
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["C".to_string(), "Y".to_string()],
+        ]
+    );
+
+    let mut numeric = Database::new().session();
+    numeric
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    numeric
+        .run(
+            "INSERT (:P {name: 'ten', v: 10}),
+                    (:Q {name: 'text', v: '10'}),
+                    (:R {name: 'nine', v: 9})",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        names(
+            &mut numeric,
+            "MATCH (n), (m) WHERE n.v > 9 OR m.v = '10'
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        vec![
+            vec!["nine".to_string(), "text".to_string()],
+            vec!["ten".to_string(), "nine".to_string()],
+            vec!["ten".to_string(), "ten".to_string()],
+            vec!["ten".to_string(), "text".to_string()],
+            vec!["text".to_string(), "text".to_string()],
+        ]
+    );
+    numeric
+        .run("INSERT (:F {name: 'two', v: 2}), (:G {name: 'half', v: 2.5})")
+        .await
+        .unwrap();
+    assert_eq!(
+        names(
+            &mut numeric,
+            "MATCH (n:F|G), (m:F|G) WHERE n.v > 2 OR m.v = 2
+             RETURN n.name AS n, m.name AS m ORDER BY n, m"
+        )
+        .await,
+        vec![
+            vec!["half".to_string(), "half".to_string()],
+            vec!["half".to_string(), "two".to_string()],
+            vec!["two".to_string(), "two".to_string()],
+        ]
     );
 }
