@@ -12,6 +12,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Classify that per-fragment result with `IS [NOT] TRUE`, `IS [NOT] FALSE` and
+  `IS [NOT] UNKNOWN`. An integer is unknown against the same digits stored as
+  text, so `IS TRUE` does not keep it and `IS UNKNOWN` does.
 
 ## 0.2.0 — 2026-10-05
 

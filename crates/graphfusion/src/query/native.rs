@@ -5,7 +5,8 @@
 //! column, and casting both sides to strings would make `10 > 9` false.
 //! Each fragment therefore keeps its stored type. A missing property, or a
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
-//! unknown stays unknown and does not keep the row.
+//! unknown stays unknown and does not keep the row. `IS [NOT] TRUE`,
+//! `IS [NOT] FALSE` and `IS [NOT] UNKNOWN` classify that same unknown result.
 
 use super::{expressions::Binder, graph::Bindings};
 use crate::{gql as ast, graph::Table, Error, Result, SessionState};
@@ -21,6 +22,18 @@ pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// `IS [NOT] TRUE` / `IS [NOT] FALSE`. Unknown is its own category: it is
+    /// not true and not false, unlike `NOT`, which leaves unknown unknown.
+    Truth {
+        inner: Box<NativeAtom>,
+        negated: bool,
+        value: bool,
+    },
+    /// `IS [NOT] UNKNOWN`.
+    Unknown {
+        inner: Box<NativeAtom>,
+        negated: bool,
+    },
     Compare {
         property: String,
         op: Operator,
@@ -127,7 +140,9 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(left, tables)?;
             validate_atom(right, tables)
         }
-        NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Not(inner)
+        | NativeAtom::Truth { inner, .. }
+        | NativeAtom::Unknown { inner, .. } => validate_atom(inner, tables),
         NativeAtom::Compare {
             property,
             value_type,
@@ -158,6 +173,31 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
         NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
         NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::Truth {
+            inner,
+            negated,
+            value,
+        } => {
+            let expr = compile(inner, schema)?;
+            let truth = if *value {
+                expr.is_true()
+            } else {
+                expr.is_false()
+            };
+            if *negated {
+                Expr::Not(Box::new(truth))
+            } else {
+                truth
+            }
+        }
+        NativeAtom::Unknown { inner, negated } => {
+            let expr = compile(inner, schema)?;
+            if *negated {
+                expr.is_not_null()
+            } else {
+                expr.is_null()
+            }
+        }
         NativeAtom::Compare {
             property,
             op,
@@ -227,6 +267,15 @@ enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Truth {
+        inner: Box<Local>,
+        negated: bool,
+        value: bool,
+    },
+    Unknown {
+        inner: Box<Local>,
+        negated: bool,
+    },
     Atom {
         property: String,
         op: Operator,
@@ -290,6 +339,19 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
+        ast::Expr::IsTruth {
+            expr,
+            negated,
+            value,
+        } => Some(Local::Truth {
+            inner: Box::new(local_tree(expr, variable)?),
+            negated: *negated,
+            value: *value,
+        }),
+        ast::Expr::IsUnknown { expr, negated } => Some(Local::Unknown {
+            inner: Box::new(local_tree(expr, variable)?),
+            negated: *negated,
+        }),
         other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
             property,
             op,
@@ -369,6 +431,21 @@ fn bind_local(
         },
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
+        }
+        Local::Truth {
+            inner,
+            negated,
+            value,
+        } => bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Truth {
+            inner: Box::new(inner),
+            negated: *negated,
+            value: *value,
+        }),
+        Local::Unknown { inner, negated } => {
+            bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Unknown {
+                inner: Box::new(inner),
+                negated: *negated,
+            })
         }
         Local::Atom {
             property,
