@@ -7,12 +7,20 @@
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
 //! unknown stays unknown and does not keep the row.
 
-use super::{expressions::Binder, graph::Bindings};
-use crate::{gql as ast, graph::Table, Error, Result, SessionState};
+use super::{
+    expressions::Binder,
+    graph::{Bindings, ElementBinding, ElementKind},
+};
+use crate::{
+    gql as ast,
+    graph::{GraphData, Table, ID},
+    Error, Result, SessionState,
+};
 use datafusion::{
-    arrow::datatypes::{DataType, Schema},
-    common::{Column, DFSchema, ScalarValue},
-    logical_expr::{cast, lit, Expr, ExprSchemable, Operator},
+    arrow::datatypes::{DataType, Schema, SchemaRef},
+    common::{Column, DFSchema, ScalarValue, TableReference},
+    datasource::provider_as_source,
+    logical_expr::{cast, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -181,12 +189,21 @@ fn compare_property(
     else {
         return Ok(unknown());
     };
-    if !comparable(&stored, value_type) {
+    compare_values(column(property), &stored, op, value, value_type)
+}
+
+fn compare_values(
+    mut left: Expr,
+    stored: &DataType,
+    op: Operator,
+    value: Expr,
+    value_type: &DataType,
+) -> Result<Expr> {
+    if !comparable(stored, value_type) {
         return Ok(unknown());
     }
-    let mut left = column(property);
     let mut right = value;
-    if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
+    if stored != value_type && stored.is_numeric() && value_type.is_numeric() {
         left = cast(left, DataType::Float64);
         right = cast(right, DataType::Float64);
     }
@@ -548,5 +565,320 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
         | E::IsDirected { .. }
         | E::IsLabeled { .. }
         | E::Identifier(_) => vec![],
+    }
+}
+
+/// Apply a `FILTER` clause. Mixed element properties are compared on each
+/// source fragment; every other predicate stays on the working table.
+pub(super) fn filter_clause(
+    mut plan: LogicalPlanBuilder,
+    session: &SessionState,
+    scope: &Bindings,
+    predicate: &ast::Expr,
+) -> Result<LogicalPlanBuilder> {
+    let mut elements = BTreeSet::new();
+    if !mentions_mixed(predicate, scope, &mut elements) {
+        let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
+        return Ok(plan.filter(expr)?);
+    }
+    let mut fragments = BTreeMap::new();
+    for name in &elements {
+        let (next, stored) = attach_fragments(plan, scope, name)?;
+        plan = next;
+        fragments.insert(name.clone(), stored);
+    }
+    let expr = lower_filter(predicate, session, plan.schema(), scope, &fragments)?;
+    expect_boolean(&expr, plan.schema())?;
+    Ok(plan.filter(expr)?)
+}
+
+struct StoredFragment {
+    scan: String,
+    schema: SchemaRef,
+}
+
+impl StoredFragment {
+    fn id(&self) -> Expr {
+        Expr::Column(Column::new(
+            Some(TableReference::bare(self.scan.as_str())),
+            ID,
+        ))
+    }
+    fn property(&self, name: &str) -> Expr {
+        Expr::Column(Column::new(
+            Some(TableReference::bare(self.scan.as_str())),
+            name,
+        ))
+    }
+}
+
+fn mentions_mixed(expr: &ast::Expr, scope: &Bindings, elements: &mut BTreeSet<String>) -> bool {
+    match expr {
+        ast::Expr::Binary {
+            left,
+            op: ast::BinaryOp::And | ast::BinaryOp::Or | ast::BinaryOp::Xor,
+            right,
+        } => {
+            let left = mentions_mixed(left, scope, elements);
+            let right = mentions_mixed(right, scope, elements);
+            left || right
+        }
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => mentions_mixed(expr, scope, elements),
+        other => mixed_comparison(other, scope).is_some_and(|(name, _)| {
+            elements.insert(name);
+            true
+        }),
+    }
+}
+
+fn mixed_comparison(expr: &ast::Expr, scope: &Bindings) -> Option<(String, String)> {
+    let (name, property, _, value) = split_comparison(expr)?;
+    if !scope.elements.contains_key(&name) || contains_property(&value) {
+        return None;
+    }
+    (stored_types(scope, &name, &property).len() > 1).then_some((name, property))
+}
+
+fn split_comparison(expr: &ast::Expr) -> Option<(String, String, Operator, ast::Expr)> {
+    let ast::Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    let op = match op {
+        ast::BinaryOp::Eq => Operator::Eq,
+        ast::BinaryOp::Neq => Operator::NotEq,
+        ast::BinaryOp::Lt => Operator::Lt,
+        ast::BinaryOp::Le => Operator::LtEq,
+        ast::BinaryOp::Gt => Operator::Gt,
+        ast::BinaryOp::Ge => Operator::GtEq,
+        _ => return None,
+    };
+    if let Some((name, property)) = element_property(left) {
+        if mentions(right, &name) {
+            return None;
+        }
+        return Some((name, property, op, right.as_ref().clone()));
+    }
+    if let Some((name, property)) = element_property(right) {
+        if mentions(left, &name) {
+            return None;
+        }
+        return Some((name, property, flip(op), left.as_ref().clone()));
+    }
+    None
+}
+
+fn element_property(expr: &ast::Expr) -> Option<(String, String)> {
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    Some((name.value.clone(), key.value.clone()))
+}
+
+fn contains_property(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Property { .. }) || children(expr).into_iter().any(contains_property)
+}
+
+fn stored_types(scope: &Bindings, name: &str, property: &str) -> Vec<DataType> {
+    let mut types = Vec::new();
+    for table in source_tables(scope, name) {
+        let Some(data_type) = table
+            .schema
+            .field_with_name(property)
+            .ok()
+            .map(|field| field.data_type().clone())
+        else {
+            continue;
+        };
+        if !types.contains(&data_type) {
+            types.push(data_type);
+        }
+    }
+    types
+}
+
+fn source_tables<'a>(scope: &'a Bindings, name: &str) -> Vec<&'a Table> {
+    let Some(binding) = scope.elements.get(name) else {
+        return Vec::new();
+    };
+    let Some(data) = scope.sources.get(&binding.graph) else {
+        return Vec::new();
+    };
+    tables_of(binding, data)
+}
+
+fn tables_of<'a>(binding: &ElementBinding, data: &'a GraphData) -> Vec<&'a Table> {
+    let selected = |table: &Table| {
+        binding
+            .source_labels
+            .iter()
+            .any(|labels| labels == &table.labels)
+    };
+    match binding.kind {
+        ElementKind::Node => data
+            .nodes
+            .iter()
+            .map(|table| &table.0)
+            .filter(|table| selected(table))
+            .collect(),
+        ElementKind::Edge => data
+            .edges
+            .iter()
+            .map(|table| &table.table)
+            .filter(|table| selected(table))
+            .collect(),
+    }
+}
+
+fn attach_fragments(
+    mut plan: LogicalPlanBuilder,
+    scope: &Bindings,
+    name: &str,
+) -> Result<(LogicalPlanBuilder, Vec<StoredFragment>)> {
+    let Some(binding) = scope.elements.get(name) else {
+        return Ok((plan, Vec::new()));
+    };
+    let mut stored = Vec::new();
+    for (index, table) in source_tables(scope, name).into_iter().enumerate() {
+        let scan_name = format!("__gf_filter_{}_{index}", binding.alias);
+        let scan =
+            LogicalPlanBuilder::scan(&scan_name, provider_as_source(table.provider.clone()), None)?
+                .build()?;
+        plan = plan.join_on(
+            scan,
+            JoinType::Left,
+            [binding.column(ID).eq(Expr::Column(Column::new(
+                Some(TableReference::bare(scan_name.as_str())),
+                ID,
+            )))],
+        )?;
+        stored.push(StoredFragment {
+            scan: scan_name,
+            schema: table.schema.clone(),
+        });
+    }
+    Ok((plan, stored))
+}
+
+fn lower_filter(
+    expr: &ast::Expr,
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    fragments: &BTreeMap<String, Vec<StoredFragment>>,
+) -> Result<Expr> {
+    match expr {
+        ast::Expr::Binary {
+            left,
+            op: op @ (ast::BinaryOp::And | ast::BinaryOp::Or | ast::BinaryOp::Xor),
+            right,
+        } => {
+            let left = lower_filter(left, session, schema, scope, fragments)?;
+            let right = lower_filter(right, session, schema, scope, fragments)?;
+            expect_boolean(&left, schema)?;
+            expect_boolean(&right, schema)?;
+            Ok(match op {
+                ast::BinaryOp::And => left.and(right),
+                ast::BinaryOp::Or => left.or(right),
+                _ => left.not_eq(right),
+            })
+        }
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => {
+            let inner = lower_filter(expr, session, schema, scope, fragments)?;
+            expect_boolean(&inner, schema)?;
+            Ok(Expr::Not(Box::new(inner)))
+        }
+        other => {
+            if let Some(comparison) = stored_comparison(other, session, schema, scope, fragments)? {
+                Ok(comparison)
+            } else {
+                Binder::with_bindings(session, schema, scope).bind(other)
+            }
+        }
+    }
+}
+
+fn stored_comparison(
+    expr: &ast::Expr,
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    fragments: &BTreeMap<String, Vec<StoredFragment>>,
+) -> Result<Option<Expr>> {
+    let Some((name, property, op, value)) = split_comparison(expr) else {
+        return Ok(None);
+    };
+    let Some(fragments) = fragments.get(&name) else {
+        return Ok(None);
+    };
+    if contains_property(&value) {
+        return Ok(None);
+    }
+    let value = Binder::with_bindings(session, schema, scope).bind(&value)?;
+    let value_type = value.get_type(schema)?;
+    validate_fragments(fragments, &property, &value_type)?;
+    if fragments.is_empty() {
+        return Ok(Some(unknown()));
+    }
+    let mut arms = Vec::new();
+    for fragment in fragments {
+        let comparison = match fragment.schema.field_with_name(&property).ok() {
+            Some(field) => compare_values(
+                fragment.property(&property),
+                field.data_type(),
+                op,
+                value.clone(),
+                &value_type,
+            )?,
+            None => unknown(),
+        };
+        arms.push((Box::new(fragment.id().is_not_null()), Box::new(comparison)));
+    }
+    Ok(Some(Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        arms,
+        Some(Box::new(unknown())),
+    ))))
+}
+
+fn validate_fragments(
+    fragments: &[StoredFragment],
+    property: &str,
+    value_type: &DataType,
+) -> Result<()> {
+    let mut stored = None;
+    for fragment in fragments {
+        let Some(field) = fragment.schema.field_with_name(property).ok() else {
+            continue;
+        };
+        if comparable(field.data_type(), value_type) {
+            return Ok(());
+        }
+        stored.get_or_insert_with(|| field.data_type().clone());
+    }
+    match stored {
+        Some(stored) => Err(Error::InvalidQuery(format!(
+            "incomparable types {stored} and {value_type}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn expect_boolean(expr: &Expr, schema: &DFSchema) -> Result<()> {
+    let data_type = expr.get_type(schema)?;
+    if matches!(data_type, DataType::Boolean | DataType::Null) {
+        Ok(())
+    } else {
+        Err(Error::InvalidQuery(format!(
+            "expected boolean predicate, got {data_type}"
+        )))
     }
 }
