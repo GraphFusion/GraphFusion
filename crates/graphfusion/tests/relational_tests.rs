@@ -204,6 +204,67 @@ async fn nested_lists_unify_empty_null_and_numeric_elements() {
 }
 
 #[tokio::test]
+async fn integer_avg_divides_the_exact_sum() {
+    let mut session = Database::new().session();
+    let averaged = query(
+        &mut session,
+        "FOR x IN [9007199254740993, 1] RETURN AVG(x) AS a",
+    )
+    .await;
+    assert_eq!(
+        ScalarValue::try_from_array(averaged.batches[0].column(0), 0).unwrap(),
+        ScalarValue::Float64(Some(4503599627370497.0))
+    );
+    check(
+        &mut session,
+        "FOR x IN [1, 2, NULL] RETURN AVG(x) AS a",
+        &[&["1.5"]],
+    )
+    .await;
+    check(
+        &mut session,
+        "FOR x IN [1, 1, 2] RETURN AVG(DISTINCT x) AS a",
+        &[&["1.5"]],
+    )
+    .await;
+    check(
+        &mut session,
+        "FOR x IN [NULL, NULL] RETURN AVG(x) AS a",
+        &[&["NULL"]],
+    )
+    .await;
+    let thirds = query(&mut session, "FOR x IN [1, 1, 2] RETURN AVG(x) AS a").await;
+    assert_eq!(
+        ScalarValue::try_from_array(thirds.batches[0].column(0), 0).unwrap(),
+        ScalarValue::Float64(Some(4.0 / 3.0))
+    );
+    check(
+        &mut session,
+        "FOR x IN [9007199254740993, 1, 10, 20]
+         RETURN x < 100 AS small, AVG(x) AS average
+         GROUP BY small ORDER BY small",
+        &[
+            &["false", "9007199254740992"],
+            &["true", "10.333333333333334"],
+        ],
+    )
+    .await;
+
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run("INSERT (:N {v: 9007199254740993}), (:N {v: 1})")
+        .await
+        .unwrap();
+    let stored = query(&mut session, "MATCH (n) RETURN AVG(n.v) AS a").await;
+    assert_eq!(
+        ScalarValue::try_from_array(stored.batches[0].column(0), 0).unwrap(),
+        ScalarValue::Float64(Some(4503599627370497.0))
+    );
+}
+
+#[tokio::test]
 async fn aggregate_grouping_aliases_having_and_order() {
     let mut s = fixture().await;
     check(&mut s, "MATCH (n:N) RETURN n.k AS k, COUNT(*) AS c, SUM(n.v) AS sum, AVG(n.v) AS avg, MIN(n.v) AS min, MAX(n.v) AS max ORDER BY k",
