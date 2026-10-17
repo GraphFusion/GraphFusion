@@ -2,6 +2,11 @@
 
 ## 0.3.0 — Unreleased
 
+- Evaluate arithmetic and string concatenation in `SET` and `INSERT` property
+  values on each fragment's stored type. `SET n.extra = n.id + 0` no longer fails
+  when another label stores `id` as text, and `SET n.copied = n.id || '!'` no
+  longer stores the decimal text of an integer. A fragment that cannot apply the
+  operator yields null.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
