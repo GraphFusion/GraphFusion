@@ -12,7 +12,7 @@ use crate::{gql as ast, graph::Table, Error, Result, SessionState};
 use datafusion::{
     arrow::datatypes::{DataType, Schema},
     common::{Column, DFSchema, ScalarValue},
-    logical_expr::{cast, lit, Expr, ExprSchemable, Operator},
+    logical_expr::{cast, expr::BinaryExpr, lit, Expr, ExprSchemable, Operator},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +21,9 @@ pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    Xor(Box<NativeAtom>, Box<NativeAtom>),
+    /// A closed boolean value, such as `1 = 1`, already bound for every fragment.
+    Bool(Expr),
     Compare {
         property: String,
         op: Operator,
@@ -89,8 +92,9 @@ impl NativePush {
 /// Split a match-level `WHERE` into per-variable fragment predicates.
 ///
 /// `AND` can be split across variables. `OR` and `NOT` stay together, so they
-/// are pushed only when every comparison names the same variable. A value that
-/// reads another column stays on the unified plan.
+/// are pushed only when every comparison names the same variable. A closed
+/// comparison that names no variable stays in that variable's tree. A value
+/// that reads another column stays on the unified plan.
 pub(super) fn clause_filters(
     session: &SessionState,
     schema: &DFSchema,
@@ -123,11 +127,14 @@ pub(super) fn validate<'a>(
 
 fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     match atom {
-        NativeAtom::And(left, right) | NativeAtom::Or(left, right) => {
+        NativeAtom::And(left, right)
+        | NativeAtom::Or(left, right)
+        | NativeAtom::Xor(left, right) => {
             validate_atom(left, tables)?;
             validate_atom(right, tables)
         }
         NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Bool(_) => Ok(()),
         NativeAtom::Compare {
             property,
             value_type,
@@ -158,6 +165,12 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
         NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
         NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::Xor(left, right) => Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(compile(left, schema)?),
+            Operator::NotEq,
+            Box::new(compile(right, schema)?),
+        )),
+        NativeAtom::Bool(expr) => expr.clone(),
         NativeAtom::Compare {
             property,
             op,
@@ -227,6 +240,8 @@ enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Xor(Box<Local>, Box<Local>),
+    Constant(ast::Expr),
     Atom {
         property: String,
         op: Operator,
@@ -241,21 +256,47 @@ fn partition(expr: &ast::Expr) -> Option<BTreeMap<String, Local>> {
         right,
     } = expr
     {
-        let mut combined = partition(left)?;
-        for (name, local) in partition(right)? {
-            if let Some(existing) = combined.remove(&name) {
-                combined.insert(name, Local::And(Box::new(existing), Box::new(local)));
-            } else {
-                combined.insert(name, local);
+        match (partition(left), partition(right)) {
+            (Some(mut combined), Some(right_parts)) => {
+                for (name, local) in right_parts {
+                    if let Some(existing) = combined.remove(&name) {
+                        combined.insert(name, Local::And(Box::new(existing), Box::new(local)));
+                    } else {
+                        combined.insert(name, local);
+                    }
+                }
+                return Some(combined);
             }
+            (Some(parts), None) if closed_predicate(right) => {
+                return Some(and_constant(parts, right));
+            }
+            (None, Some(parts)) if closed_predicate(left) => {
+                return Some(and_constant(parts, left));
+            }
+            _ => {}
         }
-        return Some(combined);
     }
     let variable = sole_variable(expr)?;
     Some(BTreeMap::from([(
         variable.clone(),
         local_tree(expr, &variable)?,
     )]))
+}
+
+/// Conjoin a closed comparison with one variable's predicate. `AND` with a
+/// constant is independent of which side evaluates it.
+fn and_constant(
+    mut parts: BTreeMap<String, Local>,
+    constant: &ast::Expr,
+) -> BTreeMap<String, Local> {
+    let Some((name, local)) = parts.pop_first() else {
+        return parts;
+    };
+    parts.insert(
+        name,
+        Local::And(Box::new(local), Box::new(Local::Constant(constant.clone()))),
+    );
+    parts
 }
 
 fn sole_variable(expr: &ast::Expr) -> Option<String> {
@@ -290,11 +331,64 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
-        other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
-            property,
-            op,
-            value,
-        }),
+        ast::Expr::Binary {
+            left,
+            op: ast::BinaryOp::Xor,
+            right,
+        } => {
+            // Two property comparisons stay on the unified plan.
+            if mentions(left, variable) && mentions(right, variable) {
+                None
+            } else {
+                Some(Local::Xor(
+                    Box::new(local_tree(left, variable)?),
+                    Box::new(local_tree(right, variable)?),
+                ))
+            }
+        }
+        other => {
+            if let Some((property, op, value)) = comparison(other, variable) {
+                return Some(Local::Atom {
+                    property,
+                    op,
+                    value,
+                });
+            }
+            constant_predicate(other, variable).then(|| Local::Constant(other.clone()))
+        }
+    }
+}
+
+/// A boolean expression that does not read `variable`. Bare truth values and
+/// parameters stay on the unified plan.
+fn constant_predicate(expr: &ast::Expr, variable: &str) -> bool {
+    !mentions(expr, variable) && !bare_truth(expr)
+}
+
+/// A predicate with no property reference. It can be attached to any variable
+/// when an `AND` splits across several variables.
+fn closed_predicate(expr: &ast::Expr) -> bool {
+    if bare_truth(expr) || contains_opaque(expr) {
+        return false;
+    }
+    let mut names = BTreeSet::new();
+    property_bases(expr, &mut names);
+    names.is_empty()
+}
+
+fn contains_opaque(expr: &ast::Expr) -> bool {
+    opaque(expr) || children(expr).into_iter().any(contains_opaque)
+}
+
+fn bare_truth(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Boolean(_) | ast::Literal::Unknown)
+        | ast::Expr::Parameter(_) => true,
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => bare_truth(expr),
+        _ => false,
     }
 }
 
@@ -369,6 +463,22 @@ fn bind_local(
         },
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
+        }
+        Local::Xor(left, right) => match (
+            bind_local(session, schema, scope, left)?,
+            bind_local(session, schema, scope, right)?,
+        ) {
+            (Some(left), Some(right)) => Some(NativeAtom::Xor(Box::new(left), Box::new(right))),
+            _ => None,
+        },
+        Local::Constant(expr) => {
+            let Some((bound, value_type)) = bind_closed(session, schema, scope, expr)? else {
+                return Ok(None);
+            };
+            if !matches!(value_type, DataType::Boolean | DataType::Null) {
+                return Ok(None);
+            }
+            Some(NativeAtom::Bool(bound))
         }
         Local::Atom {
             property,
