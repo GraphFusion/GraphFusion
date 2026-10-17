@@ -21,6 +21,20 @@ pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// `ELEMENT_ID(variable) IS NULL` / `IS NOT NULL`.
+    ElementNull {
+        negated: bool,
+    },
+    /// `ELEMENT_ID(variable)` compared with itself.
+    ElementSelf {
+        op: Operator,
+    },
+    /// `ELEMENT_ID(variable)` compared with a closed value.
+    ElementCompare {
+        op: Operator,
+        value: Expr,
+        value_type: DataType,
+    },
     Compare {
         property: String,
         op: Operator,
@@ -89,8 +103,9 @@ impl NativePush {
 /// Split a match-level `WHERE` into per-variable fragment predicates.
 ///
 /// `AND` can be split across variables. `OR` and `NOT` stay together, so they
-/// are pushed only when every comparison names the same variable. A value that
-/// reads another column stays on the unified plan.
+/// are pushed only when every comparison or `ELEMENT_ID` test names the same
+/// variable. That identity test stays with the stored-type comparison. A value
+/// that reads another column stays on the unified plan.
 pub(super) fn clause_filters(
     session: &SessionState,
     schema: &DFSchema,
@@ -128,6 +143,16 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(right, tables)
         }
         NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::ElementNull { .. } | NativeAtom::ElementSelf { .. } => Ok(()),
+        NativeAtom::ElementCompare { value_type, .. } => {
+            if *value_type == DataType::Utf8 || *value_type == DataType::Null {
+                Ok(())
+            } else {
+                Err(Error::InvalidQuery(format!(
+                    "incomparable types Utf8 and {value_type}"
+                )))
+            }
+        }
         NativeAtom::Compare {
             property,
             value_type,
@@ -153,11 +178,34 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     }
 }
 
-pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
+pub(super) fn compile(
+    atom: &NativeAtom,
+    schema: &Schema,
+    graph: crate::catalog::ObjectId,
+    kind: super::graph::ElementKind,
+) -> Result<Expr> {
     Ok(match atom {
-        NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
-        NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
-        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::And(left, right) => {
+            compile(left, schema, graph, kind)?.and(compile(right, schema, graph, kind)?)
+        }
+        NativeAtom::Or(left, right) => {
+            compile(left, schema, graph, kind)?.or(compile(right, schema, graph, kind)?)
+        }
+        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema, graph, kind)?)),
+        NativeAtom::ElementNull { negated } => {
+            let id = column(crate::graph::ID);
+            if *negated {
+                id.is_not_null()
+            } else {
+                id.is_null()
+            }
+        }
+        NativeAtom::ElementSelf { op } => self_compare(column(crate::graph::ID), *op),
+        NativeAtom::ElementCompare {
+            op,
+            value,
+            value_type,
+        } => compare_values(element_id_expr(graph, kind), *op, value.clone(), value_type)?,
         NativeAtom::Compare {
             property,
             op,
@@ -212,6 +260,55 @@ fn unknown() -> Expr {
     lit(ScalarValue::Boolean(None))
 }
 
+fn element_id_expr(graph: crate::catalog::ObjectId, kind: super::graph::ElementKind) -> Expr {
+    let kind = if kind == super::graph::ElementKind::Node {
+        "n"
+    } else {
+        "e"
+    };
+    let value = datafusion::functions::string::expr_fn::concat(vec![
+        lit(format!("g{graph}:{kind}:")),
+        cast(column(crate::graph::ID), DataType::Utf8),
+    ]);
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(column(crate::graph::ID).is_null()),
+            Box::new(lit(ScalarValue::Utf8(None))),
+        )],
+        Some(Box::new(value)),
+    ))
+}
+
+/// `x = x` is unknown when `x` is null. Ordering against itself is false for a
+/// strict inequality and true for an inclusive one.
+fn self_compare(value: Expr, op: Operator) -> Expr {
+    match op {
+        Operator::Eq | Operator::LtEq | Operator::GtEq => value.clone().eq(value),
+        Operator::NotEq | Operator::Lt | Operator::Gt => {
+            Expr::Not(Box::new(value.clone().eq(value.clone())))
+        }
+        _ => unknown(),
+    }
+}
+
+fn compare_values(left: Expr, op: Operator, right: Expr, value_type: &DataType) -> Result<Expr> {
+    if *value_type != DataType::Utf8 && *value_type != DataType::Null {
+        return Err(Error::InvalidQuery(format!(
+            "incomparable types Utf8 and {value_type}"
+        )));
+    }
+    Ok(match op {
+        Operator::Eq => left.eq(right),
+        Operator::NotEq => left.not_eq(right),
+        Operator::Lt => left.lt(right),
+        Operator::LtEq => left.lt_eq(right),
+        Operator::Gt => left.gt(right),
+        Operator::GtEq => left.gt_eq(right),
+        _ => unknown(),
+    })
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -227,6 +324,16 @@ enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    ElementNull {
+        negated: bool,
+    },
+    ElementSelf {
+        op: Operator,
+    },
+    ElementCompare {
+        op: Operator,
+        value: ast::Expr,
+    },
     Atom {
         property: String,
         op: Operator,
@@ -290,11 +397,58 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
-        other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
-            property,
-            op,
-            value,
+        ast::Expr::IsNull { expr, negated } => match expr.as_ref() {
+            ast::Expr::ElementId { variable: name } if name.value == variable => {
+                Some(Local::ElementNull { negated: *negated })
+            }
+            _ => None,
+        },
+        other => element_id_comparison(other, variable).or_else(|| {
+            comparison(other, variable).map(|(property, op, value)| Local::Atom {
+                property,
+                op,
+                value,
+            })
         }),
+    }
+}
+
+fn element_id_comparison(expr: &ast::Expr, variable: &str) -> Option<Local> {
+    let ast::Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    let op = match op {
+        ast::BinaryOp::Eq => Operator::Eq,
+        ast::BinaryOp::Neq => Operator::NotEq,
+        ast::BinaryOp::Lt => Operator::Lt,
+        ast::BinaryOp::Le => Operator::LtEq,
+        ast::BinaryOp::Gt => Operator::Gt,
+        ast::BinaryOp::Ge => Operator::GtEq,
+        _ => return None,
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (ast::Expr::ElementId { variable: left }, ast::Expr::ElementId { variable: right })
+            if left.value == variable && right.value == variable =>
+        {
+            Some(Local::ElementSelf { op })
+        }
+        (ast::Expr::ElementId { variable: name }, other)
+            if name.value == variable && !mentions(other, variable) =>
+        {
+            Some(Local::ElementCompare {
+                op,
+                value: other.clone(),
+            })
+        }
+        (other, ast::Expr::ElementId { variable: name })
+            if name.value == variable && !mentions(other, variable) =>
+        {
+            Some(Local::ElementCompare {
+                op: flip(op),
+                value: other.clone(),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -370,6 +524,17 @@ fn bind_local(
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
         }
+        Local::ElementNull { negated } => Some(NativeAtom::ElementNull { negated: *negated }),
+        Local::ElementSelf { op } => Some(NativeAtom::ElementSelf { op: *op }),
+        Local::ElementCompare { op, value } => {
+            bind_closed(session, schema, scope, value)?.map(|(expr, value_type)| {
+                NativeAtom::ElementCompare {
+                    op: *op,
+                    value: expr,
+                    value_type,
+                }
+            })
+        }
         Local::Atom {
             property,
             op,
@@ -409,6 +574,9 @@ fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
         if let ast::Expr::Identifier(name) = base.as_ref() {
             names.insert(name.value.clone());
         }
+    }
+    if let ast::Expr::ElementId { variable } = expr {
+        names.insert(variable.value.clone());
     }
     for child in children(expr) {
         property_bases(child, names);
