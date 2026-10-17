@@ -7,6 +7,8 @@ sidebar:
 
 `WHERE` attaches a predicate to MATCH or SELECT. `FILTER` filters the current working table; `FILTER WHERE` is an accepted spelling. Only true passes: false and unknown/null do not.
 
+A `MATCH` `WHERE` that compares an element property with a bound value uses each source fragment's stored type. A string binding does not match an integer that was cast to text, and a fragment that cannot compare the value is unknown.
+
 ```gql test
 MATCH (p:Person) WHERE p.age >= 30
 FILTER p.name <> 'Bob'
