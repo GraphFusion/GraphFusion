@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
+    Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
     Compare {
         property: String,
@@ -123,7 +124,9 @@ pub(super) fn validate<'a>(
 
 fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     match atom {
-        NativeAtom::And(left, right) | NativeAtom::Or(left, right) => {
+        NativeAtom::And(left, right)
+        | NativeAtom::Or(left, right)
+        | NativeAtom::Xor(left, right) => {
             validate_atom(left, tables)?;
             validate_atom(right, tables)
         }
@@ -157,6 +160,8 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
     Ok(match atom {
         NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
         NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
+        // Boolean inequality is three-valued XOR: unknown on either side stays unknown.
+        NativeAtom::Xor(left, right) => compile(left, schema)?.not_eq(compile(right, schema)?),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
         NativeAtom::Compare {
             property,
@@ -226,6 +231,7 @@ fn conjoin(atoms: Vec<NativeAtom>) -> Option<NativeAtom> {
 enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
+    Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
     Atom {
         property: String,
@@ -283,6 +289,14 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::BinaryOp::Or,
             right,
         } => Some(Local::Or(
+            Box::new(local_tree(left, variable)?),
+            Box::new(local_tree(right, variable)?),
+        )),
+        ast::Expr::Binary {
+            left,
+            op: ast::BinaryOp::Xor,
+            right,
+        } => Some(Local::Xor(
             Box::new(local_tree(left, variable)?),
             Box::new(local_tree(right, variable)?),
         )),
@@ -365,6 +379,13 @@ fn bind_local(
             bind_local(session, schema, scope, right)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::Or(Box::new(left), Box::new(right))),
+            _ => None,
+        },
+        Local::Xor(left, right) => match (
+            bind_local(session, schema, scope, left)?,
+            bind_local(session, schema, scope, right)?,
+        ) {
+            (Some(left), Some(right)) => Some(NativeAtom::Xor(Box::new(left), Box::new(right))),
             _ => None,
         },
         Local::Not(inner) => {
