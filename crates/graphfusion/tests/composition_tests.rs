@@ -330,3 +330,104 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn aggregate_operators_use_stored_types() {
+    let mut session = social().await;
+    let summed = session
+        .query("MATCH (n:Person|Document) RETURN SUM(n.id + 0) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&summed), vec![vec!["3".to_string()]]);
+
+    let counted = session
+        .query("MATCH (n:Person|Document) RETURN COUNT(n.id + 0) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&counted), vec![vec!["2".to_string()]]);
+
+    let averaged = session
+        .query("MATCH (n:Person|Document) RETURN AVG(n.id * 1) AS total")
+        .await
+        .unwrap();
+    assert_eq!(averaged.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&averaged), vec![vec!["1.5".to_string()]]);
+
+    let minimum = session
+        .query("MATCH (n:Person|Document) RETURN MIN(-n.id) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&minimum), vec![vec!["-2".to_string()]]);
+
+    let text = session
+        .query("MATCH (n:Person|Document) RETURN COUNT(n.id || '!') AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&text), vec![vec!["1".to_string()]]);
+
+    let summed_text = session
+        .query("MATCH (n:Person|Document) RETURN SUM(n.id || '') AS total")
+        .await;
+    assert!(
+        matches!(summed_text, Err(graphfusion::Error::InvalidQuery(_))),
+        "{summed_text:?}"
+    );
+
+    let bare = session
+        .query("MATCH (n:Person|Document) RETURN n.id + 0 AS total")
+        .await;
+    assert!(
+        matches!(bare, Err(graphfusion::Error::InvalidQuery(_))),
+        "{bare:?}"
+    );
+
+    let widened = session
+        .query("MATCH (n:Person|Metric) RETURN SUM(n.score + 0) AS total")
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&widened), vec![vec!["4.5".to_string()]]);
+
+    let filtered = session
+        .query(
+            "MATCH (n:Person|Document) SELECT SUM(n.id + 0) AS total
+             HAVING SUM(n.id + 0) = 3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&filtered), vec![vec!["3".to_string()]]);
+
+    let incompatible = session
+        .query("MATCH (d:Document) RETURN SUM(d.id + 0) AS total")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+
+    let people = session
+        .query("MATCH (n:Person) RETURN SUM(n.id + 0) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&people), vec![vec!["3".to_string()]]);
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d)",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query("MATCH ()-[e:Knows|Cites]->() RETURN SUM(e.since * 1) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge), vec![vec!["1".to_string()]]);
+    let edge_text = session
+        .query("MATCH ()-[e:Knows|Cites]->() RETURN COUNT(e.since || '') AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge_text), vec![vec!["1".to_string()]]);
+}

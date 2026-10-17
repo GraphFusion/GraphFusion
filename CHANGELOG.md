@@ -12,6 +12,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Evaluate arithmetic and concatenation inside aggregate arguments on each
+  fragment's stored type. A fragment that cannot apply the operator contributes
+  null, and the argument is a type error only when no selected fragment can.
 
 ## 0.2.0 — 2026-10-05
 

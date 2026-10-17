@@ -201,11 +201,35 @@ pub(super) fn result(
     scope: &Bindings,
     body: &ast::QueryBody,
 ) -> Result<LogicalPlanBuilder> {
-    let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
+    let mut working = scope.clone();
+    let mut prepared = Vec::new();
+    for item in &body.result_clause.items {
+        let (next, expr) =
+            super::native::rewrite_aggregate_inputs(plan, session, &mut working, &item.expr)?;
+        plan = next;
+        prepared.push(expr);
+    }
+    let (next, having_expr) = match &body.having {
+        Some(predicate) => {
+            let (next, expr) =
+                super::native::rewrite_aggregate_inputs(plan, session, &mut working, predicate)?;
+            (next, Some(expr))
+        }
+        None => (plan, None),
+    };
+    plan = next;
+    let mut ordering_expr = Vec::new();
+    for item in &body.order_by {
+        let (next, expr) =
+            super::native::rewrite_aggregate_inputs(plan, session, &mut working, &item.expr)?;
+        plan = next;
+        ordering_expr.push(expr);
+    }
+    let binder = Binder::with_bindings(session, plan.schema(), &working).aggregating();
     let mut aliases = BTreeMap::new();
-    let mut result_scope = scope.clone();
+    let mut result_scope = working.clone();
     let mut projections = Vec::new();
-    for (i, item) in body.result_clause.items.iter().enumerate() {
+    for (i, (item, prepared_expr)) in body.result_clause.items.iter().zip(prepared).enumerate() {
         if matches!(item.expr, ast::Expr::Wildcard) {
             if item.alias.is_some() {
                 return Err(Error::InvalidQuery("wildcard cannot have an alias".into()));
@@ -226,7 +250,7 @@ pub(super) fn result(
                     ast::Expr::Identifier(name) => name.value.clone(),
                     _ => format!("column_{}", i + 1),
                 });
-            let expr = binder.bind(&item.expr)?;
+            let expr = binder.bind(&prepared_expr)?;
             if aliases.insert(name.clone(), expr.clone()).is_some() {
                 return Err(Error::InvalidQuery(format!(
                     "duplicate result column {name}"
@@ -263,15 +287,13 @@ pub(super) fn result(
     let binder = Binder::with_bindings(session, plan.schema(), scope)
         .aggregating()
         .aliases(&aliases);
-    let having = body
-        .having
+    let having = having_expr
         .as_ref()
-        .map(|p| binder.predicate(p))
+        .map(|predicate| binder.predicate(predicate))
         .transpose()?;
-    let ordering = body
-        .order_by
+    let ordering = ordering_expr
         .iter()
-        .map(|o| binder.bind(&o.expr))
+        .map(|expr| binder.bind(expr))
         .collect::<Result<Vec<_>>>()?;
     let mut all_expressions: Vec<_> = projections.iter().map(|(_, e)| e).collect();
     all_expressions.extend(having.iter());
