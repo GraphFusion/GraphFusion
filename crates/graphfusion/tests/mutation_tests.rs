@@ -574,6 +574,16 @@ async fn identifier_case_matches_the_parser() {
         rows(
             &run(
                 &mut s,
+                "MATCH (n {name: 'Ann'}) LET r = n RETURN r.AGE AS age, PROPERTY_EXISTS(r, AGE) AS has"
+            )
+            .await
+        ),
+        vec![vec!["30", "true"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
                 "MATCH (n) SET n.AGE = n.age + 1 RETURN n.name AS name, n.age AS age ORDER BY name"
             )
             .await
