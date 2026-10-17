@@ -567,6 +567,90 @@ async fn percentile_nulls_extremes_distinct_and_discrete_exact_values() {
 }
 
 #[tokio::test]
+async fn integer_percentile_interpolates_exact_endpoints() {
+    let mut s = Database::new().session();
+    let result = query(
+        &mut s,
+        "FOR x IN [9007199254740993, NULL, 1] RETURN PERCENTILE_CONT(x, 0.5) AS c, PERCENTILE_DISC(x, 0.5) AS d, PERCENTILE_CONT(x, 0) AS lo, PERCENTILE_CONT(x, 1) AS hi",
+    )
+    .await;
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(result.schema.field(1).data_type(), &DataType::Int64);
+    assert_eq!(
+        scalar(&result, 0, 0),
+        ScalarValue::Float64(Some(4503599627370497.0))
+    );
+    assert_eq!(scalar(&result, 0, 1), ScalarValue::Int64(Some(1)));
+    assert_eq!(scalar(&result, 0, 2), ScalarValue::Float64(Some(1.0)));
+    assert_eq!(
+        scalar(&result, 0, 3),
+        ScalarValue::Float64(Some(9007199254740992.0))
+    );
+    let result = query(
+        &mut s,
+        "FOR x IN [9007199254740993, 9007199254740993, 1] RETURN PERCENTILE_CONT(DISTINCT x, 0.5) AS distinct, PERCENTILE_CONT(x, 0.5) AS repeated",
+    )
+    .await;
+    assert_eq!(
+        scalar(&result, 0, 0),
+        ScalarValue::Float64(Some(4503599627370497.0))
+    );
+    assert_eq!(
+        scalar(&result, 0, 1),
+        ScalarValue::Float64(Some(9007199254740992.0))
+    );
+    check(
+        &mut s,
+        "FOR x IN [1, 2, 3, 4] RETURN PERCENTILE_CONT(x, 0.5) AS mid, PERCENTILE_CONT(x, 0.25) AS lower",
+        &[&["2.5", "1.75"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [1.0, 2.0, 3.0, 4.0] RETURN PERCENTILE_CONT(x, 0.5) AS mid",
+        &[&["2.5"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [-9007199254740993, -1] RETURN PERCENTILE_CONT(x, 0.5) AS c",
+        &[&["-4503599627370497"]],
+    )
+    .await;
+    let grouped = query(
+        &mut s,
+        "FOR x IN [9007199254740993, 1, 10, 20] RETURN x < 100 AS small, PERCENTILE_CONT(x, 0.5) AS p GROUP BY small ORDER BY small",
+    )
+    .await;
+    assert_eq!(scalar(&grouped, 0, 0), ScalarValue::Boolean(Some(false)));
+    assert_eq!(
+        scalar(&grouped, 0, 1),
+        ScalarValue::Float64(Some(9007199254740992.0))
+    );
+    assert_eq!(scalar(&grouped, 1, 0), ScalarValue::Boolean(Some(true)));
+    assert_eq!(scalar(&grouped, 1, 1), ScalarValue::Float64(Some(10.0)));
+    s.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {v: 9007199254740993}), (:N {v: 1})")
+        .await
+        .unwrap();
+    let graph = query(&mut s, "MATCH (n) RETURN PERCENTILE_CONT(n.v, 0.5) AS c").await;
+    assert_eq!(
+        scalar(&graph, 0, 0),
+        ScalarValue::Float64(Some(4503599627370497.0))
+    );
+}
+
+fn scalar(result: &QueryResult, row: usize, column: usize) -> ScalarValue {
+    let mut seen = 0;
+    for batch in &result.batches {
+        if row < seen + batch.num_rows() {
+            return ScalarValue::try_from_array(batch.column(column), row - seen).unwrap();
+        }
+        seen += batch.num_rows();
+    }
+    panic!("missing row {row}");
+}
+
+#[tokio::test]
 async fn composite_null_only_rows_strings_and_graph_focus() {
     let mut s = fixture().await;
     check(
