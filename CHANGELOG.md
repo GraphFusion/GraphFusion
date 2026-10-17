@@ -12,6 +12,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Divide an integer `AVG` from the exact sum. The Float64 result is that
+  quotient rounded to the nearest value, including inputs above 2^53.
 
 ## 0.2.0 — 2026-10-05
 

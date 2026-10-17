@@ -72,6 +72,29 @@ pub(super) fn call(
                 value
             })
         }
+        "AVG" if data_type == DataType::Int64 => {
+            // Sum in decimal, then divide. Float addition drops bits above 2^53
+            // before the division, so the rounded quotient can be wrong.
+            let mut sum = agg::expr_fn::sum(cast(value.clone(), DataType::Decimal128(38, 0)));
+            let mut count = agg::expr_fn::count(value);
+            if distinct {
+                for aggregate in [&mut sum, &mut count] {
+                    if let Expr::AggregateFunction(function) = aggregate {
+                        function.params.distinct = true;
+                    }
+                }
+            }
+            let sum_type = sum.get_type(schema)?;
+            let average = super::arithmetic::exact_ratio(sum, sum_type, count.clone());
+            Expr::Case(datafusion::logical_expr::expr::Case::new(
+                None,
+                vec![(
+                    Box::new(count.eq(lit(0_i64))),
+                    Box::new(lit(ScalarValue::Float64(None))),
+                )],
+                Some(Box::new(average)),
+            ))
+        }
         "AVG" => agg::expr_fn::avg(value),
         "MIN" => agg::expr_fn::min(value),
         "MAX" => agg::expr_fn::max(value),
