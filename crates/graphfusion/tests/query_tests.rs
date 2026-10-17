@@ -370,3 +370,73 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         Err(Error::SessionClosed)
     ));
 }
+
+fn table(result: &QueryResult) -> Vec<Vec<String>> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(|row| {
+                (0..batch.num_columns())
+                    .map(|column| {
+                        ScalarValue::try_from_array(batch.column(column), row)
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn repeated_element_value_orders_by_the_same_identity() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run("INSERT (:P {name:'Ann'}), (:P {name:'Ann'}), (:P {name:'Bea'})")
+        .await
+        .unwrap();
+    let names = |result: QueryResult, column: usize| -> Vec<String> {
+        table(&result)
+            .into_iter()
+            .map(|row| row[column].clone())
+            .collect()
+    };
+    let result = session
+        .query("MATCH (p:P) RETURN DISTINCT p AS person, p.name AS name ORDER BY p")
+        .await
+        .unwrap();
+    assert_eq!(names(result, 1), ["Ann", "Ann", "Bea"]);
+    let result = session
+        .query("MATCH (p:P) RETURN p AS person, p.name AS name, COUNT(*) AS rows ORDER BY p DESC")
+        .await
+        .unwrap();
+    assert_eq!(
+        table(&result)
+            .into_iter()
+            .map(|row| (row[1].clone(), row[2].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Bea".into(), "1".into()),
+            ("Ann".into(), "1".into()),
+            ("Ann".into(), "1".into())
+        ]
+    );
+    session
+        .run("MATCH (a {name:'Ann'}), (b {name:'Bea'}) INSERT (a)-[:E]->(b)")
+        .await
+        .unwrap();
+    let result = session
+        .query("MATCH (a)-[e:E]->(b) RETURN DISTINCT e AS edge, b.name AS dest ORDER BY e")
+        .await
+        .unwrap();
+    assert_eq!(names(result, 1), ["Bea", "Bea"]);
+    let result = session
+        .query("MATCH p = (a:P) RETURN DISTINCT a.name AS name, ELEMENTS(p) AS els ORDER BY ELEMENTS(p)")
+        .await
+        .unwrap();
+    assert_eq!(names(result, 0), ["Ann", "Ann", "Bea"]);
+}
