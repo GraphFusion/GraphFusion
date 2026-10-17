@@ -596,9 +596,15 @@ impl Compiler<'_> {
             Box::pin(self.pattern(plan, scope, &group.pattern, endpoint, finite, false)).await?;
         plan = plan.filter(state.valid(mode, self.different))?;
         if let Some(predicate) = &group.where_clause {
-            let value =
-                Binder::with_bindings(self.session, plan.schema(), scope).predicate(predicate)?;
-            plan = plan.filter(value)?;
+            let (next, stored) =
+                super::native::group_stored_predicate(plan, scope, self.session, predicate)?;
+            plan = if let Some(stored) = stored {
+                next.filter(stored)?
+            } else {
+                let value = Binder::with_bindings(self.session, next.schema(), scope)
+                    .predicate(predicate)?;
+                next.filter(value)?
+            };
         }
         if let Some(name) = &group.variable {
             plan = self.bind_path(plan, scope, &name.value, &state)?;
