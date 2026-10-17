@@ -15,6 +15,8 @@ RETURN p.name AS name;
 
 The result is Alice. Predicates can use bound properties, parameters, scalar operators and the supported element predicates.
 
+Arithmetic and concatenation in `FILTER` use each source fragment's stored type. An integer property is not concatenated as its decimal text, and adding zero does not fail merely because another label stores that property as text. A fragment that cannot apply the operator is unknown.
+
 An OPTIONAL MATCH predicate participates in matching before null padding. A later FILTER runs after padding and can remove unmatched rows. Put conditions on the optional neighbor inside OPTIONAL MATCH when you want to keep input rows that have no such neighbor.
 
 For path selectors, a MATCH-level WHERE is applied after selection; an inline pattern predicate restricts candidates before selection. This can change shortest-path results. See [selectors](/patterns/selectors/).
