@@ -12,4 +12,4 @@ FOR value IN [10, 20, 30]
 RETURN STDDEV_POP(value) AS population, STDDEV_SAMP(value) AS sample;
 ```
 
-These are numeric aggregates with floating results. Insufficient input for a sample estimate produces null. Empty input produces null, and non-finite aggregate results are errors. See [aggregate behavior](/expressions/aggregates/).
+These are numeric aggregates with floating results. An integer standard deviation uses the exact sum and sum of squares, then rounds once to Float64. Insufficient input for a sample estimate produces null. Empty input produces null, and non-finite aggregate results are errors. See [aggregate behavior](/expressions/aggregates/).
