@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Recognize a repeated element-reference property or predicate as the same
+  `ORDER BY` key. `DISTINCT` and grouped results can sort by `person.name`,
+  `PROPERTY_EXISTS`, `IS LABELED`, or `IS DIRECTED` when that expression is
+  already projected or grouped.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
