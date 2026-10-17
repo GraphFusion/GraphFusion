@@ -362,6 +362,21 @@ async fn mixed_property_pairs_compare_stored_types() {
         strings(&greater),
         vec![vec!["ten".to_string(), "nine".to_string()]]
     );
+    session
+        .run("MATCH (n {name: 'ten'}), (m {name: 'nine'}) INSERT (n)-[:E]->(m)")
+        .await
+        .unwrap();
+    let parenthesized = session
+        .query(
+            "MATCH ((n)-[:E]-(m) WHERE n.v > m.v)
+             RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&parenthesized),
+        vec![vec!["ten".to_string(), "nine".to_string()]]
+    );
 
     let ten_nine = session
         .query(

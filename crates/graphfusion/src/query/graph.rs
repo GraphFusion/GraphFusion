@@ -224,7 +224,7 @@ pub(super) async fn matches(
     Ok(plan)
 }
 
-fn filter_or_unified(
+pub(super) fn filter_or_unified(
     plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     session: &SessionState,
