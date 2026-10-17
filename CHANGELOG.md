@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep boolean literals on a per-fragment comparison. `WHERE n.id = 1 OR FALSE`
+  no longer fails after a multi-type scan, and `OR TRUE` keeps a row whose
+  stored value cannot be compared.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
