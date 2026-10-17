@@ -2,6 +2,12 @@
 
 ## 0.3.0 — Unreleased
 
+- Reject grouping and DISTINCT when one property is stored as more than one
+  comparable family. Integers and floats still group as numbers. An integer and
+  a string are an invalid query (`GROUP BY cannot combine Int64 and Utf8`,
+  `DISTINCT cannot combine Int64 and Utf8`) instead of one group or one row
+  because both cells print as the same text. A fragment that does not store
+  the property contributes null and does not add a family.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

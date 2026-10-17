@@ -13,7 +13,7 @@ RETURN p.name AS name, p.age + 1 AS next_age
 ORDER BY name;
 ```
 
-`RETURN ALL` preserves duplicate rows and is the default. `RETURN DISTINCT` removes duplicate projected rows. `RETURN *` expands available bindings, including whole elements where present.
+`RETURN ALL` preserves duplicate rows and is the default. `RETURN DISTINCT` removes duplicate projected rows. A projected property that mixes comparable families is an invalid query, rather than treating an integer and a string as the same row when their text matches. `RETURN *` expands available bindings, including whole elements where present.
 
 ```gql test
 FOR n IN [1, 1, 2] RETURN DISTINCT n ORDER BY n;

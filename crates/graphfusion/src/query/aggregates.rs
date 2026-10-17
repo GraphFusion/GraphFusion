@@ -201,8 +201,10 @@ pub(super) fn result(
     scope: &Bindings,
     body: &ast::QueryBody,
 ) -> Result<LogicalPlanBuilder> {
+    let input_scope = scope;
     let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
     let mut aliases = BTreeMap::new();
+    let mut sort_sources: BTreeMap<String, &ast::Expr> = BTreeMap::new();
     let mut result_scope = scope.clone();
     let mut projections = Vec::new();
     for (i, item) in body.result_clause.items.iter().enumerate() {
@@ -232,6 +234,7 @@ pub(super) fn result(
                     "duplicate result column {name}"
                 )));
             }
+            sort_sources.insert(name.clone(), &item.expr);
             // Output names shadow input names in grouping, HAVING and ordering.
             // Carry the source's lookup metadata along with its value expression,
             // always resolving against the input scope (aliases are simultaneous).
@@ -282,6 +285,12 @@ pub(super) fn result(
     let mut groups = Vec::new();
     if explicit {
         for expr in &body.group_by {
+            let resolved = result_source(expr, &sort_sources);
+            super::expressions::ensure_one_family(
+                super::expressions::sort_bindings(scope, input_scope, resolved),
+                resolved,
+                "GROUP BY",
+            )?;
             if let ast::Expr::Identifier(name) = expr {
                 if let Some(reference) = scope.references.get(&name.value) {
                     let scalar = scope.scalars.get(&name.value).expect("scalar reference");
@@ -327,13 +336,28 @@ pub(super) fn result(
             }
         }
     } else if grouped {
-        for (_, expr) in &projections {
+        for (name, expr) in &projections {
             if find_aggregate_exprs([expr]).is_empty()
                 && !expr.column_refs().is_empty()
                 && !groups.contains(expr)
             {
+                if let Some(source) = sort_sources.get(name) {
+                    super::expressions::ensure_one_family(
+                        super::expressions::sort_bindings(scope, input_scope, source),
+                        source,
+                        "GROUP BY",
+                    )?;
+                }
                 groups.push(expr.clone());
             }
+        }
+    }
+    if body.result_clause.distinct {
+        for item in &body.result_clause.items {
+            if matches!(item.expr, ast::Expr::Wildcard) {
+                continue;
+            }
+            super::expressions::ensure_one_family(input_scope, &item.expr, "DISTINCT")?;
         }
     }
     let mut mapping = Vec::new();
@@ -419,6 +443,16 @@ pub(super) fn result(
         body.limit.as_ref(),
         None,
     )
+}
+
+fn result_source<'a>(
+    expr: &'a ast::Expr,
+    sources: &'a BTreeMap<String, &'a ast::Expr>,
+) -> &'a ast::Expr {
+    let ast::Expr::Identifier(name) = expr else {
+        return expr;
+    };
+    sources.get(&name.value).copied().unwrap_or(expr)
 }
 
 fn rebase(expr: Expr, mapping: &[(Expr, Column)]) -> Result<Expr> {

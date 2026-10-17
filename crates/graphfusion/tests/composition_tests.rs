@@ -330,3 +330,95 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn grouping_keeps_mixed_property_families_apart() {
+    let mut session = social().await;
+    let grouped = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS id, COUNT(*) AS c GROUP BY id")
+        .await
+        .unwrap_err();
+    assert!(
+        grouped
+            .to_string()
+            .contains("GROUP BY cannot combine Int64 and Utf8"),
+        "{grouped}"
+    );
+    let implicit = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS id, COUNT(*) AS c")
+        .await
+        .unwrap_err();
+    assert!(
+        implicit
+            .to_string()
+            .contains("GROUP BY cannot combine Int64 and Utf8"),
+        "{implicit}"
+    );
+    let shadowed = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS n, COUNT(*) AS c GROUP BY n")
+        .await
+        .unwrap_err();
+    assert!(
+        shadowed
+            .to_string()
+            .contains("GROUP BY cannot combine Int64 and Utf8"),
+        "{shadowed}"
+    );
+    let distinct_rows = session
+        .query("MATCH (n:Person|Document) RETURN DISTINCT n.id AS id")
+        .await
+        .unwrap_err();
+    assert!(
+        distinct_rows
+            .to_string()
+            .contains("DISTINCT cannot combine Int64 and Utf8"),
+        "{distinct_rows}"
+    );
+    let distinct_values = session
+        .query("MATCH (n:Person|Document) RETURN COUNT(DISTINCT n.id) AS c")
+        .await
+        .unwrap_err();
+    assert!(
+        distinct_values
+            .to_string()
+            .contains("DISTINCT cannot combine Int64 and Utf8"),
+        "{distinct_values}"
+    );
+
+    let numeric = session
+        .query(
+            "MATCH (n:Person|Metric) RETURN n.score AS score, COUNT(*) AS c GROUP BY score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(numeric.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&numeric),
+        vec![
+            vec!["1".to_string(), "1".to_string()],
+            vec!["1.5".to_string(), "1".to_string()],
+            vec!["2".to_string(), "1".to_string()]
+        ]
+    );
+
+    let identities = session
+        .query("MATCH (n:Person|Document) RETURN COUNT(*) AS c GROUP BY n")
+        .await
+        .unwrap();
+    assert_eq!(strings(&identities), vec![vec!["1".to_string()]; 3]);
+
+    session
+        .run("INSERT (:Flag {v: true}), (:Note {v: 'true'})")
+        .await
+        .unwrap();
+    let flags = session
+        .query("MATCH (n:Flag|Note) RETURN DISTINCT n.v AS v")
+        .await
+        .unwrap_err();
+    assert!(
+        flags
+            .to_string()
+            .contains("DISTINCT cannot combine Boolean and Utf8"),
+        "{flags}"
+    );
+}
