@@ -75,6 +75,11 @@ pub(super) fn call(
         "AVG" => agg::expr_fn::avg(value),
         "MIN" => agg::expr_fn::min(value),
         "MAX" => agg::expr_fn::max(value),
+        // DataFusion rejects DISTINCT on these accumulators. Collapse repeated
+        // numbers first, then use the same one-pass deviation as the plain form.
+        "STDDEV_POP" | "STDDEV_SAMP" if distinct => {
+            distinct_stddev(value, &data_type, name == "STDDEV_SAMP")?
+        }
         "STDDEV_POP" => agg::expr_fn::stddev_pop(value),
         "STDDEV_SAMP" => agg::expr_fn::stddev(value),
         "COLLECT_LIST" => {
@@ -163,6 +168,95 @@ fn percentile(value: Expr, fraction: Expr, distinct: bool, continuous: bool) -> 
         )],
         Some(Box::new(result)),
     )))
+}
+
+/// `STDDEV_*(DISTINCT)` aggregates the distinct numbers, then takes the deviation.
+/// Values are sorted first so the one-pass update does not depend on group order.
+fn distinct_stddev(value: Expr, data_type: &DataType, sample: bool) -> Result<Expr> {
+    let value = if *data_type == DataType::Float64 {
+        value
+    } else {
+        cast(value, DataType::Float64)
+    };
+    let mut values = agg::expr_fn::array_agg(value.clone());
+    if let Expr::AggregateFunction(function) = &mut values {
+        function.params.distinct = true;
+        function.params.filter = Some(Box::new(value.is_not_null()));
+    }
+    Ok(stddev_values(values, sample))
+}
+
+fn stddev_values(values: Expr, sample: bool) -> Expr {
+    use datafusion::{
+        arrow::array::{Array, Float64Array, ListArray},
+        error::DataFusionError,
+        logical_expr::{create_udf, ColumnarValue, Volatility},
+    };
+    create_udf(
+        if sample {
+            "gql_stddev_samp_values"
+        } else {
+            "gql_stddev_pop_values"
+        },
+        vec![DataType::new_list(DataType::Float64, true)],
+        DataType::Float64,
+        Volatility::Immutable,
+        std::sync::Arc::new(move |args| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let lists = arrays[0]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("expected Float64 deviation list".into())
+                })?;
+            let mut output = Vec::with_capacity(lists.len());
+            for row in 0..lists.len() {
+                let deviation = if lists.is_null(row) {
+                    None
+                } else {
+                    let child = lists.value(row);
+                    let numbers =
+                        child
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or_else(|| {
+                                DataFusionError::Internal(
+                                    "expected Float64 deviation values".into(),
+                                )
+                            })?;
+                    deviation_of(numbers.iter().flatten(), sample)
+                };
+                output.push(deviation);
+            }
+            Ok(ColumnarValue::Array(std::sync::Arc::new(
+                Float64Array::from(output),
+            )))
+        }),
+    )
+    .call(vec![values])
+}
+
+fn deviation_of(values: impl Iterator<Item = f64>, sample: bool) -> Option<f64> {
+    let mut numbers: Vec<f64> = values.collect();
+    numbers.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let mut count = 0_u64;
+    let mut mean = 0.0_f64;
+    let mut square = 0.0_f64;
+    for value in numbers {
+        count += 1;
+        let delta = value - mean;
+        mean += delta / count as f64;
+        square += delta * (value - mean);
+    }
+    match count {
+        0 => None,
+        1 if sample => None,
+        1 => Some(0.0),
+        n => {
+            let denominator = if sample { n - 1 } else { n };
+            Some((square / denominator as f64).sqrt())
+        }
+    }
 }
 
 fn percentile_fraction(value: Expr) -> Expr {

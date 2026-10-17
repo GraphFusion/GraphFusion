@@ -319,6 +319,42 @@ async fn statistical_aggregates_use_datafusion_and_percentile_is_fractional() {
 }
 
 #[tokio::test]
+async fn distinct_standard_deviation_ignores_repeated_numbers() {
+    let mut s = Database::new().session();
+    check(
+        &mut s,
+        "FOR x IN [1, 2, 2, 1] RETURN STDDEV_POP(DISTINCT x) AS p, STDDEV_SAMP(DISTINCT x) AS s, STDDEV_POP(ALL x) AS all_p",
+        &[&["0.5", "0.7071067811865476", "0.5"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [10, 30, 20, 10, NULL] RETURN STDDEV_POP(DISTINCT x) AS p, STDDEV_SAMP(DISTINCT x) AS s",
+        &[&["8.16496580927726", "10"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [4, 4, NULL] RETURN STDDEV_POP(DISTINCT x) AS p, STDDEV_SAMP(DISTINCT x) AS s",
+        &[&["0", "NULL"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [NULL, NULL] RETURN STDDEV_POP(DISTINCT x) AS p, STDDEV_SAMP(DISTINCT x) AS s",
+        &[&["NULL", "NULL"]],
+    )
+    .await;
+    s.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {k:'a', v:1}), (:N {k:'a', v:1}), (:N {k:'a', v:3}), (:N {k:'b', v:10}), (:N {k:'b', v:20}), (:N {k:'b', v:30}), (:N {k:'b', v:10})").await.unwrap();
+    check(
+        &mut s,
+        "MATCH (n) RETURN n.k AS k, STDDEV_POP(DISTINCT n.v) AS p GROUP BY k ORDER BY k",
+        &[&["a", "1"], &["b", "8.16496580927726"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn composite_all_counts_each_null_and_duplicate_occurrence() {
     let mut s = Database::new().session();
     for (op, expected) in [
