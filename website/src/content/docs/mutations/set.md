@@ -21,6 +21,6 @@ SET p = {name: 'Alicia', active: TRUE}
 RETURN p.name AS name, PROPERTY_EXISTS(p, age) AS has_age;
 ```
 
-The second form removes properties not listed in the replacement map. An untyped NULL assignment removes the property from the affected layout. Property types must remain consistent across layouts of the graph and element kind.
+The second form removes properties not listed in the replacement map. Assigning null, whether the literal NULL or an expression that evaluates to null, removes the property from the affected rows. A cleared property does not keep its previous type, so a later assignment may use a different scalar type. Property types must remain consistent across layouts of the graph and element kind.
 
 Identical updates from repeated input rows apply once per identity/payload while preserving result multiplicity. Different values for the same target from different rows are rejected rather than choosing a row arbitrarily. Null targets are skipped. Plans resolve target identities, then indexed lookups gather only affected rows for replacement. Sealed files retain their original bytes: deleted-row masks and resident replacement rows represent the change until sealing.
