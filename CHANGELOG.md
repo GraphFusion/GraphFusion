@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Compare a `FILTER` predicate on each matched fragment's stored property type.
+  `FILTER n.id = 1` no longer fails after a multi-type scan has unified those
+  values, and a string comparison does not match a stringified integer.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
