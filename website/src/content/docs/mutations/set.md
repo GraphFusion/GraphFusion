@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-SET items are evaluated in order. Later items and clauses see preceding changes, including through aliases of the same element.
+SET items are evaluated in order. Later items and clauses see preceding changes, including through aliases of the same element. Arithmetic and concatenation on a mixed property use each source fragment's stored type. A fragment that cannot apply the operator stores null instead of a stringified value.
 
 ```gql test
 MATCH (p:Person {name: 'Alice'})

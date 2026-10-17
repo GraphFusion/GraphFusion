@@ -1,7 +1,6 @@
 //! GQL plans resolve write targets; indexed snapshot overlays publish their changes.
 use super::{
     execution::{batch, col, freeze, memory, Trace},
-    expressions::Binder,
     graph::{self, Bindings, ElementBinding, ElementKind},
 };
 use crate::{
@@ -102,9 +101,9 @@ async fn table_with_empty(
 fn properties(
     map: Option<&ast::MapLiteral>,
     session: &SessionState,
-    plan: &LogicalPlanBuilder,
+    mut plan: LogicalPlanBuilder,
     scope: &Bindings,
-) -> Result<Vec<(String, Expr)>> {
+) -> Result<(LogicalPlanBuilder, Vec<(String, Expr)>)> {
     let mut result = Vec::new();
     if let Some(map) = map {
         for (name, value) in &map.entries {
@@ -116,11 +115,13 @@ fn properties(
             if result.iter().any(|(n, _)| n == &name.value) {
                 return Err(Error::InvalidDefinition("duplicate property".into()));
             }
-            let value = Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
+            let (next, value) =
+                super::native::bind_stored_value(plan, session, scope, value, false, None)?;
+            plan = next;
             result.push((name.value.clone(), value));
         }
     }
-    Ok(result)
+    Ok((plan, result))
 }
 
 fn validate_insert_labels(expression: Option<&ast::LabelExpression>) -> Result<()> {
@@ -193,7 +194,9 @@ pub(super) async fn apply(
                         ast::Direction::Undirected => (left.column(ID), right.column(ID), false),
                         _ => return Err(super::unsupported("ambiguous INSERT edge direction")),
                     };
-                    let values = properties(edge.properties.as_ref(), session, &plan, scope)?;
+                    let (next, values) =
+                        properties(edge.properties.as_ref(), session, plan, scope)?;
+                    plan = next;
                     let (next, _) = insert_element(
                         plan,
                         scope,
@@ -220,21 +223,27 @@ pub(super) async fn apply(
                 let (name, mut edit, values) = match item {
                     ast::SetItem::Property { target, value } => {
                         let (name, property) = property_target(target)?;
-                        let expr =
-                            Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
+                        let (next, expr) = super::native::bind_stored_value(
+                            plan, session, scope, value, false, None,
+                        )?;
+                        plan = next;
                         (name, Edit::default(), vec![(property, expr)])
                     }
                     ast::SetItem::AllProperties {
                         variable,
                         properties: map,
-                    } => (
-                        variable.value.clone(),
-                        Edit {
-                            replace: true,
-                            ..Edit::default()
-                        },
-                        properties(Some(map), session, &plan, scope)?,
-                    ),
+                    } => {
+                        let (next, values) = properties(Some(map), session, plan, scope)?;
+                        plan = next;
+                        (
+                            variable.value.clone(),
+                            Edit {
+                                replace: true,
+                                ..Edit::default()
+                            },
+                            values,
+                        )
+                    }
                     ast::SetItem::Label { variable, label } => (
                         variable.value.clone(),
                         Edit {
@@ -378,7 +387,7 @@ async fn insert_node(
             return Ok((plan, binding));
         }
     }
-    let values = properties(node.properties.as_ref(), session, &plan, scope)?;
+    let (plan, values) = properties(node.properties.as_ref(), session, plan, scope)?;
     insert_element(
         plan,
         scope,
