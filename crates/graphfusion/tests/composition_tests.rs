@@ -330,3 +330,119 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn cross_element_comparisons_keep_stored_types() {
+    let mut session = social().await;
+    session
+        .run(
+            "INSERT (:Person {name: 'Cy', id: 10}), (:Person {name: 'Dee', id: 9});
+             INSERT (:Document {title: 'Ten', id: '10'});
+             INSERT (:Flag {name: 'on', ok: true});
+             INSERT (:Note {name: 'mark', ok: 'yes'})",
+        )
+        .await
+        .unwrap();
+
+    let matched = session
+        .query(
+            "MATCH (n:Person|Document), (m:Person)
+             WHERE n.id = m.id AND n.name = 'Ada'
+             RETURN m.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&matched), vec![vec!["Ada".to_string()]]);
+
+    let greater = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id > m.score
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&greater),
+        vec![
+            vec!["Bea".to_string()],
+            vec!["Cy".to_string()],
+            vec!["Dee".to_string()]
+        ]
+    );
+
+    let below = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id < m.score
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&below), vec![vec!["Ada".to_string()]]);
+
+    let equal = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id = m.score
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(equal.row_count(), 0);
+
+    let ordered = session
+        .query(
+            "MATCH (n:Person|Document), (m:Person|Document)
+             WHERE n.id > m.id AND n.name = 'Cy' AND m.name = 'Dee'
+             RETURN n.name AS left_name, m.name AS right_name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&ordered),
+        vec![vec!["Cy".to_string(), "Dee".to_string()]]
+    );
+
+    let digits = session
+        .query(
+            "MATCH (n:Person|Document), (m:Person|Document)
+             WHERE n.id = m.id AND n.name = 'Cy' AND m.title = 'Ten'
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(digits.row_count(), 0);
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE NOT n.id = m.score AND n.title = 'Spec'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(negated.row_count(), 0);
+
+    let mismatched = session
+        .query("MATCH (n:Person), (m:Document) WHERE n.id = m.id RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        mismatched
+            .to_string()
+            .contains("incomparable types Int64 and Utf8"),
+        "{mismatched}"
+    );
+
+    let no_pair = session
+        .query("MATCH (n:Flag|Note), (m:Person) WHERE n.ok = m.id RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        no_pair
+            .to_string()
+            .contains("incomparable types Boolean and Int64"),
+        "{no_pair}"
+    );
+}
