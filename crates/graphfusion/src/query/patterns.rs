@@ -43,6 +43,9 @@ pub(super) struct Compiler<'a> {
     pub clause_filters: BTreeMap<String, NativeAtom>,
     pub clause_push: bool,
     pub clause_hit: BTreeSet<String>,
+    /// Cross-element comparisons projected as booleans, then combined after the join.
+    pub clause_residue: Option<super::native::ClauseResidue>,
+    pub residue_hit: BTreeSet<String>,
 }
 fn narrower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -140,6 +143,12 @@ impl Compiler<'_> {
             if let Some(extra) = self.clause_filters.get(&name.value) {
                 native.conjunct(extra.clone());
                 self.clause_hit.insert(name.value.clone());
+            }
+            if let Some(residue) = &self.clause_residue {
+                if let Some(columns) = residue.columns.get(&name.value) {
+                    native.flags.extend(columns.iter().cloned());
+                    self.residue_hit.insert(name.value.clone());
+                }
             }
         }
         Ok(native)

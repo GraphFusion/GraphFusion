@@ -12,6 +12,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Compare each side of a match `WHERE` that combines different elements with
+  `OR`, `XOR`, or `NOT` on that element's stored type. `n.id = 1 OR m.id = 'x'`
+  keeps a row when either stored value matches, instead of rejecting the
+  unified column as incomparable with the literal.
 
 ## 0.2.0 — 2026-10-05
 

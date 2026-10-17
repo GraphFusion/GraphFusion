@@ -170,14 +170,23 @@ pub(super) async fn matches(
             }
         }
     }
+    let searchable = !where_runs_after_search(clause, session)?;
     let (clause_filters, clause_push) = match &clause.where_clause {
-        Some(predicate) if !where_runs_after_search(clause, session)? => {
+        Some(predicate) if searchable => {
             match super::native::clause_filters(session, plan.schema(), scope, predicate)? {
                 Some(filters) => (filters, true),
                 None => (BTreeMap::new(), false),
             }
         }
         _ => (BTreeMap::new(), false),
+    };
+    // Projecting a boolean does not drop scan rows, so a selective search can
+    // still rank every candidate and apply the combination afterwards.
+    let clause_residue = match &clause.where_clause {
+        Some(predicate) if !clause_push => {
+            super::native::clause_residue(session, plan.schema(), scope, predicate)?
+        }
+        _ => None,
     };
     let mut compiler = super::patterns::Compiler {
         session,
@@ -190,6 +199,8 @@ pub(super) async fn matches(
         clause_filters,
         clause_push,
         clause_hit: BTreeSet::new(),
+        clause_residue,
+        residue_hit: BTreeSet::new(),
     };
     let mut edge_lists: Vec<Expr> = Vec::new();
     for path in &clause.patterns {
@@ -216,7 +227,16 @@ pub(super) async fn matches(
             .clause_filters
             .keys()
             .all(|name| compiler.clause_hit.contains(name));
-    if let Some(predicate) = &clause.where_clause {
+    let residue = compiler.clause_residue.as_ref().filter(|residue| {
+        residue
+            .columns
+            .keys()
+            .all(|name| compiler.residue_hit.contains(name))
+    });
+    if let Some(residue) = residue {
+        let expr = super::native::compile_residue(&residue.predicate, scope)?;
+        plan = plan.filter(expr)?;
+    } else if let Some(predicate) = &clause.where_clause {
         if !pushed {
             let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
             plan = plan.filter(expr)?;
@@ -541,14 +561,20 @@ fn scan_tables(
         scanned.clone()
     };
     let properties = graph::property_types(schema_source.iter().map(|(table, _)| *table))?;
-    if let Some(atom) = &native.filter {
+    if native.filter.is_some() || !native.flags.is_empty() {
         // An empty label scan still exposes the element kind's property types.
         let typed = if scanned.is_empty() {
             &schema_source
         } else {
             &scanned
         };
-        super::native::validate(atom, typed.iter().map(|(table, _)| *table))?;
+        let tables: Vec<_> = typed.iter().map(|(table, _)| *table).collect();
+        if let Some(atom) = &native.filter {
+            super::native::validate(atom, tables.iter().copied())?;
+        }
+        for (_, atom) in &native.flags {
+            super::native::validate(atom, tables.iter().copied())?;
+        }
     }
     let source_labels: Vec<_> = scanned
         .iter()
@@ -654,6 +680,9 @@ fn scan_tables(
             for (label, column) in &binding.labels {
                 projections.push(lit(table.labels.contains(label)).alias(column));
             }
+            for (name, atom) in &native.flags {
+                projections.push(super::native::compile(atom, table.schema.as_ref())?.alias(name));
+            }
             branches.push(scan.project(projections)?.build()?);
         }
     }
@@ -674,6 +703,9 @@ fn scan_tables(
         }
         for column in binding.labels.values() {
             fields.push(lit(false).alias(column));
+        }
+        for (name, _) in &native.flags {
+            fields.push(lit(ScalarValue::Boolean(None)).alias(name));
         }
         LogicalPlanBuilder::empty(false).project(fields)?
     } else {
