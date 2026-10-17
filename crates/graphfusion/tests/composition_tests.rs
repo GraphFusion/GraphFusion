@@ -330,3 +330,111 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+async fn names(session: &mut graphfusion::Session, query: &str) -> Vec<String> {
+    strings(&session.query(query).await.unwrap())
+        .into_iter()
+        .map(|row| row.into_iter().next().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn truth_predicates_compare_stored_types() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:P {name: 'ten', v: 10}),
+                    (:P {name: 'nine', v: 9}),
+                    (:D {name: 'text', v: '10'})",
+        )
+        .await
+        .unwrap();
+    session.execute("SESSION SET VALUE $digits = '10'").unwrap();
+
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS TRUE RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["text".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS FALSE RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS UNKNOWN RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["nine".to_string(), "ten".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS NOT TRUE RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["nine".to_string(), "ten".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS NOT UNKNOWN RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["text".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = $digits) IS TRUE RETURN n.name AS name"
+        )
+        .await,
+        vec!["text".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n WHERE (n.v = '10') IS UNKNOWN) RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["nine".to_string(), "ten".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n:P) WHERE (n.v > 9) IS TRUE RETURN n.name AS name"
+        )
+        .await,
+        vec!["ten".to_string()]
+    );
+    let mismatch = session
+        .query("MATCH (n:D) WHERE (n.v > 9) IS TRUE RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("incomparable types"),
+        "{mismatch}"
+    );
+
+    let mut session = social().await;
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n:Person|Metric) WHERE (n.score > 1) IS TRUE
+             RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["Bea".to_string(), "load".to_string()]
+    );
+}
