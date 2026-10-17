@@ -330,3 +330,61 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn mixed_label_xor_compares_stored_types() {
+    let mut session = social().await;
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 XOR n.id <> 1
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let one_of = session
+        .query(
+            "MATCH (n:Person|Document WHERE n.id = 1 XOR n.id = 2)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&one_of),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let crossed = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 XOR n.id = 'doc'
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(crossed.row_count(), 0);
+
+    let widened = session
+        .query(
+            "MATCH (n:Person|Metric) WHERE n.score > 1 XOR n.score < 1
+             RETURN n.score AS score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
+
+    let incompatible = session
+        .query("MATCH (d:Document) WHERE d.id = 1 XOR d.id <> 1 RETURN d.title AS title")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+}

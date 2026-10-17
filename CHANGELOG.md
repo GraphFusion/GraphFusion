@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Evaluate `XOR` of property comparisons on each fragment's stored type. A
+  multi-type filter such as `n.id = 1 XOR n.id <> 1` no longer fails after the
+  scan has unified those values into one column.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
