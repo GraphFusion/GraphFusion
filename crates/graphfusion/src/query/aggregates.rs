@@ -201,86 +201,73 @@ pub(super) fn result(
     scope: &Bindings,
     body: &ast::QueryBody,
 ) -> Result<LogicalPlanBuilder> {
-    let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
     let mut aliases = BTreeMap::new();
     let mut result_scope = scope.clone();
     let mut projections = Vec::new();
-    for (i, item) in body.result_clause.items.iter().enumerate() {
-        if matches!(item.expr, ast::Expr::Wildcard) {
-            if item.alias.is_some() {
-                return Err(Error::InvalidQuery("wildcard cannot have an alias".into()));
-            }
-            for name in &scope.order {
-                let expr = binder.bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?;
-                if aliases.insert(name.clone(), expr.clone()).is_some() {
-                    return Err(Error::InvalidQuery("duplicate result column".into()));
+    {
+        let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
+        for (i, item) in body.result_clause.items.iter().enumerate() {
+            if matches!(item.expr, ast::Expr::Wildcard) {
+                if item.alias.is_some() {
+                    return Err(Error::InvalidQuery("wildcard cannot have an alias".into()));
                 }
-                projections.push((name.clone(), expr));
+                for name in &scope.order {
+                    let expr = binder.bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?;
+                    if aliases.insert(name.clone(), expr.clone()).is_some() {
+                        return Err(Error::InvalidQuery("duplicate result column".into()));
+                    }
+                    projections.push((name.clone(), expr));
+                }
+            } else {
+                let name = item
+                    .alias
+                    .as_ref()
+                    .map(|name| name.value.clone())
+                    .unwrap_or_else(|| match &item.expr {
+                        ast::Expr::Identifier(name) => name.value.clone(),
+                        _ => format!("column_{}", i + 1),
+                    });
+                let expr = binder.bind(&item.expr)?;
+                if aliases.insert(name.clone(), expr.clone()).is_some() {
+                    return Err(Error::InvalidQuery(format!(
+                        "duplicate result column {name}"
+                    )));
+                }
+                // Output names shadow input names in grouping, HAVING and ordering.
+                // Carry the source's lookup metadata along with its value expression,
+                // always resolving against the input scope (aliases are simultaneous).
+                result_scope.scalars.remove(&name);
+                result_scope.elements.remove(&name);
+                result_scope.references.remove(&name);
+                let source = match &item.expr {
+                    ast::Expr::Identifier(source) => Some(&source.value),
+                    _ => None,
+                };
+                if let Some(column) = source.and_then(|source| scope.scalars.get(source)) {
+                    result_scope.scalars.insert(name.clone(), column.clone());
+                }
+                if let Some(element) = source.and_then(|source| scope.elements.get(source)) {
+                    result_scope.elements.insert(name.clone(), element.clone());
+                }
+                if let Some(reference) = source.and_then(|source| scope.references.get(source)) {
+                    result_scope
+                        .references
+                        .insert(name.clone(), reference.clone());
+                }
+                projections.push((name, expr));
             }
-        } else {
-            let name = item
-                .alias
-                .as_ref()
-                .map(|name| name.value.clone())
-                .unwrap_or_else(|| match &item.expr {
-                    ast::Expr::Identifier(name) => name.value.clone(),
-                    _ => format!("column_{}", i + 1),
-                });
-            let expr = binder.bind(&item.expr)?;
-            if aliases.insert(name.clone(), expr.clone()).is_some() {
-                return Err(Error::InvalidQuery(format!(
-                    "duplicate result column {name}"
-                )));
-            }
-            // Output names shadow input names in grouping, HAVING and ordering.
-            // Carry the source's lookup metadata along with its value expression,
-            // always resolving against the input scope (aliases are simultaneous).
-            result_scope.scalars.remove(&name);
-            result_scope.elements.remove(&name);
-            result_scope.references.remove(&name);
-            let source = match &item.expr {
-                ast::Expr::Identifier(source) => Some(&source.value),
-                _ => None,
-            };
-            if let Some(column) = source.and_then(|source| scope.scalars.get(source)) {
-                result_scope.scalars.insert(name.clone(), column.clone());
-            }
-            if let Some(element) = source.and_then(|source| scope.elements.get(source)) {
-                result_scope.elements.insert(name.clone(), element.clone());
-            }
-            if let Some(reference) = source.and_then(|source| scope.references.get(source)) {
-                result_scope
-                    .references
-                    .insert(name.clone(), reference.clone());
-            }
-            projections.push((name, expr));
         }
     }
     if projections.is_empty() {
         return Err(Error::InvalidQuery("result has no bound columns".into()));
     }
     let scope = &result_scope;
-    let binder = Binder::with_bindings(session, plan.schema(), scope)
-        .aggregating()
-        .aliases(&aliases);
-    let having = body
-        .having
-        .as_ref()
-        .map(|p| binder.predicate(p))
-        .transpose()?;
-    let ordering = body
-        .order_by
-        .iter()
-        .map(|o| binder.bind(&o.expr))
-        .collect::<Result<Vec<_>>>()?;
-    let mut all_expressions: Vec<_> = projections.iter().map(|(_, e)| e).collect();
-    all_expressions.extend(having.iter());
-    all_expressions.extend(&ordering);
-    let mut aggregates = find_aggregate_exprs(all_expressions);
     let explicit = !body.group_by.is_empty() || body.empty_grouping_set;
-    let grouped = explicit || !aggregates.is_empty() || having.is_some();
     let mut groups = Vec::new();
     if explicit {
+        let binder = Binder::with_bindings(session, plan.schema(), scope)
+            .aggregating()
+            .aliases(&aliases);
         for expr in &body.group_by {
             if let ast::Expr::Identifier(name) = expr {
                 if let Some(reference) = scope.references.get(&name.value) {
@@ -326,7 +313,15 @@ pub(super) fn result(
                 groups.push(group);
             }
         }
-    } else if grouped {
+    } else if body.having.is_some()
+        || body
+            .order_by
+            .iter()
+            .any(|order| super::native::contains_function(&order.expr))
+        || projections
+            .iter()
+            .any(|(_, expr)| !find_aggregate_exprs([expr]).is_empty())
+    {
         for (_, expr) in &projections {
             if find_aggregate_exprs([expr]).is_empty()
                 && !expr.column_refs().is_empty()
@@ -336,6 +331,37 @@ pub(super) fn result(
             }
         }
     }
+    let having_requested = body.having.is_some();
+    let mut having_consumed = false;
+    if let Some(predicate) = &body.having {
+        if super::native::having_inputs_grouped(scope, predicate, &groups) {
+            let (next, applied) =
+                super::native::apply_having_operator(plan, session, scope, predicate)?;
+            plan = next;
+            having_consumed = applied;
+        }
+    }
+    let binder = Binder::with_bindings(session, plan.schema(), scope)
+        .aggregating()
+        .aliases(&aliases);
+    let having = if having_consumed {
+        None
+    } else {
+        body.having
+            .as_ref()
+            .map(|predicate| binder.predicate(predicate))
+            .transpose()?
+    };
+    let ordering = body
+        .order_by
+        .iter()
+        .map(|order| binder.bind(&order.expr))
+        .collect::<Result<Vec<_>>>()?;
+    let mut all_expressions: Vec<_> = projections.iter().map(|(_, e)| e).collect();
+    all_expressions.extend(having.iter());
+    all_expressions.extend(&ordering);
+    let mut aggregates = find_aggregate_exprs(all_expressions);
+    let grouped = explicit || !aggregates.is_empty() || having_requested;
     let mut mapping = Vec::new();
     if grouped {
         if groups.is_empty() && aggregates.is_empty() {
