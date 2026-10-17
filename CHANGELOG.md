@@ -9,6 +9,9 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- Compare a filter on each fragment's stored property type before a multi-type
+  scan unifies those columns. An integer comparison stays numeric, and a
+  fragment that cannot compare is unknown rather than a match.
 
 ## 0.2.0 — 2026-10-05
 
