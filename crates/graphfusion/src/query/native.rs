@@ -21,6 +21,11 @@ pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// `PROPERTY_EXISTS(variable, property)`: a missing column or a null value
+    /// is false, and a null element is null.
+    Exists {
+        property: String,
+    },
     Compare {
         property: String,
         op: Operator,
@@ -89,8 +94,9 @@ impl NativePush {
 /// Split a match-level `WHERE` into per-variable fragment predicates.
 ///
 /// `AND` can be split across variables. `OR` and `NOT` stay together, so they
-/// are pushed only when every comparison names the same variable. A value that
-/// reads another column stays on the unified plan.
+/// are pushed only when every comparison or `PROPERTY_EXISTS` names the same
+/// variable. That existence test stays with the variable's stored-type
+/// comparison. A value that reads another column stays on the unified plan.
 pub(super) fn clause_filters(
     session: &SessionState,
     schema: &DFSchema,
@@ -128,6 +134,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(right, tables)
         }
         NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Exists { .. } => Ok(()),
         NativeAtom::Compare {
             property,
             value_type,
@@ -158,6 +165,7 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
         NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
         NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::Exists { property } => exists_expr(schema, property),
         NativeAtom::Compare {
             property,
             op,
@@ -212,6 +220,24 @@ fn unknown() -> Expr {
     lit(ScalarValue::Boolean(None))
 }
 
+/// Match `ElementBinding::property_exists`: a stored null and a column the
+/// fragment does not have are both false. A null element stays null.
+fn exists_expr(schema: &Schema, property: &str) -> Expr {
+    let present = if schema.field_with_name(property).is_ok() {
+        column(property).is_not_null()
+    } else {
+        lit(false)
+    };
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(column(crate::graph::ID).is_null()),
+            Box::new(lit(ScalarValue::Boolean(None))),
+        )],
+        Some(Box::new(present)),
+    ))
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -227,6 +253,9 @@ enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Exists {
+        property: String,
+    },
     Atom {
         property: String,
         op: Operator,
@@ -290,6 +319,12 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
+        ast::Expr::PropertyExists {
+            variable: name,
+            property,
+        } if name.value == variable => Some(Local::Exists {
+            property: property.value.clone(),
+        }),
         other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
             property,
             op,
@@ -370,6 +405,9 @@ fn bind_local(
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
         }
+        Local::Exists { property } => Some(NativeAtom::Exists {
+            property: property.clone(),
+        }),
         Local::Atom {
             property,
             op,
@@ -409,6 +447,9 @@ fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
         if let ast::Expr::Identifier(name) = base.as_ref() {
             names.insert(name.value.clone());
         }
+    }
+    if let ast::Expr::PropertyExists { variable, .. } = expr {
+        names.insert(variable.value.clone());
     }
     for child in children(expr) {
         property_bases(child, names);
