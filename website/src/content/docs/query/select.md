@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-`SELECT` provides a projection-first query form. A graph source supplies the graph for its MATCH pattern.
+`SELECT` provides a projection-first query form. A graph source supplies the graph for its MATCH pattern. A `WHERE` after the select list filters the working table. Arithmetic and concatenation there use each source fragment's stored type; a fragment that cannot apply the operator is unknown.
 
 ```gql test
 SELECT p.name AS name, p.age AS age

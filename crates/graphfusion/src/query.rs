@@ -665,8 +665,7 @@ async fn plan_body(
     trace.sources.extend(scope.sources.clone());
     trace.output_domains = references::result_domains(body, &scope);
     if let Some(predicate) = &body.select_where {
-        let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
-        plan = plan.filter(expr)?;
+        plan = native::apply_select_operator(plan, session, &scope, predicate)?;
     }
     Ok((
         aggregates::result(plan, session, &scope, body)?.build()?,

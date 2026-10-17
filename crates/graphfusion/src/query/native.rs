@@ -7,12 +7,20 @@
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
 //! unknown stays unknown and does not keep the row.
 
-use super::{expressions::Binder, graph::Bindings};
-use crate::{gql as ast, graph::Table, Error, Result, SessionState};
+use super::{
+    expressions::Binder,
+    graph::{Bindings, ElementKind},
+};
+use crate::{
+    gql as ast,
+    graph::{Table, ID},
+    Error, Result, SessionState,
+};
 use datafusion::{
-    arrow::datatypes::{DataType, Schema},
-    common::{Column, DFSchema, ScalarValue},
-    logical_expr::{cast, lit, Expr, ExprSchemable, Operator},
+    arrow::datatypes::{DataType, Schema, SchemaRef},
+    common::{Column, DFSchema, ScalarValue, TableReference},
+    datasource::provider_as_source,
+    logical_expr::{cast, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -548,5 +556,353 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
         | E::IsDirected { .. }
         | E::IsLabeled { .. }
         | E::Identifier(_) => vec![],
+    }
+}
+
+/// Evaluate SELECT WHERE arithmetic and concatenation on each fragment's stored type.
+///
+/// A plain comparison stays on the unified working table. An operator around a
+/// mixed property otherwise sees that text column: addition rejects it, and
+/// concatenation matches a stringified integer. Each fragment is bound with
+/// its own stored type. A fragment that cannot apply the operator is unknown,
+/// and the operator is a type error only when no fragment can.
+pub(super) fn apply_select_operator(
+    mut plan: LogicalPlanBuilder,
+    session: &SessionState,
+    scope: &Bindings,
+    predicate: &ast::Expr,
+) -> Result<LogicalPlanBuilder> {
+    let elements = nested_mixed_elements(predicate, scope);
+    if elements.is_empty() {
+        let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
+        return Ok(plan.filter(expr)?);
+    }
+    let mut stored = Vec::new();
+    for name in &elements {
+        let (next, fragments) = attach_operator_fragments(plan, scope, name)?;
+        plan = next;
+        if fragments.is_empty() {
+            let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
+            return Ok(plan.filter(expr)?);
+        }
+        stored.push((name.clone(), fragments));
+    }
+    let contexts = fragment_contexts(&stored);
+    let leaves = boolean_leaves(predicate);
+    let mut leaf_ok = vec![false; leaves.len()];
+    let mut leaf_err = (0..leaves.len()).map(|_| None).collect::<Vec<_>>();
+    let mut evaluated = Vec::new();
+    for context in &contexts {
+        let mut values = Vec::new();
+        for (index, leaf) in leaves.iter().enumerate() {
+            match bind_leaf(session, plan.schema(), scope, context, leaf) {
+                Ok(expr) => {
+                    leaf_ok[index] = true;
+                    values.push(expr);
+                }
+                Err(err @ (Error::InvalidQuery(_) | Error::UnsupportedFeature(_))) => {
+                    if leaf_err[index].is_none() {
+                        leaf_err[index] = Some(err);
+                    }
+                    values.push(unknown());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let mut index = 0;
+        evaluated.push((
+            context_condition(context),
+            assemble_predicate(predicate, &values, &mut index, plan.schema())?,
+        ));
+    }
+    for (index, ok) in leaf_ok.iter().enumerate() {
+        if !ok {
+            return Err(leaf_err[index].take().unwrap_or_else(|| {
+                Error::InvalidQuery("predicate does not match a stored type".into())
+            }));
+        }
+    }
+    let expr = fragment_case(evaluated);
+    expect_boolean(&expr, plan.schema())?;
+    Ok(plan.filter(expr)?)
+}
+
+fn nested_mixed_elements(expr: &ast::Expr, scope: &Bindings) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    walk_nested(expr, scope, false, &mut names);
+    names
+}
+
+fn walk_nested(
+    expr: &ast::Expr,
+    scope: &Bindings,
+    comparison_side: bool,
+    names: &mut BTreeSet<String>,
+) {
+    if let Some((name, property)) = bare_element_property(expr) {
+        if !comparison_side
+            && scope.elements.contains_key(&name)
+            && stored_type_count(scope, &name, &property) > 1
+        {
+            names.insert(name);
+        }
+        return;
+    }
+    if let ast::Expr::Binary { left, op, right } = expr {
+        if is_comparison(op) {
+            walk_nested(left, scope, bare_element_property(left).is_some(), names);
+            walk_nested(right, scope, bare_element_property(right).is_some(), names);
+            return;
+        }
+    }
+    for child in children(expr) {
+        walk_nested(child, scope, false, names);
+    }
+}
+
+fn bare_element_property(expr: &ast::Expr) -> Option<(String, String)> {
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    Some((name.value.clone(), key.value.clone()))
+}
+
+fn is_comparison(op: &ast::BinaryOp) -> bool {
+    matches!(
+        op,
+        ast::BinaryOp::Eq
+            | ast::BinaryOp::Neq
+            | ast::BinaryOp::Lt
+            | ast::BinaryOp::Le
+            | ast::BinaryOp::Gt
+            | ast::BinaryOp::Ge
+    )
+}
+
+fn boolean_leaves(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    match expr {
+        ast::Expr::Binary {
+            left,
+            op: ast::BinaryOp::And | ast::BinaryOp::Or | ast::BinaryOp::Xor,
+            right,
+        } => boolean_leaves(left)
+            .into_iter()
+            .chain(boolean_leaves(right))
+            .collect(),
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => boolean_leaves(expr),
+        other => vec![other],
+    }
+}
+
+#[derive(Clone)]
+struct OperatorFragment {
+    scan: String,
+    schema: SchemaRef,
+}
+
+impl OperatorFragment {
+    fn id(&self) -> Expr {
+        Expr::Column(Column::new(
+            Some(TableReference::bare(self.scan.as_str())),
+            ID,
+        ))
+    }
+}
+
+fn stored_type_count(scope: &Bindings, name: &str, property: &str) -> usize {
+    let mut types = Vec::new();
+    for table in operator_tables(scope, name) {
+        let Some(data_type) = table
+            .schema
+            .field_with_name(property)
+            .ok()
+            .map(|field| field.data_type().clone())
+        else {
+            continue;
+        };
+        if !types.contains(&data_type) {
+            types.push(data_type);
+        }
+    }
+    types.len()
+}
+
+fn operator_tables<'a>(scope: &'a Bindings, name: &str) -> Vec<&'a Table> {
+    let Some(binding) = scope.elements.get(name) else {
+        return Vec::new();
+    };
+    let Some(data) = scope.sources.get(&binding.graph) else {
+        return Vec::new();
+    };
+    let selected = |table: &Table| {
+        binding
+            .source_labels
+            .iter()
+            .any(|labels| labels == &table.labels)
+    };
+    match binding.kind {
+        ElementKind::Node => data
+            .nodes
+            .iter()
+            .map(|table| &table.0)
+            .filter(|table| selected(table))
+            .collect(),
+        ElementKind::Edge => data
+            .edges
+            .iter()
+            .map(|table| &table.table)
+            .filter(|table| selected(table))
+            .collect(),
+    }
+}
+
+fn attach_operator_fragments(
+    mut plan: LogicalPlanBuilder,
+    scope: &Bindings,
+    name: &str,
+) -> Result<(LogicalPlanBuilder, Vec<OperatorFragment>)> {
+    let Some(binding) = scope.elements.get(name) else {
+        return Ok((plan, Vec::new()));
+    };
+    let mut stored = Vec::new();
+    for (index, table) in operator_tables(scope, name).into_iter().enumerate() {
+        let scan_name = format!("__gf_select_op_{}_{index}", binding.alias);
+        let scan =
+            LogicalPlanBuilder::scan(&scan_name, provider_as_source(table.provider.clone()), None)?
+                .build()?;
+        plan = plan.join_on(
+            scan,
+            JoinType::Left,
+            [binding.column(ID).eq(Expr::Column(Column::new(
+                Some(TableReference::bare(scan_name.as_str())),
+                ID,
+            )))],
+        )?;
+        stored.push(OperatorFragment {
+            scan: scan_name,
+            schema: table.schema.clone(),
+        });
+    }
+    Ok((plan, stored))
+}
+
+fn fragment_contexts(
+    stored: &[(String, Vec<OperatorFragment>)],
+) -> Vec<Vec<(String, OperatorFragment)>> {
+    let mut contexts = vec![Vec::new()];
+    for (name, fragments) in stored {
+        let mut next = Vec::new();
+        for context in &contexts {
+            for fragment in fragments {
+                let mut row = context.clone();
+                row.push((name.clone(), fragment.clone()));
+                next.push(row);
+            }
+        }
+        contexts = next;
+    }
+    contexts
+}
+
+fn bind_leaf(
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    context: &[(String, OperatorFragment)],
+    leaf: &ast::Expr,
+) -> Result<Expr> {
+    let mut local = scope.clone();
+    for (name, fragment) in context {
+        let Some(binding) = local.elements.get_mut(name) else {
+            continue;
+        };
+        binding.property_scan = Some(fragment.scan.clone());
+        binding.properties = fragment
+            .schema
+            .fields()
+            .iter()
+            .filter(|field| !field.name().starts_with("__gf_"))
+            .map(|field| (field.name().clone(), field.data_type().clone()))
+            .collect();
+    }
+    Binder::with_bindings(session, schema, &local).predicate(leaf)
+}
+
+fn context_condition(context: &[(String, OperatorFragment)]) -> Expr {
+    context
+        .iter()
+        .map(|(_, fragment)| fragment.id().is_not_null())
+        .reduce(Expr::and)
+        .unwrap_or_else(|| lit(true))
+}
+
+fn assemble_predicate(
+    expr: &ast::Expr,
+    values: &[Expr],
+    index: &mut usize,
+    schema: &DFSchema,
+) -> Result<Expr> {
+    match expr {
+        ast::Expr::Binary {
+            left,
+            op: op @ (ast::BinaryOp::And | ast::BinaryOp::Or | ast::BinaryOp::Xor),
+            right,
+        } => {
+            let left = assemble_predicate(left, values, index, schema)?;
+            let right = assemble_predicate(right, values, index, schema)?;
+            expect_boolean(&left, schema)?;
+            expect_boolean(&right, schema)?;
+            Ok(match op {
+                ast::BinaryOp::And => left.and(right),
+                ast::BinaryOp::Or => left.or(right),
+                _ => left.not_eq(right),
+            })
+        }
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => {
+            let inner = assemble_predicate(expr, values, index, schema)?;
+            expect_boolean(&inner, schema)?;
+            Ok(Expr::Not(Box::new(inner)))
+        }
+        _ => {
+            let expr = values
+                .get(*index)
+                .cloned()
+                .ok_or_else(|| Error::InvalidQuery("predicate leaf is missing".into()))?;
+            *index += 1;
+            Ok(expr)
+        }
+    }
+}
+
+fn fragment_case(arms: Vec<(Expr, Expr)>) -> Expr {
+    if arms.is_empty() {
+        return unknown();
+    }
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        arms.into_iter()
+            .map(|(condition, value)| (Box::new(condition), Box::new(value)))
+            .collect(),
+        Some(Box::new(unknown())),
+    ))
+}
+
+fn expect_boolean(expr: &Expr, schema: &DFSchema) -> Result<()> {
+    let data_type = expr.get_type(schema)?;
+    if matches!(data_type, DataType::Boolean | DataType::Null) {
+        Ok(())
+    } else {
+        Err(Error::InvalidQuery(format!(
+            "expected boolean predicate, got {data_type}"
+        )))
     }
 }
