@@ -330,3 +330,120 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn mixed_label_operators_use_stored_types() {
+    let mut session = social().await;
+    let added = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id + 0 = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&added), vec![vec!["Ada".to_string()]]);
+
+    let multiplied = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id * 1 = 2
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&multiplied), vec![vec!["Bea".to_string()]]);
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE -n.id = -1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let not_stringified = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id || '' = '1'
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_stringified.row_count(), 0);
+
+    let concatenated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id || '!' = 'doc!'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&concatenated), vec![vec!["Spec".to_string()]]);
+
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id + 0 = 1 OR n.name = 'Bea'
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let widened = session
+        .query(
+            "MATCH (n:Person|Metric) WHERE n.score + 0 > 1
+             RETURN n.score AS score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE n.id + 0 = 1)
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&inline), vec![vec!["Ada".to_string()]]);
+
+    let incompatible = session
+        .query("MATCH (d:Document) WHERE d.id + 0 = 1 RETURN d.title AS title")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d)",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() WHERE e.since * 1 = 1
+             RETURN e.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge), vec![vec!["1".to_string()]]);
+    let edge_text = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() WHERE e.since || '' = '1'
+             RETURN e.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge_text.row_count(), 0);
+}

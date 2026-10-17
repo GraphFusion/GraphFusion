@@ -7,6 +7,8 @@ sidebar:
 
 `WHERE` attaches a predicate to MATCH or SELECT. `FILTER` filters the current working table; `FILTER WHERE` is an accepted spelling. Only true passes: false and unknown/null do not.
 
+Arithmetic and concatenation in `MATCH` `WHERE` use each source fragment's stored type. An integer property is not concatenated as its decimal text, and adding zero does not fail merely because another label stores that property as text.
+
 ```gql test
 MATCH (p:Person) WHERE p.age >= 30
 FILTER p.name <> 'Bob'
