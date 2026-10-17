@@ -1,5 +1,5 @@
 use datafusion::arrow::datatypes::DataType;
-use graphfusion::{Database, Value};
+use graphfusion::{Database, Error, Value};
 use std::collections::BTreeMap;
 
 fn strings(result: &graphfusion::QueryResult) -> Vec<Vec<String>> {
@@ -329,4 +329,118 @@ async fn mixed_label_filters_compare_stored_types() {
         strings(&both),
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
+}
+
+#[tokio::test]
+async fn where_direction_tests_keep_stored_types() {
+    let mut session = social().await;
+    session
+        .run(
+            "INSERT (a:Person {name: 'Cy', id: 3})-[:Knows {id: 1}]->(a);
+             INSERT (b:Person {name: 'Knot', id: 4})-[:Notes {id: 2}]-(b);
+             INSERT (c:Document {title: 'Paper', id: 'p'})-[:Cites {id: 'doc'}]->(c)",
+        )
+        .await
+        .unwrap();
+
+    let directed = session
+        .query(
+            "MATCH ()-[e:Knows|Notes|Cites]-()
+             WHERE e IS DIRECTED AND e.id = 1
+             RETURN e.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(directed.schema.field(0).data_type(), &DataType::Utf8);
+    assert_eq!(strings(&directed), vec![vec!["1".to_string()]]);
+
+    let undirected = session
+        .query(
+            "MATCH ()-[e:Knows|Notes|Cites]-()
+             WHERE e IS NOT DIRECTED AND e.id = 2
+             RETURN e.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&undirected), vec![vec!["2".to_string()]]);
+
+    let either = session
+        .query(
+            "MATCH ()-[e:Knows|Notes|Cites]-()
+             WHERE e.id = 'doc' OR e IS NOT DIRECTED
+             RETURN e.id AS id ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![vec!["2".to_string()], vec!["doc".to_string()]]
+    );
+
+    let all_directed = session
+        .query(
+            "MATCH ()-[e:Knows|Notes|Cites]-()
+             WHERE e IS DIRECTED OR e.id = 2
+             RETURN e.id AS id ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&all_directed),
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["doc".to_string()]
+        ]
+    );
+
+    let excluded = session
+        .query(
+            "MATCH ()-[e:Knows|Notes|Cites]-()
+             WHERE NOT e IS DIRECTED AND e.id = 1
+             RETURN e.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(excluded.row_count(), 0);
+
+    let inline = session
+        .query(
+            "MATCH ()-[e:Knows|Notes|Cites WHERE e IS DIRECTED AND e.id = 1]-()
+             RETURN e.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&inline), vec![vec!["1".to_string()]]);
+
+    let joined = session
+        .query(
+            "MATCH (n:Person|Document)-[e:Knows|Notes|Cites]-()
+             WHERE n.id = 3 AND e IS DIRECTED
+             RETURN n.name AS name, e.id AS id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&joined),
+        vec![vec!["Cy".to_string(), "1".to_string()]]
+    );
+
+    let node = session
+        .query("MATCH (n:Person) WHERE n IS DIRECTED RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    match node {
+        Error::InvalidQuery(message) => assert!(message.contains("edge"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
+
+    let error = session
+        .query("MATCH ()-[e:Cites]-() WHERE e.id = 1 OR e IS DIRECTED RETURN e.id AS id")
+        .await
+        .unwrap_err();
+    match error {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
 }
