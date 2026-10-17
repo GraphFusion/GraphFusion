@@ -56,7 +56,7 @@ async fn table(
     ctx: &SessionContext,
     trace: &mut Trace,
 ) -> Result<Option<Table>> {
-    table_with_empty(plan, labels, edge, ctx, trace, false).await
+    table_with_empty(plan, labels, edge, ctx, trace, false, false).await
 }
 
 async fn table_with_empty(
@@ -66,10 +66,51 @@ async fn table_with_empty(
     ctx: &SessionContext,
     trace: &mut Trace,
     keep_empty: bool,
+    omit_null_properties: bool,
 ) -> Result<Option<Table>> {
-    let (schema, batches) = trace.collect(ctx, &plan.build()?).await?;
+    let (mut schema, mut batches) = trace.collect(ctx, &plan.build()?).await?;
     if !keep_empty && batches.iter().all(|b| b.num_rows() == 0) {
         return Ok(None);
+    }
+    // `1 + NULL` has an Int64 type and a null value. Storing that column makes
+    // the property look absent while still rejecting a later value of another type.
+    if omit_null_properties && batches.iter().any(|batch| batch.num_rows() > 0) {
+        let keep: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| {
+                let name = field.name().as_str();
+                if matches!(name, ID | SOURCE | DESTINATION) {
+                    return true;
+                }
+                !batches.iter().all(|batch| {
+                    batch
+                        .column_by_name(name)
+                        .is_none_or(|column| column.null_count() == column.len())
+                })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if keep.len() != schema.fields().len() {
+            schema = Arc::new(Schema::new(
+                keep.iter()
+                    .map(|index| schema.field(*index).clone())
+                    .collect::<Vec<_>>(),
+            ));
+            batches = batches
+                .into_iter()
+                .map(|batch| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        keep.iter()
+                            .map(|index| batch.column(*index).clone())
+                            .collect(),
+                    )
+                    .map_err(|err| Error::Corrupt(format!("invalid insert property batch: {err}")))
+                })
+                .collect::<Result<_>>()?;
+        }
     }
     let schema = Arc::new(Schema::new(
         schema
@@ -443,6 +484,7 @@ async fn insert_element(
         kind == ElementKind::Edge,
         ctx,
         trace,
+        true,
         true,
     )
     .await?;

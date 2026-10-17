@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Do not store an INSERT property when its value is null on every new row.
+  `INSERT (:P {v: 1 + NULL})` leaves `v` unset, the same as omitting it, so a
+  later value of a different type is not rejected as a mixed type.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
