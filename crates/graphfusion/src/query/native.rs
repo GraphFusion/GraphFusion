@@ -7,12 +7,20 @@
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
 //! unknown stays unknown and does not keep the row.
 
-use super::{expressions::Binder, graph::Bindings};
-use crate::{gql as ast, graph::Table, Error, Result, SessionState};
+use super::{
+    expressions::Binder,
+    graph::{Bindings, ElementKind},
+};
+use crate::{
+    gql as ast,
+    graph::{Table, ID},
+    Error, Result, SessionState,
+};
 use datafusion::{
-    arrow::datatypes::{DataType, Schema},
-    common::{Column, DFSchema, ScalarValue},
-    logical_expr::{cast, lit, Expr, ExprSchemable, Operator},
+    arrow::datatypes::{DataType, Schema, SchemaRef},
+    common::{Column, DFSchema, ScalarValue, TableReference},
+    datasource::provider_as_source,
+    logical_expr::{cast, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -549,4 +557,453 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
         | E::IsLabeled { .. }
         | E::Identifier(_) => vec![],
     }
+}
+
+/// Evaluate arithmetic and concatenation inside aggregate arguments on stored types.
+///
+/// The aggregate call itself stays on the working table. Its argument is bound
+/// per fragment before grouping, and a fragment that cannot apply the operator
+/// contributes null. Aggregates already omit nulls. The argument is a type
+/// error only when no fragment can evaluate it.
+pub(super) fn rewrite_aggregate_inputs(
+    plan: LogicalPlanBuilder,
+    session: &SessionState,
+    scope: &mut Bindings,
+    expr: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, ast::Expr)> {
+    rewrite_expr(plan, session, scope, expr)
+}
+
+fn rewrite_expr(
+    plan: LogicalPlanBuilder,
+    session: &SessionState,
+    scope: &mut Bindings,
+    expr: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, ast::Expr)> {
+    match expr {
+        ast::Expr::Function {
+            name,
+            quantifier,
+            args,
+        } => {
+            let mut plan = plan;
+            let mut rewritten = Vec::with_capacity(args.len());
+            for arg in args {
+                let (next, arg) = rewrite_expr(plan, session, scope, arg)?;
+                let (next, arg) = materialize_argument(next, session, scope, arg)?;
+                plan = next;
+                rewritten.push(arg);
+            }
+            Ok((
+                plan,
+                ast::Expr::Function {
+                    name: name.clone(),
+                    quantifier: *quantifier,
+                    args: rewritten,
+                },
+            ))
+        }
+        ast::Expr::Binary { left, op, right } => {
+            let (plan, left) = rewrite_expr(plan, session, scope, left)?;
+            let (plan, right) = rewrite_expr(plan, session, scope, right)?;
+            Ok((
+                plan,
+                ast::Expr::Binary {
+                    left: Box::new(left),
+                    op: *op,
+                    right: Box::new(right),
+                },
+            ))
+        }
+        ast::Expr::Unary { op, expr } => {
+            let (plan, inner) = rewrite_expr(plan, session, scope, expr)?;
+            Ok((
+                plan,
+                ast::Expr::Unary {
+                    op: *op,
+                    expr: Box::new(inner),
+                },
+            ))
+        }
+        ast::Expr::IsNull { expr, negated } => {
+            let (plan, inner) = rewrite_expr(plan, session, scope, expr)?;
+            Ok((
+                plan,
+                ast::Expr::IsNull {
+                    expr: Box::new(inner),
+                    negated: *negated,
+                },
+            ))
+        }
+        ast::Expr::IsUnknown { expr, negated } => {
+            let (plan, inner) = rewrite_expr(plan, session, scope, expr)?;
+            Ok((
+                plan,
+                ast::Expr::IsUnknown {
+                    expr: Box::new(inner),
+                    negated: *negated,
+                },
+            ))
+        }
+        ast::Expr::IsTruth {
+            expr,
+            negated,
+            value,
+        } => {
+            let (plan, inner) = rewrite_expr(plan, session, scope, expr)?;
+            Ok((
+                plan,
+                ast::Expr::IsTruth {
+                    expr: Box::new(inner),
+                    negated: *negated,
+                    value: *value,
+                },
+            ))
+        }
+        other => Ok((plan, other.clone())),
+    }
+}
+
+fn materialize_argument(
+    plan: LogicalPlanBuilder,
+    session: &SessionState,
+    scope: &mut Bindings,
+    expr: ast::Expr,
+) -> Result<(LogicalPlanBuilder, ast::Expr)> {
+    if contains_call(&expr) || value_mixed_elements(&expr, scope).is_empty() {
+        return Ok((plan, expr));
+    }
+    let (plan, value) = bind_aggregate_input(plan, session, scope, &expr)?;
+    let name = scope.fresh("agg_arg");
+    let mut output = Vec::new();
+    for column in plan.schema().columns() {
+        output.push(
+            Expr::Column(column.clone())
+                .alias_qualified(column.relation.clone(), column.name.as_str()),
+        );
+    }
+    output.push(value.alias(&name));
+    let plan = plan.project(output)?;
+    scope
+        .scalars
+        .insert(name.clone(), Column::new_unqualified(&name));
+    Ok((plan, ast::Expr::Identifier(ast::Identifier::new(name))))
+}
+
+fn bind_aggregate_input(
+    mut plan: LogicalPlanBuilder,
+    session: &SessionState,
+    scope: &Bindings,
+    expr: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Expr)> {
+    let elements = value_mixed_elements(expr, scope);
+    if elements.is_empty() {
+        let value = Binder::with_bindings(session, plan.schema(), scope).bind(expr)?;
+        return Ok((plan, value));
+    }
+    let mut stored = Vec::new();
+    for name in &elements {
+        let (next, fragments) = attach_value_fragments(plan, scope, name)?;
+        plan = next;
+        if fragments.is_empty() {
+            let value = Binder::with_bindings(session, plan.schema(), scope).bind(expr)?;
+            return Ok((plan, value));
+        }
+        stored.push((name.clone(), fragments));
+    }
+    let mut bound = Vec::new();
+    let mut failure = None;
+    for context in value_contexts(&stored) {
+        match bind_value(session, plan.schema(), scope, &context, expr) {
+            Ok(value) => bound.push((value_condition(&context), value)),
+            Err(err @ (Error::InvalidQuery(_) | Error::UnsupportedFeature(_))) => {
+                if failure.is_none() {
+                    failure = Some(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if bound.is_empty() {
+        return Err(failure.unwrap_or_else(|| {
+            Error::InvalidQuery("expression does not match a stored type".into())
+        }));
+    }
+    let schema = plan.schema();
+    let types = bound
+        .iter()
+        .map(|(_, value)| value.get_type(schema))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let data_type = unify_value_type(&types)?;
+    let arms = bound
+        .into_iter()
+        .map(|(condition, value)| {
+            let value = if value.get_type(schema)? == data_type {
+                value
+            } else {
+                value.cast_to(&data_type, schema)?
+            };
+            Ok((condition, value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((plan, value_case(arms, &data_type)?))
+}
+
+fn value_mixed_elements(expr: &ast::Expr, scope: &Bindings) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    walk_value(expr, scope, false, &mut names);
+    names
+}
+
+fn walk_value(
+    expr: &ast::Expr,
+    scope: &Bindings,
+    under_operator: bool,
+    names: &mut BTreeSet<String>,
+) {
+    if let Some((name, property)) = bare_value_property(expr) {
+        if under_operator
+            && scope.elements.contains_key(&name)
+            && value_type_count(scope, &name, &property) > 1
+        {
+            names.insert(name);
+        }
+        return;
+    }
+    match expr {
+        ast::Expr::Binary { left, op, right } if is_value_comparison(op) => {
+            walk_value(left, scope, false, names);
+            walk_value(right, scope, false, names);
+        }
+        ast::Expr::Binary { left, op, right } => {
+            let operator = matches!(
+                op,
+                ast::BinaryOp::Add
+                    | ast::BinaryOp::Sub
+                    | ast::BinaryOp::Mul
+                    | ast::BinaryOp::Div
+                    | ast::BinaryOp::Concat
+            );
+            walk_value(left, scope, operator, names);
+            walk_value(right, scope, operator, names);
+        }
+        ast::Expr::Unary { op, expr } => {
+            let operator = matches!(op, ast::UnaryOp::Pos | ast::UnaryOp::Neg);
+            walk_value(expr, scope, operator, names);
+        }
+        other => {
+            for child in children(other) {
+                walk_value(child, scope, false, names);
+            }
+        }
+    }
+}
+
+fn bare_value_property(expr: &ast::Expr) -> Option<(String, String)> {
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    Some((name.value.clone(), key.value.clone()))
+}
+
+fn is_value_comparison(op: &ast::BinaryOp) -> bool {
+    matches!(
+        op,
+        ast::BinaryOp::Eq
+            | ast::BinaryOp::Neq
+            | ast::BinaryOp::Lt
+            | ast::BinaryOp::Le
+            | ast::BinaryOp::Gt
+            | ast::BinaryOp::Ge
+    )
+}
+
+fn contains_call(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Function { .. }) || children(expr).into_iter().any(contains_call)
+}
+
+#[derive(Clone)]
+struct ValueFragment {
+    scan: String,
+    schema: SchemaRef,
+}
+
+impl ValueFragment {
+    fn id(&self) -> Expr {
+        Expr::Column(Column::new(
+            Some(TableReference::bare(self.scan.as_str())),
+            ID,
+        ))
+    }
+}
+
+fn value_type_count(scope: &Bindings, name: &str, property: &str) -> usize {
+    let mut types = Vec::new();
+    for table in value_tables(scope, name) {
+        let Some(data_type) = table
+            .schema
+            .field_with_name(property)
+            .ok()
+            .map(|field| field.data_type().clone())
+        else {
+            continue;
+        };
+        if !types.contains(&data_type) {
+            types.push(data_type);
+        }
+    }
+    types.len()
+}
+
+fn value_tables<'a>(scope: &'a Bindings, name: &str) -> Vec<&'a Table> {
+    let Some(binding) = scope.elements.get(name) else {
+        return Vec::new();
+    };
+    let Some(data) = scope.sources.get(&binding.graph) else {
+        return Vec::new();
+    };
+    let selected = |table: &Table| {
+        binding
+            .source_labels
+            .iter()
+            .any(|labels| labels == &table.labels)
+    };
+    match binding.kind {
+        ElementKind::Node => data
+            .nodes
+            .iter()
+            .map(|table| &table.0)
+            .filter(|table| selected(table))
+            .collect(),
+        ElementKind::Edge => data
+            .edges
+            .iter()
+            .map(|table| &table.table)
+            .filter(|table| selected(table))
+            .collect(),
+    }
+}
+
+fn attach_value_fragments(
+    mut plan: LogicalPlanBuilder,
+    scope: &Bindings,
+    name: &str,
+) -> Result<(LogicalPlanBuilder, Vec<ValueFragment>)> {
+    let Some(binding) = scope.elements.get(name) else {
+        return Ok((plan, Vec::new()));
+    };
+    let salt = plan.schema().fields().len();
+    let mut stored = Vec::new();
+    for (index, table) in value_tables(scope, name).into_iter().enumerate() {
+        let scan_name = format!("__gf_agg_{salt}_{}_{index}", binding.alias);
+        let scan =
+            LogicalPlanBuilder::scan(&scan_name, provider_as_source(table.provider.clone()), None)?
+                .build()?;
+        plan = plan.join_on(
+            scan,
+            JoinType::Left,
+            [binding.column(ID).eq(Expr::Column(Column::new(
+                Some(TableReference::bare(scan_name.as_str())),
+                ID,
+            )))],
+        )?;
+        stored.push(ValueFragment {
+            scan: scan_name,
+            schema: table.schema.clone(),
+        });
+    }
+    Ok((plan, stored))
+}
+
+fn value_contexts(stored: &[(String, Vec<ValueFragment>)]) -> Vec<Vec<(String, ValueFragment)>> {
+    let mut contexts = vec![Vec::new()];
+    for (name, fragments) in stored {
+        let mut next = Vec::new();
+        for context in &contexts {
+            for fragment in fragments {
+                let mut row = context.clone();
+                row.push((name.clone(), fragment.clone()));
+                next.push(row);
+            }
+        }
+        contexts = next;
+    }
+    contexts
+}
+
+fn bind_value(
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    context: &[(String, ValueFragment)],
+    expr: &ast::Expr,
+) -> Result<Expr> {
+    let mut local = scope.clone();
+    for (name, fragment) in context {
+        let Some(binding) = local.elements.get_mut(name) else {
+            continue;
+        };
+        binding.property_scan = Some(fragment.scan.clone());
+        binding.properties = fragment
+            .schema
+            .fields()
+            .iter()
+            .filter(|field| !field.name().starts_with("__gf_"))
+            .map(|field| (field.name().clone(), field.data_type().clone()))
+            .collect();
+    }
+    Binder::with_bindings(session, schema, &local).bind(expr)
+}
+
+fn value_condition(context: &[(String, ValueFragment)]) -> Expr {
+    context
+        .iter()
+        .map(|(_, fragment)| fragment.id().is_not_null())
+        .reduce(Expr::and)
+        .unwrap_or_else(|| lit(true))
+}
+
+fn unify_value_type(types: &[DataType]) -> Result<DataType> {
+    let mut unified: Option<DataType> = None;
+    for data_type in types {
+        if *data_type == DataType::Null {
+            continue;
+        }
+        unified = Some(match &unified {
+            None => data_type.clone(),
+            Some(current) if current == data_type => current.clone(),
+            Some(current) if current.is_numeric() && data_type.is_numeric() => DataType::Float64,
+            Some(current) if is_text(current) && is_text(data_type) => DataType::Utf8,
+            Some(current) => {
+                return Err(Error::InvalidQuery(format!(
+                    "incompatible value types {current} and {data_type}"
+                )));
+            }
+        });
+    }
+    Ok(unified.unwrap_or(DataType::Null))
+}
+
+fn is_text(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+fn value_case(arms: Vec<(Expr, Expr)>, data_type: &DataType) -> Result<Expr> {
+    let null = lit(ScalarValue::try_from(data_type.clone())?);
+    if arms.is_empty() {
+        return Ok(null);
+    }
+    Ok(Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        arms.into_iter()
+            .map(|(condition, value)| (Box::new(condition), Box::new(value)))
+            .collect(),
+        Some(Box::new(null)),
+    )))
 }

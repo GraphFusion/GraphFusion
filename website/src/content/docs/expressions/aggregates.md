@@ -15,7 +15,7 @@ RETURN COUNT(*) AS people, AVG(p.age) AS average_age,
 
 COUNT(*) counts rows. COUNT(value) and COUNT(element) omit nulls. All aggregates omit null inputs. An empty global group produces COUNT = 0, COLLECT_LIST = [] and null numeric results. COLLECT_LIST order is unspecified.
 
-Integer SUM accumulates in a wider representation before a checked Int64 conversion. Non-finite floating results are errors. Use [GROUP BY and HAVING](/query/group-by/) to form and filter groups.
+Integer SUM accumulates in a wider representation before a checked Int64 conversion. Non-finite floating results are errors. Arithmetic and concatenation inside an aggregate argument use each source fragment's stored type. A fragment that cannot apply the operator contributes null, which aggregates omit. Use [GROUP BY and HAVING](/query/group-by/) to form and filter groups.
 
 ```gql test
 MATCH (p:Person)

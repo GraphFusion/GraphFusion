@@ -22,6 +22,9 @@ pub(super) enum ElementKind {
 #[derive(Clone, Debug)]
 pub(super) struct ElementBinding {
     pub alias: String,
+    /// Property columns are read from this scan when an aggregate argument
+    /// binds one source fragment. Labels and endpoints stay on `alias`.
+    pub property_scan: Option<String>,
     pub graph: ObjectId,
     pub kind: ElementKind,
     pub properties: BTreeMap<String, DataType>,
@@ -36,10 +39,11 @@ pub(super) struct ElementBinding {
 }
 impl ElementBinding {
     pub fn column(&self, name: &str) -> Expr {
-        Expr::Column(Column::new(
-            Some(TableReference::bare(self.alias.clone())),
-            name,
-        ))
+        let qualifier = match self.property_scan.as_deref() {
+            Some(scan) if self.properties.contains_key(name) => scan,
+            _ => self.alias.as_str(),
+        };
+        Expr::Column(Column::new(Some(TableReference::bare(qualifier)), name))
     }
     pub fn property(&self, name: &str) -> Expr {
         if self.properties.contains_key(name) {
@@ -557,6 +561,7 @@ fn scan_tables(
     let labels: BTreeSet<_> = source_labels.iter().flatten().cloned().collect();
     let binding = ElementBinding {
         alias: format!("__gf_element_{}", scope.next),
+        property_scan: None,
         graph: graph_id,
         kind,
         labels: labels
