@@ -106,12 +106,14 @@ async fn label_filters_scan_only_compatible_fragments() {
     );
 
     let mixed = session
-        .query("MATCH (n:Person|Document) RETURN n.id AS id ORDER BY id")
+        .query("MATCH (n:Person|Document) RETURN n.id AS id")
         .await
         .unwrap();
     assert_eq!(mixed.schema.field(0).data_type(), &DataType::Utf8);
+    let mut mixed_rows = strings(&mixed);
+    mixed_rows.sort();
     assert_eq!(
-        strings(&mixed),
+        mixed_rows,
         vec![
             vec!["1".to_string()],
             vec!["2".to_string()],
@@ -288,7 +290,7 @@ async fn mixed_label_filters_compare_stored_types() {
     let either = session
         .query(
             "MATCH (n:Person|Document) WHERE n.id = 1 OR n.title = 'Spec'
-             RETURN n.id AS id, n.title AS title ORDER BY id",
+             RETURN n.id AS id, n.title AS title ORDER BY title",
         )
         .await
         .unwrap();
@@ -296,8 +298,8 @@ async fn mixed_label_filters_compare_stored_types() {
     assert_eq!(
         strings(&either),
         vec![
-            vec!["1".to_string(), "NULL".to_string()],
-            vec!["doc".to_string(), "Spec".to_string()]
+            vec!["doc".to_string(), "Spec".to_string()],
+            vec!["1".to_string(), "NULL".to_string()]
         ]
     );
 
@@ -328,5 +330,93 @@ async fn mixed_label_filters_compare_stored_types() {
     assert_eq!(
         strings(&both),
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn order_by_rejects_mixed_property_families() {
+    let mut session = social().await;
+    let alias = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS id ORDER BY id")
+        .await
+        .unwrap_err();
+    assert!(
+        alias
+            .to_string()
+            .contains("ORDER BY cannot combine Int64 and Utf8"),
+        "{alias}"
+    );
+    let shadowed = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS n ORDER BY n")
+        .await
+        .unwrap_err();
+    assert!(
+        shadowed
+            .to_string()
+            .contains("ORDER BY cannot combine Int64 and Utf8"),
+        "{shadowed}"
+    );
+    let direct = session
+        .query("MATCH (n:Person|Document) ORDER BY n.id RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        direct
+            .to_string()
+            .contains("ORDER BY cannot combine Int64 and Utf8"),
+        "{direct}"
+    );
+    let selected = session
+        .query("SELECT n.id AS id FROM g MATCH (n:Person|Document) ORDER BY id")
+        .await
+        .unwrap_err();
+    assert!(
+        selected
+            .to_string()
+            .contains("ORDER BY cannot combine Int64 and Utf8"),
+        "{selected}"
+    );
+
+    let numeric = session
+        .query("MATCH (n:Person|Metric) RETURN n.score AS score ORDER BY score DESC")
+        .await
+        .unwrap();
+    assert_eq!(numeric.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&numeric),
+        vec![
+            vec!["2".to_string()],
+            vec!["1.5".to_string()],
+            vec!["1".to_string()]
+        ]
+    );
+
+    let missing = session
+        .query("MATCH (n:Person|Metric) RETURN n.id AS id ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(missing.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&missing),
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    session
+        .run("INSERT (:Flag {v: true}), (:Count {v: 1})")
+        .await
+        .unwrap();
+    let flags = session
+        .query("MATCH (n:Flag|Count) RETURN n.v AS v ORDER BY v")
+        .await
+        .unwrap_err();
+    assert!(
+        flags
+            .to_string()
+            .contains("ORDER BY cannot combine Boolean and Int64"),
+        "{flags}"
     );
 }

@@ -683,6 +683,11 @@ fn order_and_page(
     scope: Option<&graph::Bindings>,
 ) -> Result<LogicalPlanBuilder> {
     if !ordering.is_empty() {
+        if let Some(scope) = scope {
+            for item in ordering {
+                expressions::ensure_sortable(scope, &item.expr)?;
+            }
+        }
         let binder = match scope {
             Some(scope) => Binder::with_bindings(session, plan.schema(), scope),
             None => Binder::new(session, plan.schema()),

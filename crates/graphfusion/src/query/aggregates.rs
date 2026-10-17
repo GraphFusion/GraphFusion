@@ -203,6 +203,7 @@ pub(super) fn result(
 ) -> Result<LogicalPlanBuilder> {
     let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
     let mut aliases = BTreeMap::new();
+    let mut sort_sources: BTreeMap<String, &ast::Expr> = BTreeMap::new();
     let mut result_scope = scope.clone();
     let mut projections = Vec::new();
     for (i, item) in body.result_clause.items.iter().enumerate() {
@@ -232,6 +233,7 @@ pub(super) fn result(
                     "duplicate result column {name}"
                 )));
             }
+            sort_sources.insert(name.clone(), &item.expr);
             // Output names shadow input names in grouping, HAVING and ordering.
             // Carry the source's lookup metadata along with its value expression,
             // always resolving against the input scope (aliases are simultaneous).
@@ -259,6 +261,7 @@ pub(super) fn result(
     if projections.is_empty() {
         return Err(Error::InvalidQuery("result has no bound columns".into()));
     }
+    let input_scope = scope;
     let scope = &result_scope;
     let binder = Binder::with_bindings(session, plan.schema(), scope)
         .aggregating()
@@ -268,6 +271,18 @@ pub(super) fn result(
         .as_ref()
         .map(|p| binder.predicate(p))
         .transpose()?;
+    for item in &body.order_by {
+        let expr = match &item.expr {
+            ast::Expr::Identifier(name) => {
+                sort_sources.get(&name.value).copied().unwrap_or(&item.expr)
+            }
+            _ => &item.expr,
+        };
+        super::expressions::ensure_sortable(
+            super::expressions::sort_bindings(scope, input_scope, expr),
+            expr,
+        )?;
+    }
     let ordering = body
         .order_by
         .iter()

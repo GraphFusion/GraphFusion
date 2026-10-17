@@ -509,6 +509,101 @@ impl<'a> Binder<'a> {
     }
 }
 
+/// Result names can hide the element a property was read from. Prefer the
+/// scope that still has that element.
+pub(super) fn sort_bindings<'a>(
+    result: &'a super::graph::Bindings,
+    input: &'a super::graph::Bindings,
+    expr: &ast::Expr,
+) -> &'a super::graph::Bindings {
+    let ast::Expr::Property { base, .. } = expr else {
+        return result;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return result;
+    };
+    if result.elements.contains_key(&name.value) {
+        result
+    } else {
+        input
+    }
+}
+
+/// A sort key reads each fragment's stored type. Integers and floats are one
+/// family; boolean, string, and byte-string values are not ordered as strings.
+pub(super) fn ensure_sortable(bindings: &super::graph::Bindings, expr: &ast::Expr) -> Result<()> {
+    let Some(types) = stored_property_types(bindings, expr) else {
+        return Ok(());
+    };
+    let mut families = Vec::new();
+    for data_type in &types {
+        let family = sort_family(data_type);
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    if families.len() <= 1 {
+        return Ok(());
+    }
+    let mut labels: Vec<_> = types.iter().map(ToString::to_string).collect();
+    labels.sort();
+    Err(Error::InvalidQuery(format!(
+        "ORDER BY cannot combine {}",
+        labels.join(" and ")
+    )))
+}
+
+fn stored_property_types(
+    bindings: &super::graph::Bindings,
+    expr: &ast::Expr,
+) -> Option<Vec<DataType>> {
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    let element = bindings.elements.get(&name.value)?;
+    let graph = bindings.sources.get(&element.graph)?;
+    let mut types = Vec::new();
+    for labels in &element.source_labels {
+        let matched: Vec<&crate::graph::Table> = match element.kind {
+            super::graph::ElementKind::Node => graph
+                .nodes
+                .iter()
+                .map(|table| &table.0)
+                .filter(|table| &table.labels == labels)
+                .collect(),
+            super::graph::ElementKind::Edge => graph
+                .edges
+                .iter()
+                .map(|table| &table.table)
+                .filter(|table| &table.labels == labels)
+                .collect(),
+        };
+        for table in matched {
+            let Some(field) = table.schema.field_with_name(&key.value).ok() else {
+                continue;
+            };
+            let data_type = field.data_type().clone();
+            if !types.contains(&data_type) {
+                types.push(data_type);
+            }
+        }
+    }
+    Some(types)
+}
+
+fn sort_family(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Int64 | DataType::Float64 => "numeric".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytes".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
     if left == right || *right == DataType::Null {
         return Ok(left.clone());
