@@ -12,6 +12,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Keep a MATCH `WHERE` on a conditional or repeated-group name. A variable
+  missing from an alternative or a questioned segment stays null and does not
+  match, and a property comparison on a repeated group is rejected because that
+  name is a list.
 
 ## 0.2.0 — 2026-10-05
 

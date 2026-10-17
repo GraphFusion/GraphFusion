@@ -328,3 +328,53 @@ async fn unbounded_homogeneous_selection_uses_complete_finite_bounds() {
     let q = q.replace("->*(b", "->{0,8}(b");
     assert_eq!(rows(&query(&mut s, &q).await), vec![vec!["8"]]);
 }
+
+#[tokio::test]
+async fn match_where_keeps_conditional_and_group_predicates() {
+    let db = Database::new();
+    let mut s = db.session();
+    s.execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+        .unwrap();
+    s.run("INSERT (a:N {name:'A'}),(b:N {name:'B'}),(c:N {name:'C'}),(a)-[:E]->(b),(a)-[:E]->(c)")
+        .await
+        .unwrap();
+    let present = "MATCH (a {name:'A'})-[:E]->(b) | (a {name:'A'})-[:E]->(c) WHERE b.name = 'B' RETURN b.name AS b, c.name AS c ORDER BY b, c";
+    let equivalent = present.replace("b.name = 'B'", "b.name = 'B' OR FALSE");
+    assert_eq!(
+        rows(&query(&mut s, present).await),
+        rows(&query(&mut s, &equivalent).await)
+    );
+    assert_eq!(
+        rows(&query(&mut s, present).await),
+        vec![vec!["B".to_string(), "NULL".to_string()]]
+    );
+
+    s.run("INSERT (x:N {name:'X', a:1})-[:E]->(y:N {name:'Y', a:0})-[:E]->(z:N {name:'Z', a:1})")
+        .await
+        .unwrap();
+    let questioned = "MATCH ((n)-[:E]->(m))?(end) WHERE n.a = 1 RETURN end.name AS end, n.name AS n ORDER BY end, n";
+    let questioned_or = questioned.replace("n.a = 1", "n.a = 1 OR FALSE");
+    assert_eq!(
+        rows(&query(&mut s, questioned).await),
+        rows(&query(&mut s, &questioned_or).await)
+    );
+    assert_eq!(
+        rows(&query(&mut s, questioned).await),
+        vec![vec!["Y".to_string(), "X".to_string()]]
+    );
+
+    for predicate in ["n.a = 1", "n.a = 1 OR n.a = 0"] {
+        let q =
+            format!("MATCH ((n)-[:E]->(m)){{1,2}}(end) WHERE {predicate} RETURN end.name AS end");
+        let err = s.query(&q).await.unwrap_err().to_string();
+        assert!(
+            err.contains("n is not a resolved element reference"),
+            "{q}\n{err}"
+        );
+    }
+    let inline =
+        "MATCH ((n WHERE n.a = 1)-[:E]->(m)){1,2}(end) RETURN end.name AS end ORDER BY end";
+    assert_eq!(rows(&query(&mut s, inline).await), vec![vec!["Y"]]);
+    let singleton = "MATCH (n)-[:E]->(m) WHERE n.a = 1 RETURN m.name AS m ORDER BY m";
+    assert_eq!(rows(&query(&mut s, singleton).await), vec![vec!["Y"]]);
+}
