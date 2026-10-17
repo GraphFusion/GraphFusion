@@ -12,6 +12,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- `COALESCE` a null with a byte string. The null takes the byte-string type
+  instead of failing while the call is planned.
 
 ## 0.2.0 — 2026-10-05
 

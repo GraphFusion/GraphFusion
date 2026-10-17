@@ -428,8 +428,7 @@ impl<'a> Binder<'a> {
                     .iter()
                     .map(|arg| self.bind(arg))
                     .collect::<Result<Vec<_>>>()?;
-                self.compatible(&args)?;
-                datafusion::functions::core::expr_fn::coalesce(args)
+                self.coalesce(args)?
             }
             E::NullIf { left, right } => {
                 let left = self.bind(left)?;
@@ -506,6 +505,27 @@ impl<'a> Binder<'a> {
             previous = common_value_type(&previous, &expr.get_type(self.schema)?)?;
         }
         Ok(())
+    }
+
+    /// `coalesce` accepts an untyped null beside a number or string, but not
+    /// beside a byte string. Cast those nulls to binary once the other
+    /// arguments have established that family.
+    fn coalesce(&self, args: Vec<Expr>) -> Result<Expr> {
+        let mut element = DataType::Null;
+        for expr in &args {
+            element = common_value_type(&element, &expr.get_type(self.schema)?)?;
+        }
+        let args = args
+            .into_iter()
+            .map(|expr| {
+                if element == DataType::Binary && expr.get_type(self.schema)? == DataType::Null {
+                    Ok(expr.cast_to(&DataType::Binary, self.schema)?)
+                } else {
+                    Ok(expr)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(datafusion::functions::core::expr_fn::coalesce(args))
     }
 }
 
