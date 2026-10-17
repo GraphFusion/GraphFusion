@@ -12,6 +12,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Keep that stored-type comparison in `RETURN` and `SELECT` expressions,
+  `SELECT WHERE`, `HAVING`, and `ORDER BY`. An integer property does not become
+  equal to its text form after the columns are unified, including when `AND`,
+  `OR`, `XOR`, or `NOT` combines the comparison with another boolean.
 
 ## 0.2.0 — 2026-10-05
 

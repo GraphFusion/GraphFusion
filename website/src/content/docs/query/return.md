@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-`RETURN` projects expressions into an Arrow result table. A variable keeps its name; give computed expressions an explicit `AS` alias to make result schemas stable. Otherwise scalar expressions receive names such as `column_1`.
+`RETURN` projects expressions into an Arrow result table. A variable keeps its name; give computed expressions an explicit `AS` alias to make result schemas stable. Otherwise scalar expressions receive names such as `column_1`. A comparison of a property that has different non-numeric types uses each stored type, not the unified text column.
 
 ```gql test
 MATCH (p:Person)

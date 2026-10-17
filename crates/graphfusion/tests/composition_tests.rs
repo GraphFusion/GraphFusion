@@ -330,3 +330,127 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn result_expressions_compare_mixed_properties_on_each_fragment() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:Person {name: 'Ada', id: 1}),
+                    (:Person {name: 'Bea', id: 2}),
+                    (:Document {title: 'Spec', id: '1'})",
+        )
+        .await
+        .unwrap();
+
+    let projected = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id = '1' AS text_id, n.id = 1 AS number_id
+             ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&projected),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string(), "true".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string(), "false".to_string()],
+            vec!["NULL".to_string(), "true".to_string(), "NULL".to_string()],
+        ]
+    );
+
+    let wrapped = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id = '1' OR FALSE AS eq
+             ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&wrapped),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string()],
+            vec!["NULL".to_string(), "true".to_string()],
+        ]
+    );
+
+    let selected = session
+        .query(
+            "MATCH (n:Person|Document)
+             SELECT n.name AS name WHERE n.id = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&selected), vec![vec!["NULL".to_string()]]);
+
+    let excluded = session
+        .query(
+            "MATCH (n:Person|Document)
+             SELECT n.name AS name WHERE NOT n.id = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(excluded.row_count(), 0);
+
+    let ordered = session
+        .query(
+            "MATCH (n:Person|Document)
+             ORDER BY n.id = '1', n.name
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&ordered),
+        vec![
+            vec!["NULL".to_string()],
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()]
+        ]
+    );
+
+    let grouped = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id = '1' AS eq, COUNT(*) AS c
+             GROUP BY n
+             ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&grouped),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string(), "1".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string(), "1".to_string()],
+            vec!["NULL".to_string(), "true".to_string(), "1".to_string()],
+        ]
+    );
+
+    let having = session
+        .query(
+            "MATCH (n:Person|Document)
+             SELECT n.name AS name GROUP BY n HAVING n.id = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&having), vec![vec!["NULL".to_string()]]);
+
+    let numeric = session
+        .query("MATCH (n:Person) RETURN n.name AS name, n.id = 1 AS eq ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&numeric),
+        vec![
+            vec!["Ada".to_string(), "true".to_string()],
+            vec!["Bea".to_string(), "false".to_string()]
+        ]
+    );
+}
