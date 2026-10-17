@@ -201,7 +201,6 @@ pub(super) fn result(
     scope: &Bindings,
     body: &ast::QueryBody,
 ) -> Result<LogicalPlanBuilder> {
-    let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
     let mut aliases = BTreeMap::new();
     let mut result_scope = scope.clone();
     let mut projections = Vec::new();
@@ -211,7 +210,9 @@ pub(super) fn result(
                 return Err(Error::InvalidQuery("wildcard cannot have an alias".into()));
             }
             for name in &scope.order {
-                let expr = binder.bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?;
+                let expr = Binder::with_bindings(session, plan.schema(), scope)
+                    .aggregating()
+                    .bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?;
                 if aliases.insert(name.clone(), expr.clone()).is_some() {
                     return Err(Error::InvalidQuery("duplicate result column".into()));
                 }
@@ -226,7 +227,9 @@ pub(super) fn result(
                     ast::Expr::Identifier(name) => name.value.clone(),
                     _ => format!("column_{}", i + 1),
                 });
-            let expr = binder.bind(&item.expr)?;
+            let (next, expr) =
+                super::native::bind_stored_value(plan, session, scope, &item.expr, true, None)?;
+            plan = next;
             if aliases.insert(name.clone(), expr.clone()).is_some() {
                 return Err(Error::InvalidQuery(format!(
                     "duplicate result column {name}"
@@ -260,6 +263,19 @@ pub(super) fn result(
         return Err(Error::InvalidQuery("result has no bound columns".into()));
     }
     let scope = &result_scope;
+    let mut ordering = Vec::new();
+    for item in &body.order_by {
+        let (next, expr) = super::native::bind_stored_value(
+            plan,
+            session,
+            scope,
+            &item.expr,
+            true,
+            Some(&aliases),
+        )?;
+        plan = next;
+        ordering.push(expr);
+    }
     let binder = Binder::with_bindings(session, plan.schema(), scope)
         .aggregating()
         .aliases(&aliases);
@@ -268,11 +284,6 @@ pub(super) fn result(
         .as_ref()
         .map(|p| binder.predicate(p))
         .transpose()?;
-    let ordering = body
-        .order_by
-        .iter()
-        .map(|o| binder.bind(&o.expr))
-        .collect::<Result<Vec<_>>>()?;
     let mut all_expressions: Vec<_> = projections.iter().map(|(_, e)| e).collect();
     all_expressions.extend(having.iter());
     all_expressions.extend(&ordering);

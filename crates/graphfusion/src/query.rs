@@ -549,20 +549,21 @@ async fn plan_body(
                     if item.typed || item.value_type.is_some() {
                         return Err(unsupported("typed LET definitions"));
                     }
-                    let binder = Binder::with_bindings(session, plan.schema(), &scope);
                     if scope.contains(&item.name.value) {
                         return Err(Error::InvalidQuery(format!(
                             "variable {} is already bound",
                             item.name.value
                         )));
                     }
+                    let (next, expression) =
+                        native::bind_stored_value(plan, session, &scope, &item.value, false, None)?;
+                    plan = next;
                     let mut expressions: Vec<_> = plan
                         .schema()
                         .columns()
                         .into_iter()
                         .map(Expr::Column)
                         .collect();
-                    let expression = binder.bind(&item.value)?;
                     let domain = references::domain(&item.value, &scope);
                     let column = scope.scalar(&item.name.value);
                     if let Some(domain) = domain {
@@ -683,23 +684,26 @@ fn order_and_page(
     scope: Option<&graph::Bindings>,
 ) -> Result<LogicalPlanBuilder> {
     if !ordering.is_empty() {
-        let binder = match scope {
-            Some(scope) => Binder::with_bindings(session, plan.schema(), scope),
-            None => Binder::new(session, plan.schema()),
-        };
-        let sorts = ordering
-            .iter()
-            .map(|item| {
-                let ascending = item.direction != Some(ast::SortDirection::Desc);
-                // Nulls sort as the greatest values unless explicitly specified.
-                let nulls_first = match item.null_ordering {
-                    Some(ast::NullOrdering::First) => true,
-                    Some(ast::NullOrdering::Last) => false,
-                    None => !ascending,
-                };
-                Ok(binder.bind(&item.expr)?.sort(ascending, nulls_first))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut sorts = Vec::new();
+        for item in ordering {
+            let ascending = item.direction != Some(ast::SortDirection::Desc);
+            // Nulls sort as the greatest values unless explicitly specified.
+            let nulls_first = match item.null_ordering {
+                Some(ast::NullOrdering::First) => true,
+                Some(ast::NullOrdering::Last) => false,
+                None => !ascending,
+            };
+            let expr = match scope {
+                Some(scope) => {
+                    let (next, expr) =
+                        native::bind_stored_value(plan, session, scope, &item.expr, false, None)?;
+                    plan = next;
+                    expr
+                }
+                None => Binder::new(session, plan.schema()).bind(&item.expr)?,
+            };
+            sorts.push(expr.sort(ascending, nulls_first));
+        }
         plan = plan.sort(sorts)?;
     }
     if offset.is_some() || limit.is_some() {
