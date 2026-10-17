@@ -21,6 +21,12 @@ pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// `IS NULL` / `IS NOT NULL`. `property` is `None` when the test is on the
+    /// element itself (`n IS NULL`), which reads the fragment id.
+    Null {
+        property: Option<String>,
+        negated: bool,
+    },
     Compare {
         property: String,
         op: Operator,
@@ -89,7 +95,8 @@ impl NativePush {
 /// Split a match-level `WHERE` into per-variable fragment predicates.
 ///
 /// `AND` can be split across variables. `OR` and `NOT` stay together, so they
-/// are pushed only when every comparison names the same variable. A value that
+/// are pushed only when every comparison or null test names the same variable.
+/// A null test stays with that variable's stored-type comparison. A value that
 /// reads another column stays on the unified plan.
 pub(super) fn clause_filters(
     session: &SessionState,
@@ -128,6 +135,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(right, tables)
         }
         NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Null { .. } => Ok(()),
         NativeAtom::Compare {
             property,
             value_type,
@@ -158,6 +166,7 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
         NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
         NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::Null { property, negated } => null_expr(schema, property.as_deref(), *negated),
         NativeAtom::Compare {
             property,
             op,
@@ -212,6 +221,28 @@ fn unknown() -> Expr {
     lit(ScalarValue::Boolean(None))
 }
 
+/// A missing property is null on that fragment. `IS NOT NULL` is therefore
+/// false for every row, rather than unknown.
+fn null_expr(schema: &Schema, property: Option<&str>, negated: bool) -> Expr {
+    let Some(name) = property else {
+        let id = column(crate::graph::ID);
+        return if negated {
+            id.is_not_null()
+        } else {
+            id.is_null()
+        };
+    };
+    if schema.field_with_name(name).is_err() {
+        return lit(!negated);
+    }
+    let value = column(name);
+    if negated {
+        value.is_not_null()
+    } else {
+        value.is_null()
+    }
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -227,6 +258,13 @@ enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Null {
+        property: String,
+        negated: bool,
+    },
+    ElementNull {
+        negated: bool,
+    },
     Atom {
         property: String,
         op: Operator,
@@ -290,11 +328,24 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
+        ast::Expr::IsNull { expr, negated } => null_test(expr, variable, *negated),
         other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
             property,
             op,
             value,
         }),
+    }
+}
+
+fn null_test(expr: &ast::Expr, variable: &str, negated: bool) -> Option<Local> {
+    if let Some(property) = property_of(expr, variable) {
+        return Some(Local::Null { property, negated });
+    }
+    match expr {
+        ast::Expr::Identifier(name) if name.value == variable => {
+            Some(Local::ElementNull { negated })
+        }
+        _ => None,
     }
 }
 
@@ -370,6 +421,14 @@ fn bind_local(
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
         }
+        Local::Null { property, negated } => Some(NativeAtom::Null {
+            property: Some(property.clone()),
+            negated: *negated,
+        }),
+        Local::ElementNull { negated } => Some(NativeAtom::Null {
+            property: None,
+            negated: *negated,
+        }),
         Local::Atom {
             property,
             op,
@@ -407,6 +466,11 @@ fn bind_closed(
 fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
     if let ast::Expr::Property { base, .. } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
+            names.insert(name.value.clone());
+        }
+    }
+    if let ast::Expr::IsNull { expr, .. } = expr {
+        if let ast::Expr::Identifier(name) = expr.as_ref() {
             names.insert(name.value.clone());
         }
     }
