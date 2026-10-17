@@ -469,6 +469,11 @@ impl<'a> Binder<'a> {
                 quantifier,
                 args,
             } if self.aggregates => {
+                if matches!(name.value.to_ascii_uppercase().as_str(), "MIN" | "MAX") {
+                    for arg in args {
+                        self.one_aggregate_family(&name.value, arg)?;
+                    }
+                }
                 let star = args.len() == 1 && matches!(args[0], E::Wildcard);
                 let bound = if star {
                     vec![]
@@ -500,12 +505,90 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// MIN and MAX need one comparable family. Integers and floats are one
+    /// family and already widen; boolean, string and byte-string values do not
+    /// collapse into that number or into each other.
+    fn one_aggregate_family(&self, name: &str, expr: &ast::Expr) -> Result<()> {
+        let Some(types) = stored_property_types(self.bindings, expr) else {
+            return Ok(());
+        };
+        let mut families = Vec::new();
+        for data_type in &types {
+            let family = aggregate_family(data_type);
+            if !families.contains(&family) {
+                families.push(family);
+            }
+        }
+        if families.len() <= 1 {
+            return Ok(());
+        }
+        let mut labels: Vec<_> = types.iter().map(ToString::to_string).collect();
+        labels.sort();
+        Err(Error::InvalidQuery(format!(
+            "{} cannot combine {}",
+            name.to_ascii_uppercase(),
+            labels.join(" and ")
+        )))
+    }
+
     fn compatible(&self, expressions: &[Expr]) -> Result<()> {
         let mut previous = DataType::Null;
         for expr in expressions {
             previous = common_value_type(&previous, &expr.get_type(self.schema)?)?;
         }
         Ok(())
+    }
+}
+
+fn stored_property_types(
+    bindings: Option<&super::graph::Bindings>,
+    expr: &ast::Expr,
+) -> Option<Vec<DataType>> {
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    let bindings = bindings?;
+    let element = bindings.elements.get(&name.value)?;
+    let graph = bindings.sources.get(&element.graph)?;
+    let mut types = Vec::new();
+    for labels in &element.source_labels {
+        let matched: Vec<&crate::graph::Table> = match element.kind {
+            super::graph::ElementKind::Node => graph
+                .nodes
+                .iter()
+                .map(|table| &table.0)
+                .filter(|table| &table.labels == labels)
+                .collect(),
+            super::graph::ElementKind::Edge => graph
+                .edges
+                .iter()
+                .map(|table| &table.table)
+                .filter(|table| &table.labels == labels)
+                .collect(),
+        };
+        for table in matched {
+            let Some(field) = table.schema.field_with_name(&key.value).ok() else {
+                continue;
+            };
+            let data_type = field.data_type().clone();
+            if !types.contains(&data_type) {
+                types.push(data_type);
+            }
+        }
+    }
+    Some(types)
+}
+
+fn aggregate_family(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Int64 | DataType::Float64 => "numeric".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytes".to_string(),
+        other => other.to_string(),
     }
 }
 

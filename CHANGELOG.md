@@ -12,6 +12,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Reject `MIN` and `MAX` when a property's selected fragments are not one
+  comparable family. Integers and floats still widen; a string fragment no
+  longer makes the extreme a lexicographic value.
 
 ## 0.2.0 — 2026-10-05
 
