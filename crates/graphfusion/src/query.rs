@@ -574,9 +574,7 @@ async fn plan_body(
                 }
             }
             ast::QueryClause::Filter(clause) => {
-                let expr = Binder::with_bindings(session, plan.schema(), &scope)
-                    .predicate(&clause.predicate)?;
-                plan = plan.filter(expr)?;
+                plan = native::apply_filter_operator(plan, session, &scope, &clause.predicate)?;
             }
             ast::QueryClause::OrderByPage(clause) => {
                 plan = order_and_page(
