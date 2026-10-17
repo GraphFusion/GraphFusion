@@ -3,7 +3,6 @@ mod groups;
 mod union;
 use super::{
     execution::{self, Trace},
-    expressions::Binder,
     graph::{self, Bindings, ElementKind},
     native::{NativeAtom, NativePush},
     paths::{self, Selection, State},
@@ -81,7 +80,7 @@ impl Compiler<'_> {
     pub(super) fn apply_predicates(
         &mut self,
         mut plan: Plan,
-        scope: &Bindings,
+        scope: &mut Bindings,
         start: usize,
     ) -> Result<Plan> {
         for p in self.predicates.split_off(start) {
@@ -596,9 +595,7 @@ impl Compiler<'_> {
             Box::pin(self.pattern(plan, scope, &group.pattern, endpoint, finite, false)).await?;
         plan = plan.filter(state.valid(mode, self.different))?;
         if let Some(predicate) = &group.where_clause {
-            let value =
-                Binder::with_bindings(self.session, plan.schema(), scope).predicate(predicate)?;
-            plan = plan.filter(value)?;
+            plan = graph::filter_or_unified(plan, scope, self.session, predicate)?;
         }
         if let Some(name) = &group.variable {
             plan = self.bind_path(plan, scope, &name.value, &state)?;
@@ -676,7 +673,7 @@ impl Compiler<'_> {
                 finite,
             ))
             .await?;
-            let plan = self.apply_predicates(plan, &branch_scope, predicate_start)?;
+            let plan = self.apply_predicates(plan, &mut branch_scope, predicate_start)?;
             scope.advance(&branch_scope);
             branches.push((plan, branch_scope, state));
         }

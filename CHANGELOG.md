@@ -12,6 +12,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Compare two properties on each fragment's stored type. A mixed scan no longer
+  orders integers as text or treats an integer as equal to that text on another
+  element. The comparison applies in WHERE, parenthesized path predicates,
+  FILTER, property maps, RETURN, SELECT, HAVING, and ORDER BY.
 
 ## 0.2.0 — 2026-10-05
 

@@ -549,20 +549,23 @@ async fn plan_body(
                     if item.typed || item.value_type.is_some() {
                         return Err(unsupported("typed LET definitions"));
                     }
-                    let binder = Binder::with_bindings(session, plan.schema(), &scope);
                     if scope.contains(&item.name.value) {
                         return Err(Error::InvalidQuery(format!(
                             "variable {} is already bound",
                             item.name.value
                         )));
                     }
+                    // Keep the pre-join columns. The comparison may read fragment
+                    // columns, but those stay internal to this expression.
                     let mut expressions: Vec<_> = plan
                         .schema()
                         .columns()
                         .into_iter()
                         .map(Expr::Column)
                         .collect();
-                    let expression = binder.bind(&item.value)?;
+                    let (next, expression) =
+                        bind_or_pair(plan, &mut scope, session, &item.value, false)?;
+                    plan = next;
                     let domain = references::domain(&item.value, &scope);
                     let column = scope.scalar(&item.name.value);
                     if let Some(domain) = domain {
@@ -574,9 +577,9 @@ async fn plan_body(
                 }
             }
             ast::QueryClause::Filter(clause) => {
-                let expr = Binder::with_bindings(session, plan.schema(), &scope)
-                    .predicate(&clause.predicate)?;
-                plan = plan.filter(expr)?;
+                let (next, expr) =
+                    bind_or_pair(plan, &mut scope, session, &clause.predicate, true)?;
+                plan = next.filter(expr)?;
             }
             ast::QueryClause::OrderByPage(clause) => {
                 plan = order_and_page(
@@ -585,7 +588,7 @@ async fn plan_body(
                     &clause.order_by,
                     clause.offset.as_ref(),
                     clause.limit.as_ref(),
-                    Some(&scope),
+                    Some(&mut scope),
                 )?;
             }
             clause if mutations::is_mutation(clause) => {
@@ -665,13 +668,35 @@ async fn plan_body(
     trace.sources.extend(scope.sources.clone());
     trace.output_domains = references::result_domains(body, &scope);
     if let Some(predicate) = &body.select_where {
-        let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
-        plan = plan.filter(expr)?;
+        let (next, expr) = bind_or_pair(plan, &mut scope, session, predicate, true)?;
+        plan = next.filter(expr)?;
     }
     Ok((
-        aggregates::result(plan, session, &scope, body)?.build()?,
+        aggregates::result(plan, session, &mut scope, body)?.build()?,
         current_graph,
     ))
+}
+
+/// A property-to-property comparison keeps each fragment's stored type.
+/// Anything else stays on the unified columns.
+fn bind_or_pair(
+    plan: LogicalPlanBuilder,
+    scope: &mut graph::Bindings,
+    session: &SessionState,
+    expr: &ast::Expr,
+    predicate: bool,
+) -> Result<(LogicalPlanBuilder, Expr)> {
+    let (plan, pair) = native::property_pair(plan, scope, session, expr)?;
+    if let Some(pair) = pair {
+        return Ok((plan, pair.expr));
+    }
+    let binder = Binder::with_bindings(session, plan.schema(), scope);
+    let bound = if predicate {
+        binder.predicate(expr)?
+    } else {
+        binder.bind(expr)?
+    };
+    Ok((plan, bound))
 }
 
 fn order_and_page(
@@ -680,26 +705,28 @@ fn order_and_page(
     ordering: &[ast::OrderByItem],
     offset: Option<&ast::UnsignedIntegerSpecification>,
     limit: Option<&ast::UnsignedIntegerSpecification>,
-    scope: Option<&graph::Bindings>,
+    mut scope: Option<&mut graph::Bindings>,
 ) -> Result<LogicalPlanBuilder> {
     if !ordering.is_empty() {
-        let binder = match scope {
-            Some(scope) => Binder::with_bindings(session, plan.schema(), scope),
-            None => Binder::new(session, plan.schema()),
-        };
-        let sorts = ordering
-            .iter()
-            .map(|item| {
-                let ascending = item.direction != Some(ast::SortDirection::Desc);
-                // Nulls sort as the greatest values unless explicitly specified.
-                let nulls_first = match item.null_ordering {
-                    Some(ast::NullOrdering::First) => true,
-                    Some(ast::NullOrdering::Last) => false,
-                    None => !ascending,
-                };
-                Ok(binder.bind(&item.expr)?.sort(ascending, nulls_first))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut sorts = Vec::new();
+        for item in ordering {
+            let ascending = item.direction != Some(ast::SortDirection::Desc);
+            // Nulls sort as the greatest values unless explicitly specified.
+            let nulls_first = match item.null_ordering {
+                Some(ast::NullOrdering::First) => true,
+                Some(ast::NullOrdering::Last) => false,
+                None => !ascending,
+            };
+            let bound = match scope.as_mut() {
+                Some(scope) => {
+                    let (next, expr) = bind_or_pair(plan, scope, session, &item.expr, false)?;
+                    plan = next;
+                    expr
+                }
+                None => Binder::new(session, plan.schema()).bind(&item.expr)?,
+            };
+            sorts.push(bound.sort(ascending, nulls_first));
+        }
         plan = plan.sort(sorts)?;
     }
     if offset.is_some() || limit.is_some() {

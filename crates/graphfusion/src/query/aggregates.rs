@@ -198,18 +198,21 @@ fn percentile_fraction(value: Expr) -> Expr {
 pub(super) fn result(
     mut plan: LogicalPlanBuilder,
     session: &SessionState,
-    scope: &Bindings,
+    scope: &mut Bindings,
     body: &ast::QueryBody,
 ) -> Result<LogicalPlanBuilder> {
-    let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
     let mut aliases = BTreeMap::new();
     let mut result_scope = scope.clone();
     let mut projections = Vec::new();
+    // Fragment columns of a stored pair comparison. They are group keys only
+    // when every element id the comparison reads is already grouped.
+    let mut stored_pairs: Vec<(Expr, Vec<Expr>)> = Vec::new();
     for (i, item) in body.result_clause.items.iter().enumerate() {
         if matches!(item.expr, ast::Expr::Wildcard) {
             if item.alias.is_some() {
                 return Err(Error::InvalidQuery("wildcard cannot have an alias".into()));
             }
+            let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
             for name in &scope.order {
                 let expr = binder.bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?;
                 if aliases.insert(name.clone(), expr.clone()).is_some() {
@@ -226,7 +229,18 @@ pub(super) fn result(
                     ast::Expr::Identifier(name) => name.value.clone(),
                     _ => format!("column_{}", i + 1),
                 });
-            let expr = binder.bind(&item.expr)?;
+            let (next, pair) = super::native::property_pair(plan, scope, session, &item.expr)?;
+            plan = next;
+            let expr = if let Some(pair) = pair {
+                stored_pairs.push((pair.expr.clone(), pair.ids));
+                pair.expr
+            } else {
+                // Projection aliases are simultaneous, so this item cannot see
+                // a name introduced earlier in the same result list.
+                Binder::with_bindings(session, plan.schema(), scope)
+                    .aggregating()
+                    .bind(&item.expr)?
+            };
             if aliases.insert(name.clone(), expr.clone()).is_some() {
                 return Err(Error::InvalidQuery(format!(
                     "duplicate result column {name}"
@@ -259,20 +273,39 @@ pub(super) fn result(
     if projections.is_empty() {
         return Err(Error::InvalidQuery("result has no bound columns".into()));
     }
-    let scope = &result_scope;
-    let binder = Binder::with_bindings(session, plan.schema(), scope)
-        .aggregating()
-        .aliases(&aliases);
-    let having = body
-        .having
-        .as_ref()
-        .map(|p| binder.predicate(p))
-        .transpose()?;
-    let ordering = body
-        .order_by
-        .iter()
-        .map(|o| binder.bind(&o.expr))
-        .collect::<Result<Vec<_>>>()?;
+    result_scope.advance(scope);
+    let having = match &body.having {
+        Some(predicate) => {
+            let (next, pair) =
+                super::native::property_pair(plan, &mut result_scope, session, predicate)?;
+            plan = next;
+            Some(if let Some(pair) = pair {
+                stored_pairs.push((pair.expr.clone(), pair.ids));
+                pair.expr
+            } else {
+                Binder::with_bindings(session, plan.schema(), &result_scope)
+                    .aggregating()
+                    .aliases(&aliases)
+                    .predicate(predicate)?
+            })
+        }
+        None => None,
+    };
+    let mut ordering = Vec::new();
+    for item in &body.order_by {
+        let (next, pair) =
+            super::native::property_pair(plan, &mut result_scope, session, &item.expr)?;
+        plan = next;
+        ordering.push(if let Some(pair) = pair {
+            stored_pairs.push((pair.expr.clone(), pair.ids));
+            pair.expr
+        } else {
+            Binder::with_bindings(session, plan.schema(), &result_scope)
+                .aggregating()
+                .aliases(&aliases)
+                .bind(&item.expr)?
+        });
+    }
     let mut all_expressions: Vec<_> = projections.iter().map(|(_, e)| e).collect();
     all_expressions.extend(having.iter());
     all_expressions.extend(&ordering);
@@ -280,11 +313,17 @@ pub(super) fn result(
     let explicit = !body.group_by.is_empty() || body.empty_grouping_set;
     let grouped = explicit || !aggregates.is_empty() || having.is_some();
     let mut groups = Vec::new();
+    let group_binder = Binder::with_bindings(session, plan.schema(), &result_scope)
+        .aggregating()
+        .aliases(&aliases);
     if explicit {
         for expr in &body.group_by {
             if let ast::Expr::Identifier(name) = expr {
-                if let Some(reference) = scope.references.get(&name.value) {
-                    let scalar = scope.scalars.get(&name.value).expect("scalar reference");
+                if let Some(reference) = result_scope.references.get(&name.value) {
+                    let scalar = result_scope
+                        .scalars
+                        .get(&name.value)
+                        .expect("scalar reference");
                     groups.push(Expr::Column(scalar.clone()));
                     groups.extend(
                         plan.schema()
@@ -293,7 +332,7 @@ pub(super) fn result(
                             .filter(|c| {
                                 c.relation.as_ref().is_some_and(|r| {
                                     reference.parts.iter().any(|p| r.table() == p.alias)
-                                        || scope
+                                        || result_scope
                                             .elements
                                             .get(&name.value)
                                             .is_some_and(|p| r.table() == p.alias)
@@ -303,7 +342,7 @@ pub(super) fn result(
                     );
                     continue;
                 }
-                if let Some(binding) = scope.elements.get(&name.value) {
+                if let Some(binding) = result_scope.elements.get(&name.value) {
                     groups.extend(
                         plan.schema()
                             .columns()
@@ -318,7 +357,7 @@ pub(super) fn result(
                     continue;
                 }
             }
-            let group = binder.bind(expr)?;
+            let group = group_binder.bind(expr)?;
             if !find_aggregate_exprs([&group]).is_empty() {
                 return Err(Error::InvalidQuery("aggregate in GROUP BY".into()));
             }
@@ -336,6 +375,20 @@ pub(super) fn result(
             }
         }
     }
+    if grouped {
+        for (expr, ids) in &stored_pairs {
+            if ids.is_empty() || !ids.iter().all(|id| groups.contains(id)) {
+                continue;
+            }
+            for column in expr.column_refs() {
+                let column = Expr::Column(column.clone());
+                if !groups.contains(&column) {
+                    groups.push(column);
+                }
+            }
+        }
+    }
+    scope.advance(&result_scope);
     let mut mapping = Vec::new();
     if grouped {
         if groups.is_empty() && aggregates.is_empty() {

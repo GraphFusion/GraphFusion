@@ -7,12 +7,17 @@
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
 //! unknown stays unknown and does not keep the row.
 
-use super::{expressions::Binder, graph::Bindings};
+use super::{
+    expressions::Binder,
+    graph::{Bindings, ElementBinding, ElementKind},
+};
 use crate::{gql as ast, graph::Table, Error, Result, SessionState};
 use datafusion::{
-    arrow::datatypes::{DataType, Schema},
-    common::{Column, DFSchema, ScalarValue},
-    logical_expr::{cast, lit, Expr, ExprSchemable, Operator},
+    arrow::datatypes::{DataType, Schema, SchemaRef},
+    common::{Column, DFSchema, ScalarValue, TableReference},
+    datasource::provider_as_source,
+    functions::core::expr_fn::coalesce,
+    logical_expr::{cast, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -549,4 +554,638 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
         | E::IsLabeled { .. }
         | E::Identifier(_) => vec![],
     }
+}
+
+/// A property-to-property comparison compiled on stored fragment types.
+pub(super) struct PropertyPair {
+    pub expr: Expr,
+    pub ids: Vec<Expr>,
+}
+
+/// Equality of a pattern property and another element's property, using stored
+/// types when a unified column would compare integers as text.
+pub(super) fn equated_property(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    _session: &SessionState,
+    binding: &ElementBinding,
+    property: &str,
+    value: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
+    let Some((right_name, right_property)) = element_property(value, scope) else {
+        return Ok((plan, None));
+    };
+    let Some(right) = scope.elements.get(&right_name).cloned() else {
+        return Ok((plan, None));
+    };
+    if !pair_needs_stored_types(scope, binding, property, &right, &right_property) {
+        return Ok((plan, None));
+    }
+    let (plan, expr) = compile_property_pair(
+        plan,
+        scope,
+        binding,
+        property,
+        Operator::Eq,
+        &right,
+        &right_property,
+    )?;
+    Ok((plan, Some(expr)))
+}
+
+/// Boolean tree containing a property-to-property comparison. `None` leaves the
+/// unified columns in place: either the tree is not that comparison, or every
+/// stored pair already agrees with them.
+pub(super) fn property_pair(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    expr: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Option<PropertyPair>)> {
+    let Some(tree) = pair_tree(session, plan.schema(), scope, expr) else {
+        return Ok((plan, None));
+    };
+    if !tree_needs_stored_types(scope, &tree) {
+        return Ok((plan, None));
+    }
+    let mut joined = Joined {
+        plan,
+        scope,
+        fragments: BTreeMap::new(),
+    };
+    let expr = joined.compile(&tree)?;
+    let ids = tree_variables(&tree)
+        .into_iter()
+        .map(|name| {
+            joined
+                .scope
+                .elements
+                .get(&name)
+                .expect("pair element")
+                .column(crate::graph::ID)
+        })
+        .collect();
+    Ok((joined.plan, Some(PropertyPair { expr, ids })))
+}
+
+enum PairNode {
+    And(Box<PairNode>, Box<PairNode>),
+    Or(Box<PairNode>, Box<PairNode>),
+    Xor(Box<PairNode>, Box<PairNode>),
+    Not(Box<PairNode>),
+    Closed(Expr),
+    One {
+        variable: String,
+        property: String,
+        op: Operator,
+        value: Expr,
+        value_type: DataType,
+    },
+    Pair {
+        left: String,
+        left_property: String,
+        op: Operator,
+        right: String,
+        right_property: String,
+    },
+}
+
+fn pair_tree(
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    expr: &ast::Expr,
+) -> Option<PairNode> {
+    use ast::Expr as E;
+    match expr {
+        E::Binary {
+            left,
+            op: ast::BinaryOp::And,
+            right,
+        } => Some(PairNode::And(
+            Box::new(pair_tree(session, schema, scope, left)?),
+            Box::new(pair_tree(session, schema, scope, right)?),
+        )),
+        E::Binary {
+            left,
+            op: ast::BinaryOp::Or,
+            right,
+        } => Some(PairNode::Or(
+            Box::new(pair_tree(session, schema, scope, left)?),
+            Box::new(pair_tree(session, schema, scope, right)?),
+        )),
+        E::Binary {
+            left,
+            op: ast::BinaryOp::Xor,
+            right,
+        } => Some(PairNode::Xor(
+            Box::new(pair_tree(session, schema, scope, left)?),
+            Box::new(pair_tree(session, schema, scope, right)?),
+        )),
+        E::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => Some(PairNode::Not(Box::new(pair_tree(
+            session, schema, scope, expr,
+        )?))),
+        other => comparison_node(session, schema, scope, other).or_else(|| {
+            let bound = Binder::with_bindings(session, schema, scope)
+                .bind(other)
+                .ok()?;
+            if !bound.column_refs().is_empty() {
+                return None;
+            }
+            let data_type = bound.get_type(schema).ok()?;
+            matches!(data_type, DataType::Boolean | DataType::Null)
+                .then_some(PairNode::Closed(bound))
+        }),
+    }
+}
+
+fn comparison_node(
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    expr: &ast::Expr,
+) -> Option<PairNode> {
+    let ast::Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    let op = match op {
+        ast::BinaryOp::Eq => Operator::Eq,
+        ast::BinaryOp::Neq => Operator::NotEq,
+        ast::BinaryOp::Lt => Operator::Lt,
+        ast::BinaryOp::Le => Operator::LtEq,
+        ast::BinaryOp::Gt => Operator::Gt,
+        ast::BinaryOp::Ge => Operator::GtEq,
+        _ => return None,
+    };
+    if let (Some((left_name, left_property)), Some((right_name, right_property))) = (
+        element_property(left, scope),
+        element_property(right, scope),
+    ) {
+        return Some(PairNode::Pair {
+            left: left_name,
+            left_property,
+            op,
+            right: right_name,
+            right_property,
+        });
+    }
+    if let Some((variable, property)) = element_property(left, scope) {
+        let (value, value_type) = bind_closed(session, schema, scope, right).ok().flatten()?;
+        return Some(PairNode::One {
+            variable,
+            property,
+            op,
+            value,
+            value_type,
+        });
+    }
+    if let Some((variable, property)) = element_property(right, scope) {
+        let (value, value_type) = bind_closed(session, schema, scope, left).ok().flatten()?;
+        return Some(PairNode::One {
+            variable,
+            property,
+            op: flip(op),
+            value,
+            value_type,
+        });
+    }
+    None
+}
+
+fn element_property(expr: &ast::Expr, scope: &Bindings) -> Option<(String, String)> {
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    scope
+        .elements
+        .contains_key(&name.value)
+        .then(|| (name.value.clone(), key.value.clone()))
+}
+
+fn tree_needs_stored_types(scope: &Bindings, node: &PairNode) -> bool {
+    match node {
+        PairNode::And(left, right) | PairNode::Or(left, right) | PairNode::Xor(left, right) => {
+            tree_needs_stored_types(scope, left) || tree_needs_stored_types(scope, right)
+        }
+        PairNode::Not(inner) => tree_needs_stored_types(scope, inner),
+        PairNode::Closed(_) | PairNode::One { .. } => false,
+        PairNode::Pair {
+            left,
+            left_property,
+            right,
+            right_property,
+            ..
+        } => {
+            let Some(left_binding) = scope.elements.get(left) else {
+                return false;
+            };
+            let Some(right_binding) = scope.elements.get(right) else {
+                return false;
+            };
+            pair_needs_stored_types(
+                scope,
+                left_binding,
+                left_property,
+                right_binding,
+                right_property,
+            )
+        }
+    }
+}
+
+fn tree_variables(node: &PairNode) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    fn walk(node: &PairNode, names: &mut BTreeSet<String>) {
+        match node {
+            PairNode::And(left, right) | PairNode::Or(left, right) | PairNode::Xor(left, right) => {
+                walk(left, names);
+                walk(right, names);
+            }
+            PairNode::Not(inner) => walk(inner, names),
+            PairNode::Closed(_) => {}
+            PairNode::One { variable, .. } => {
+                names.insert(variable.clone());
+            }
+            PairNode::Pair { left, right, .. } => {
+                names.insert(left.clone());
+                names.insert(right.clone());
+            }
+        }
+    }
+    walk(node, &mut names);
+    names
+}
+
+fn pair_needs_stored_types(
+    scope: &Bindings,
+    left: &ElementBinding,
+    left_property: &str,
+    right: &ElementBinding,
+    right_property: &str,
+) -> bool {
+    let left_tables = fragment_tables(scope, left);
+    let right_tables = fragment_tables(scope, right);
+    let mut comparable_pair = false;
+    let mut disagree = false;
+    for left_table in &left_tables {
+        for right_table in &right_tables {
+            match (
+                left_table.schema.field_with_name(left_property).ok(),
+                right_table.schema.field_with_name(right_property).ok(),
+            ) {
+                (Some(left_field), Some(right_field))
+                    if comparable(left_field.data_type(), right_field.data_type()) =>
+                {
+                    comparable_pair = true;
+                    if !(left_field.data_type() == right_field.data_type()
+                        || (left_field.data_type().is_numeric()
+                            && right_field.data_type().is_numeric()))
+                    {
+                        disagree = true;
+                    }
+                }
+                (Some(_), Some(_)) => disagree = true,
+                _ => {}
+            }
+        }
+    }
+    comparable_pair
+        && (disagree
+            || property_type_mixes(&left_tables, left_property)
+            || property_type_mixes(&right_tables, right_property))
+}
+
+fn property_type_mixes(tables: &[&Table], property: &str) -> bool {
+    let mut seen: Vec<&DataType> = Vec::new();
+    for table in tables {
+        let Some(field) = table.schema.field_with_name(property).ok() else {
+            continue;
+        };
+        let data_type = field.data_type();
+        if seen.iter().any(|previous| {
+            *previous != data_type && !(previous.is_numeric() && data_type.is_numeric())
+        }) {
+            return true;
+        }
+        if !seen.contains(&data_type) {
+            seen.push(data_type);
+        }
+    }
+    false
+}
+
+fn fragment_tables<'a>(scope: &'a Bindings, binding: &ElementBinding) -> Vec<&'a Table> {
+    let Some(data) = scope.sources.get(&binding.graph) else {
+        return Vec::new();
+    };
+    let tables: Vec<&Table> = match binding.kind {
+        ElementKind::Node => data.nodes.iter().map(|node| &node.0).collect(),
+        ElementKind::Edge => data.edges.iter().map(|edge| &edge.table).collect(),
+    };
+    tables
+        .into_iter()
+        .filter(|table| {
+            binding
+                .source_labels
+                .iter()
+                .any(|labels| labels == &table.labels)
+        })
+        .collect()
+}
+
+struct Joined<'a> {
+    plan: LogicalPlanBuilder,
+    scope: &'a mut Bindings,
+    fragments: BTreeMap<String, Vec<(String, SchemaRef)>>,
+}
+
+impl Joined<'_> {
+    fn compile(&mut self, node: &PairNode) -> Result<Expr> {
+        Ok(match node {
+            PairNode::And(left, right) => self.compile(left)?.and(self.compile(right)?),
+            PairNode::Or(left, right) => self.compile(left)?.or(self.compile(right)?),
+            PairNode::Xor(left, right) => self.compile(left)?.not_eq(self.compile(right)?),
+            PairNode::Not(inner) => Expr::Not(Box::new(self.compile(inner)?)),
+            PairNode::Closed(expr) => expr.clone(),
+            PairNode::One {
+                variable,
+                property,
+                op,
+                value,
+                value_type,
+            } => {
+                let binding = self.scope.elements.get(variable).cloned().ok_or_else(|| {
+                    Error::InvalidQuery(format!("unbound element variable {variable}"))
+                })?;
+                ensure_literal(&fragment_tables(self.scope, &binding), property, value_type)?;
+                let fragments = self.attach(&binding)?;
+                coalesce_parts(fragments.iter().map(|(alias, schema)| {
+                    compare_property_qualified(
+                        schema,
+                        alias,
+                        property,
+                        *op,
+                        value.clone(),
+                        value_type,
+                    )
+                }))?
+            }
+            PairNode::Pair {
+                left,
+                left_property,
+                op,
+                right,
+                right_property,
+            } => {
+                let left_binding = self.scope.elements.get(left).cloned().ok_or_else(|| {
+                    Error::InvalidQuery(format!("unbound element variable {left}"))
+                })?;
+                let right_binding = self.scope.elements.get(right).cloned().ok_or_else(|| {
+                    Error::InvalidQuery(format!("unbound element variable {right}"))
+                })?;
+                self.property_pair(
+                    &left_binding,
+                    left_property,
+                    *op,
+                    &right_binding,
+                    right_property,
+                )?
+            }
+        })
+    }
+
+    fn property_pair(
+        &mut self,
+        left: &ElementBinding,
+        left_property: &str,
+        op: Operator,
+        right: &ElementBinding,
+        right_property: &str,
+    ) -> Result<Expr> {
+        ensure_pair(
+            &fragment_tables(self.scope, left),
+            left_property,
+            &fragment_tables(self.scope, right),
+            right_property,
+        )?;
+        let left_fragments = self.attach(left)?;
+        let right_fragments = if left.alias == right.alias {
+            left_fragments.clone()
+        } else {
+            self.attach(right)?
+        };
+        let mut parts = Vec::new();
+        for (left_alias, left_schema) in &left_fragments {
+            for (right_alias, right_schema) in &right_fragments {
+                if left.alias == right.alias && left_alias != right_alias {
+                    continue;
+                }
+                parts.push(compare_stored_columns(
+                    left_schema,
+                    left_alias,
+                    left_property,
+                    op,
+                    right_schema,
+                    right_alias,
+                    right_property,
+                ));
+            }
+        }
+        coalesce_parts(parts)
+    }
+
+    fn attach(&mut self, binding: &ElementBinding) -> Result<Vec<(String, SchemaRef)>> {
+        if let Some(existing) = self.fragments.get(&binding.alias) {
+            return Ok(existing.clone());
+        }
+        let tables = fragment_tables(self.scope, binding)
+            .into_iter()
+            .map(|table| (table.schema.clone(), table.provider.clone()))
+            .collect::<Vec<_>>();
+        let mut attached = Vec::new();
+        for (schema, provider) in tables {
+            let alias = self.scope.fresh("pair");
+            let scan =
+                LogicalPlanBuilder::scan(&alias, provider_as_source(provider), None)?.build()?;
+            let id = Expr::Column(Column::new(
+                Some(TableReference::bare(alias.as_str())),
+                crate::graph::ID,
+            ));
+            self.plan = std::mem::replace(&mut self.plan, LogicalPlanBuilder::empty(false))
+                .join_on(
+                    scan,
+                    JoinType::Left,
+                    [binding.column(crate::graph::ID).eq(id)],
+                )?;
+            attached.push((alias, schema));
+        }
+        self.fragments
+            .insert(binding.alias.clone(), attached.clone());
+        Ok(attached)
+    }
+}
+
+fn compile_property_pair(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    left: &ElementBinding,
+    left_property: &str,
+    op: Operator,
+    right: &ElementBinding,
+    right_property: &str,
+) -> Result<(LogicalPlanBuilder, Expr)> {
+    let mut joined = Joined {
+        plan,
+        scope,
+        fragments: BTreeMap::new(),
+    };
+    let expr = joined.property_pair(left, left_property, op, right, right_property)?;
+    Ok((joined.plan, expr))
+}
+
+fn ensure_literal(tables: &[&Table], property: &str, value_type: &DataType) -> Result<()> {
+    let mut stored = None;
+    for table in tables {
+        let Some(field) = table.schema.field_with_name(property).ok() else {
+            continue;
+        };
+        if comparable(field.data_type(), value_type) {
+            return Ok(());
+        }
+        stored.get_or_insert_with(|| field.data_type().clone());
+    }
+    match stored {
+        Some(stored) => Err(Error::InvalidQuery(format!(
+            "incomparable types {stored} and {value_type}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn ensure_pair(
+    left_tables: &[&Table],
+    left_property: &str,
+    right_tables: &[&Table],
+    right_property: &str,
+) -> Result<()> {
+    let mut left_type = None;
+    let mut right_type = None;
+    for left in left_tables {
+        for right in right_tables {
+            match (
+                left.schema.field_with_name(left_property).ok(),
+                right.schema.field_with_name(right_property).ok(),
+            ) {
+                (Some(left_field), Some(right_field))
+                    if comparable(left_field.data_type(), right_field.data_type()) =>
+                {
+                    return Ok(());
+                }
+                (Some(left_field), Some(right_field)) => {
+                    left_type.get_or_insert_with(|| left_field.data_type().clone());
+                    right_type.get_or_insert_with(|| right_field.data_type().clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    match (left_type, right_type) {
+        (Some(left_type), Some(right_type)) => Err(Error::InvalidQuery(format!(
+            "incomparable types {left_type} and {right_type}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn compare_property_qualified(
+    schema: &Schema,
+    alias: &str,
+    property: &str,
+    op: Operator,
+    value: Expr,
+    value_type: &DataType,
+) -> Result<Expr> {
+    let Some(stored) = schema
+        .field_with_name(property)
+        .ok()
+        .map(|field| field.data_type().clone())
+    else {
+        return Ok(unknown());
+    };
+    if !comparable(&stored, value_type) {
+        return Ok(unknown());
+    }
+    let mut left = qualified(alias, property);
+    let mut right = value;
+    if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
+        left = cast(left, DataType::Float64);
+        right = cast(right, DataType::Float64);
+    }
+    Ok(apply_op(left, op, right))
+}
+
+fn compare_stored_columns(
+    left_schema: &Schema,
+    left_alias: &str,
+    left_property: &str,
+    op: Operator,
+    right_schema: &Schema,
+    right_alias: &str,
+    right_property: &str,
+) -> Result<Expr> {
+    let Some(left_type) = left_schema
+        .field_with_name(left_property)
+        .ok()
+        .map(|field| field.data_type().clone())
+    else {
+        return Ok(unknown());
+    };
+    let Some(right_type) = right_schema
+        .field_with_name(right_property)
+        .ok()
+        .map(|field| field.data_type().clone())
+    else {
+        return Ok(unknown());
+    };
+    if !comparable(&left_type, &right_type) {
+        return Ok(unknown());
+    }
+    let mut left = qualified(left_alias, left_property);
+    let mut right = qualified(right_alias, right_property);
+    if left_type != right_type && left_type.is_numeric() && right_type.is_numeric() {
+        left = cast(left, DataType::Float64);
+        right = cast(right, DataType::Float64);
+    }
+    Ok(apply_op(left, op, right))
+}
+
+fn apply_op(left: Expr, op: Operator, right: Expr) -> Expr {
+    match op {
+        Operator::Eq => left.eq(right),
+        Operator::NotEq => left.not_eq(right),
+        Operator::Lt => left.lt(right),
+        Operator::LtEq => left.lt_eq(right),
+        Operator::Gt => left.gt(right),
+        Operator::GtEq => left.gt_eq(right),
+        _ => unknown(),
+    }
+}
+
+fn qualified(alias: &str, name: &str) -> Expr {
+    Expr::Column(Column::new(Some(TableReference::bare(alias)), name))
+}
+
+fn coalesce_parts(parts: impl IntoIterator<Item = Result<Expr>>) -> Result<Expr> {
+    let parts = parts.into_iter().collect::<Result<Vec<_>>>()?;
+    Ok(match parts.len() {
+        0 => unknown(),
+        1 => parts.into_iter().next().expect("comparison"),
+        _ => coalesce(parts),
+    })
 }
