@@ -620,7 +620,12 @@ fn scan_tables(
                 scan = scan.filter(col(graph::SOURCE).not_eq(col(graph::DESTINATION)))?;
             }
             if let Some(atom) = &native.filter {
-                scan = scan.filter(super::native::compile(atom, table.schema.as_ref())?)?;
+                let stored_direction = (kind == ElementKind::Edge).then_some(directed);
+                scan = scan.filter(super::native::compile(
+                    atom,
+                    table.schema.as_ref(),
+                    stored_direction,
+                )?)?;
             }
             let mut projections = vec![col(graph::ID)];
             if kind == ElementKind::Edge {

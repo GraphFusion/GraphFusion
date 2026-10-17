@@ -21,6 +21,10 @@ pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// `IS DIRECTED` / `IS NOT DIRECTED`, using the fragment's stored direction.
+    Directed {
+        negated: bool,
+    },
     Compare {
         property: String,
         op: Operator,
@@ -89,8 +93,9 @@ impl NativePush {
 /// Split a match-level `WHERE` into per-variable fragment predicates.
 ///
 /// `AND` can be split across variables. `OR` and `NOT` stay together, so they
-/// are pushed only when every comparison names the same variable. A value that
-/// reads another column stays on the unified plan.
+/// are pushed only when every comparison or direction test names the same
+/// variable. A direction test stays with that variable's stored-type
+/// comparison. A value that reads another column stays on the unified plan.
 pub(super) fn clause_filters(
     session: &SessionState,
     schema: &DFSchema,
@@ -128,6 +133,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(right, tables)
         }
         NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Directed { .. } => Ok(()),
         NativeAtom::Compare {
             property,
             value_type,
@@ -153,11 +159,21 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     }
 }
 
-pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
+pub(super) fn compile(atom: &NativeAtom, schema: &Schema, directed: Option<bool>) -> Result<Expr> {
     Ok(match atom {
-        NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
-        NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
-        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::And(left, right) => {
+            compile(left, schema, directed)?.and(compile(right, schema, directed)?)
+        }
+        NativeAtom::Or(left, right) => {
+            compile(left, schema, directed)?.or(compile(right, schema, directed)?)
+        }
+        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema, directed)?)),
+        NativeAtom::Directed { negated } => {
+            let Some(directed) = directed else {
+                return Err(Error::InvalidQuery("IS DIRECTED requires an edge".into()));
+            };
+            directed_expr(directed, *negated)
+        }
         NativeAtom::Compare {
             property,
             op,
@@ -212,6 +228,20 @@ fn unknown() -> Expr {
     lit(ScalarValue::Boolean(None))
 }
 
+/// A null element yields null. Stored edges always have an id, so the
+/// fragment's direction flag decides the rows this scan reads.
+fn directed_expr(directed: bool, negated: bool) -> Expr {
+    let holds = directed ^ negated;
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(column(crate::graph::ID).is_null()),
+            Box::new(lit(ScalarValue::Boolean(None))),
+        )],
+        Some(Box::new(lit(holds))),
+    ))
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -227,6 +257,9 @@ enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Directed {
+        negated: bool,
+    },
     Atom {
         property: String,
         op: Operator,
@@ -290,6 +323,10 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
+        ast::Expr::IsDirected {
+            variable: name,
+            negated,
+        } if name.value == variable => Some(Local::Directed { negated: *negated }),
         other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
             property,
             op,
@@ -370,6 +407,7 @@ fn bind_local(
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
         }
+        Local::Directed { negated } => Some(NativeAtom::Directed { negated: *negated }),
         Local::Atom {
             property,
             op,
@@ -409,6 +447,9 @@ fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
         if let ast::Expr::Identifier(name) = base.as_ref() {
             names.insert(name.value.clone());
         }
+    }
+    if let ast::Expr::IsDirected { variable, .. } = expr {
+        names.insert(variable.value.clone());
     }
     for child in children(expr) {
         property_bases(child, names);
