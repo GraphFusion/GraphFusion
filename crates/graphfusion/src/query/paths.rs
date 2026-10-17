@@ -361,7 +361,7 @@ pub(super) fn expand(
     )?;
     recursive = graph::predicates_for(
         recursive,
-        &local,
+        &mut local,
         session,
         &binding,
         &edge.labels,

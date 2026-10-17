@@ -81,7 +81,7 @@ impl Compiler<'_> {
     pub(super) fn apply_predicates(
         &mut self,
         mut plan: Plan,
-        scope: &Bindings,
+        scope: &mut Bindings,
         start: usize,
     ) -> Result<Plan> {
         for p in self.predicates.split_off(start) {
@@ -676,7 +676,7 @@ impl Compiler<'_> {
                 finite,
             ))
             .await?;
-            let plan = self.apply_predicates(plan, &branch_scope, predicate_start)?;
+            let plan = self.apply_predicates(plan, &mut branch_scope, predicate_start)?;
             scope.advance(&branch_scope);
             branches.push((plan, branch_scope, state));
         }

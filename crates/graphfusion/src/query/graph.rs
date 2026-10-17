@@ -218,11 +218,24 @@ pub(super) async fn matches(
             .all(|name| compiler.clause_hit.contains(name));
     if let Some(predicate) = &clause.where_clause {
         if !pushed {
-            let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
-            plan = plan.filter(expr)?;
+            plan = filter_or_unified(plan, scope, session, predicate)?;
         }
     }
     Ok(plan)
+}
+
+fn filter_or_unified(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    predicate: &ast::Expr,
+) -> Result<LogicalPlanBuilder> {
+    let (plan, pair) = super::native::property_pair(plan, scope, session, predicate)?;
+    if let Some(pair) = pair {
+        return Ok(plan.filter(pair.expr)?);
+    }
+    let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
+    Ok(plan.filter(expr)?)
 }
 
 /// A selective path search applies the match `WHERE` after ranking. Pushing
@@ -375,7 +388,7 @@ pub(super) fn node(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn predicates_for(
     mut plan: LogicalPlanBuilder,
-    scope: &Bindings,
+    scope: &mut Bindings,
     session: &SessionState,
     binding: &ElementBinding,
     labels: &[ast::Identifier],
@@ -396,6 +409,13 @@ pub(super) fn predicates_for(
             if native.properties.contains(&name.value) {
                 continue;
             }
+            let (next, equality) =
+                super::native::equated_property(plan, scope, session, binding, &name.value, value)?;
+            if let Some(equality) = equality {
+                plan = next.filter(equality)?;
+                continue;
+            }
+            plan = next;
             let right = Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
             let equality = Binder::with_bindings(session, plan.schema(), scope)
                 .equals(binding.property(&name.value), right)?;
@@ -403,9 +423,7 @@ pub(super) fn predicates_for(
         }
     }
     if let Some(predicate) = predicate.filter(|_| !native.pushed_where) {
-        let expression =
-            Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
-        plan = plan.filter(expression)?;
+        plan = filter_or_unified(plan, scope, session, predicate)?;
     }
     Ok(plan)
 }
