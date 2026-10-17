@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-When a result contains aggregates without an explicit GROUP BY, nonaggregate projected expressions that refer to input values become grouping keys.
+When a result contains aggregates without an explicit GROUP BY, nonaggregate projected expressions that refer to input values become grouping keys. A property the matched elements do not store is still one of those values: it is null on every row, and an empty match produces no group. A written constant is not a key, so `RETURN 7, COUNT(*)` on an empty match stays one row. `GROUP BY ()` forces that single global group even for a missing property.
 
 ```gql test
 MATCH (p:Person)
