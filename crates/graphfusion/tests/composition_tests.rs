@@ -330,3 +330,58 @@ async fn mixed_label_filters_compare_stored_types() {
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn min_max_reject_mixed_property_families() {
+    let mut session = social().await;
+    let people = session
+        .query("MATCH (p:Person) RETURN MIN(p.id) AS lo, MAX(p.id) AS hi")
+        .await
+        .unwrap();
+    assert_eq!(people.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&people),
+        vec![vec!["1".to_string(), "2".to_string()]]
+    );
+
+    let scores = session
+        .query("MATCH (n:Person|Document) RETURN MIN(n.score) AS lo, MAX(n.score) AS hi")
+        .await
+        .unwrap();
+    assert_eq!(scores.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&scores),
+        vec![vec!["1".to_string(), "2".to_string()]]
+    );
+
+    let widened = session
+        .query("MATCH (n:Person|Metric) RETURN MIN(n.score) AS lo, MAX(n.score) AS hi")
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1".to_string(), "2".to_string()]]
+    );
+
+    let minimum = session
+        .query("MATCH (n:Person|Document) RETURN MIN(n.id) AS lo")
+        .await
+        .unwrap_err();
+    assert!(
+        minimum
+            .to_string()
+            .contains("MIN cannot combine Int64 and Utf8"),
+        "{minimum}"
+    );
+    let maximum = session
+        .query("MATCH (n:Person|Document) RETURN MAX(DISTINCT n.id) AS hi")
+        .await
+        .unwrap_err();
+    assert!(
+        maximum
+            .to_string()
+            .contains("MAX cannot combine Int64 and Utf8"),
+        "{maximum}"
+    );
+}
