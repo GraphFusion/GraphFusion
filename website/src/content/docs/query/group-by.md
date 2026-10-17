@@ -23,6 +23,6 @@ SELECT COUNT(*) AS people FROM social MATCH (p:Person)
 GROUP BY () HAVING COUNT(*) > 0;
 ```
 
-SELECT HAVING filters completed groups. Ungrouped input references and nested aggregate calls are rejected. An empty global aggregate still returns one row: COUNT is 0, COLLECT_LIST is an empty list, and numeric aggregates are null.
+SELECT HAVING filters completed groups. When every input column in that predicate is a group key, arithmetic and concatenation use each source fragment's stored type. A fragment that cannot apply the operator is unknown. Ungrouped input references and nested aggregate calls are rejected. An empty global aggregate still returns one row: COUNT is 0, COLLECT_LIST is an empty list, and numeric aggregates are null.
 
 [Aggregate functions →](/expressions/aggregates/)

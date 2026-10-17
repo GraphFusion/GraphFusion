@@ -12,6 +12,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Evaluate SELECT HAVING arithmetic and concatenation on each fragment's stored
+  type when the grouped columns cover the predicate. A fragment that cannot
+  apply the operator is unknown, and the operator is a type error only when no
+  selected fragment can.
 
 ## 0.2.0 — 2026-10-05
 
