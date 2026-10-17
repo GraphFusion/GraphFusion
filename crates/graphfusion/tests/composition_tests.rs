@@ -1,5 +1,5 @@
 use datafusion::arrow::datatypes::DataType;
-use graphfusion::{Database, Value};
+use graphfusion::{Database, Error, Value};
 use std::collections::BTreeMap;
 
 fn strings(result: &graphfusion::QueryResult) -> Vec<Vec<String>> {
@@ -329,4 +329,146 @@ async fn mixed_label_filters_compare_stored_types() {
         strings(&both),
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
+}
+
+#[tokio::test]
+async fn where_label_tests_keep_stored_types() {
+    let mut session = social().await;
+
+    let person = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n IS LABELED Person AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&person), vec![vec!["Ada".to_string()]]);
+
+    let colon = session
+        .query("MATCH (n:Person|Document) WHERE n:Person AND n.id = 1 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&colon), vec![vec!["Ada".to_string()]]);
+
+    let document = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR n IS LABELED Document
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&document),
+        vec![vec!["Ada".to_string()], vec!["NULL".to_string()]]
+    );
+
+    let not_person = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n IS NOT LABELED Person OR n.id = 1
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&not_person),
+        vec![vec!["Ada".to_string()], vec!["NULL".to_string()]]
+    );
+
+    let keep_people = session
+        .query(
+            "MATCH (n:Person|Document) WHERE NOT n IS LABELED Document AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&keep_people), vec![vec!["Ada".to_string()]]);
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE n.id = 1 OR n IS LABELED Document)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&inline),
+        vec![vec!["Ada".to_string()], vec!["NULL".to_string()]]
+    );
+
+    let excluded = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n IS LABELED !Person AND n.id = 'doc'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&excluded), vec![vec!["Spec".to_string()]]);
+
+    let either_label = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n IS LABELED Person|Document AND n.id = 'doc'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&either_label), vec![vec!["Spec".to_string()]]);
+
+    let both_labels = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n IS LABELED Person&Document OR n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&both_labels), vec![vec!["Ada".to_string()]]);
+
+    let wildcard = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n IS LABELED % AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&wildcard), vec![vec!["Ada".to_string()]]);
+
+    let people = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 'doc' OR n IS LABELED Person
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&people),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let joined = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id = 1 AND m IS LABELED Metric
+             RETURN n.name AS name, m.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&joined),
+        vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
+
+    let error = session
+        .query(
+            "MATCH (d:Document) WHERE d.id = 1 OR d IS LABELED Document
+             RETURN d.title AS title",
+        )
+        .await
+        .unwrap_err();
+    match error {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
 }

@@ -21,6 +21,11 @@ pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// `IS LABELED` / `IS NOT LABELED`, resolved from each fragment's label set.
+    Labeled {
+        expression: ast::LabelExpression,
+        negated: bool,
+    },
     Compare {
         property: String,
         op: Operator,
@@ -89,7 +94,8 @@ impl NativePush {
 /// Split a match-level `WHERE` into per-variable fragment predicates.
 ///
 /// `AND` can be split across variables. `OR` and `NOT` stay together, so they
-/// are pushed only when every comparison names the same variable. A value that
+/// are pushed only when every comparison or label test names the same variable.
+/// A label test stays with that variable's stored-type comparison. A value that
 /// reads another column stays on the unified plan.
 pub(super) fn clause_filters(
     session: &SessionState,
@@ -128,6 +134,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(right, tables)
         }
         NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Labeled { .. } => Ok(()),
         NativeAtom::Compare {
             property,
             value_type,
@@ -153,11 +160,16 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     }
 }
 
-pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
+pub(super) fn compile(atom: &NativeAtom, table: &crate::graph::Table) -> Result<Expr> {
+    let schema = table.schema.as_ref();
     Ok(match atom {
-        NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
-        NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
-        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::And(left, right) => compile(left, table)?.and(compile(right, table)?),
+        NativeAtom::Or(left, right) => compile(left, table)?.or(compile(right, table)?),
+        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, table)?)),
+        NativeAtom::Labeled {
+            expression,
+            negated,
+        } => labeled_expr(&table.labels, expression, *negated),
         NativeAtom::Compare {
             property,
             op,
@@ -212,6 +224,24 @@ fn unknown() -> Expr {
     lit(ScalarValue::Boolean(None))
 }
 
+/// A null element yields null. Every stored row has an id, so the label set
+/// decides the predicate for the rows this scan actually reads.
+fn labeled_expr(
+    labels: &BTreeSet<String>,
+    expression: &ast::LabelExpression,
+    negated: bool,
+) -> Expr {
+    let holds = super::graph::label_holds(labels, expression) ^ negated;
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(column(crate::graph::ID).is_null()),
+            Box::new(lit(ScalarValue::Boolean(None))),
+        )],
+        Some(Box::new(lit(holds))),
+    ))
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -227,6 +257,10 @@ enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Labeled {
+        expression: ast::LabelExpression,
+        negated: bool,
+    },
     Atom {
         property: String,
         op: Operator,
@@ -290,6 +324,14 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
+        ast::Expr::IsLabeled {
+            variable: name,
+            negated,
+            label_expression,
+        } if name.value == variable => Some(Local::Labeled {
+            expression: label_expression.clone(),
+            negated: *negated,
+        }),
         other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
             property,
             op,
@@ -370,6 +412,13 @@ fn bind_local(
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
         }
+        Local::Labeled {
+            expression,
+            negated,
+        } => Some(NativeAtom::Labeled {
+            expression: expression.clone(),
+            negated: *negated,
+        }),
         Local::Atom {
             property,
             op,
@@ -409,6 +458,9 @@ fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
         if let ast::Expr::Identifier(name) = base.as_ref() {
             names.insert(name.value.clone());
         }
+    }
+    if let ast::Expr::IsLabeled { variable, .. } = expr {
+        names.insert(variable.value.clone());
     }
     for child in children(expr) {
         property_bases(child, names);
