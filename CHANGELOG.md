@@ -12,6 +12,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Snap a percentile rank product that floating-point rounding leaves within a
+  few ULPs of an integer, so `PERCENTILE_DISC` of 25 values at 0.28 returns the
+  7th value and a continuous fraction that lands on an order statistic returns
+  that observation.
 
 ## 0.2.0 — 2026-10-05
 
