@@ -1,5 +1,5 @@
 use datafusion::arrow::datatypes::DataType;
-use graphfusion::{Database, Value};
+use graphfusion::{Database, Error, Value};
 use std::collections::BTreeMap;
 
 fn strings(result: &graphfusion::QueryResult) -> Vec<Vec<String>> {
@@ -329,4 +329,149 @@ async fn mixed_label_filters_compare_stored_types() {
         strings(&both),
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
+}
+
+#[tokio::test]
+async fn where_constant_comparisons_keep_stored_types() {
+    let mut session = social().await;
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR 1 = 1
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let only_ada = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 OR 1 = 0 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&only_ada), vec![vec!["Ada".to_string()]]);
+
+    let still_ada = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 AND 1 = 1 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&still_ada), vec![vec!["Ada".to_string()]]);
+
+    let excluded = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 AND 1 = 0 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(excluded.row_count(), 0);
+
+    let exclusive = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 XOR 1 = 1
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&exclusive), vec![vec!["Bea".to_string()]]);
+
+    let negated = session
+        .query("MATCH (n:Person|Document) WHERE NOT (1 = 0) AND n.id = 1 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE n.id = 1 OR 1 = 1)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&inline),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let document = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 'doc' OR 2 > 3 RETURN n.title AS title")
+        .await
+        .unwrap();
+    assert_eq!(strings(&document), vec![vec!["Spec".to_string()]]);
+
+    let widened = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR 2 > 0
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&widened),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let joined = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id = 1 AND m.name = 'load' AND 1 = 1
+             RETURN n.name AS name, m.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&joined),
+        vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
+
+    let grouped = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id = 1 AND 1 = 1 AND m.name = 'load'
+             RETURN n.name AS name, m.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&grouped),
+        vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
+
+    session
+        .execute("SESSION SET VALUE $one INTEGER = 1")
+        .unwrap();
+    let parameter = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR $one = 1
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&parameter),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let error = session
+        .query("MATCH (d:Document) WHERE d.id = 1 OR 1 = 1 RETURN d.title AS title")
+        .await
+        .unwrap_err();
+    match error {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
 }
