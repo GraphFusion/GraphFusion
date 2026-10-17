@@ -370,3 +370,58 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         Err(Error::SessionClosed)
     ));
 }
+
+fn table(result: &QueryResult) -> Vec<Vec<String>> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(|row| {
+                (0..batch.num_columns())
+                    .map(|column| {
+                        ScalarValue::try_from_array(batch.column(column), row)
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn repeated_arithmetic_orders_by_the_same_result_expression() {
+    let mut session = Database::new().session();
+    let result = session
+        .query("FOR n IN [1, 1, 2] RETURN DISTINCT n + 1 AS value ORDER BY n + 1 DESC")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["3"], vec!["2"]]);
+    let result = session
+        .query("FOR n IN [2, 1] RETURN DISTINCT -n AS value ORDER BY -n")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["-2"], vec!["-1"]]);
+    let result = session
+        .query("FOR n IN [1, 1, 2] RETURN n + 1 AS value, COUNT(*) AS rows ORDER BY n + 1 DESC")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["3", "1"], vec!["2", "2"]]);
+    let result = session
+        .query("FOR n IN [1.25, 0.25] RETURN DISTINCT n * 2.0 AS value ORDER BY n * 2.0")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["0.5"], vec!["2.5"]]);
+    session
+        .execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run("INSERT (:N {v: 4}), (:N {v: 1}), (:N {v: 4})")
+        .await
+        .unwrap();
+    let result = session
+        .query("MATCH (n:N) RETURN DISTINCT n.v / 2 AS value ORDER BY n.v / 2")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["0"], vec!["2"]]);
+}

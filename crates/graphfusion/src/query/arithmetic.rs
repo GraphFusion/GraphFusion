@@ -3,7 +3,7 @@ use datafusion::{
     arrow::{array::Float64Array, compute::kernels::numeric, datatypes::DataType},
     common::ScalarValue,
     error::DataFusionError,
-    logical_expr::{create_udf, ColumnarValue, Expr, Operator, Volatility},
+    logical_expr::{create_udf, ColumnarValue, Expr, Operator, ScalarUDF, Volatility},
 };
 use std::sync::Arc;
 
@@ -33,6 +33,37 @@ pub(super) fn finite(value: Expr) -> Expr {
 }
 
 pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType) -> Expr {
+    // One function value per operator and type. A fresh closure would not compare
+    // equal, so DISTINCT and GROUP BY could not recognize the same arithmetic
+    // expression in ORDER BY.
+    checked_udf(op, &data_type).call(vec![left, right])
+}
+
+fn checked_udf(op: Operator, data_type: &DataType) -> ScalarUDF {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u8, DataType), ScalarUDF>>> =
+        OnceLock::new();
+    let key = (
+        match op {
+            Operator::Plus => 0,
+            Operator::Minus => 1,
+            Operator::Multiply => 2,
+            Operator::Divide => 3,
+            _ => unreachable!("only arithmetic operators are bound to this UDF"),
+        },
+        data_type.clone(),
+    );
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .entry(key)
+        .or_insert_with(|| checked_udf_new(op, data_type.clone()))
+        .clone()
+}
+
+fn checked_udf_new(op: Operator, data_type: DataType) -> ScalarUDF {
     let name = format!("gql_checked_{op:?}_{data_type:?}").to_lowercase();
     create_udf(
         &name,
@@ -84,7 +115,6 @@ pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType
             }
         }),
     )
-    .call(vec![left, right])
 }
 
 #[cfg(test)]
@@ -98,6 +128,18 @@ mod tests {
         logical_expr::col,
         prelude::SessionContext,
     };
+
+    #[test]
+    fn identical_checked_expressions_compare_equal() {
+        use datafusion::logical_expr::lit;
+        let left = checked(col("n"), Operator::Plus, lit(1_i64), DataType::Int64);
+        let right = checked(col("n"), Operator::Plus, lit(1_i64), DataType::Int64);
+        assert_eq!(left, right);
+        assert_ne!(
+            left,
+            checked(col("n"), Operator::Minus, lit(1_i64), DataType::Int64)
+        );
+    }
 
     #[tokio::test]
     async fn checked_arithmetic_executes_on_arrow_columns_with_nulls() {
