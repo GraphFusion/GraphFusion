@@ -9,6 +9,8 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- Reject a binding-table column that mixes a number with a boolean, string, or
+  bytes value. Integers and floats in one column still widen to float.
 - Resolve a `LET` copy of a label-constrained element from that label set, so
   its property types are not widened by another label that stores the same name.
 - A label that matches no fragment keeps property names as untyped columns.
