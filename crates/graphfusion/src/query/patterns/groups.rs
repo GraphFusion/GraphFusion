@@ -48,8 +48,17 @@ impl Compiler<'_> {
         let input = execution::ordinal(plan, self.ctx, self.trace, &row).await?;
         let incoming = input.schema().columns();
         let mut local = scope.clone();
+        // The one-step relation does not use input columns unless the group
+        // reads an outer variable. Cross-joining it with every input row only
+        // duplicates that relation; build it once and join on the endpoint.
+        let shared = !reads_outer(group, scope);
+        let step_input = if shared {
+            Plan::empty(true)
+        } else {
+            input.clone()
+        };
         let (step, step_state) =
-            Box::pin(self.group_once(input.clone(), &mut local, group, None, finite)).await?;
+            Box::pin(self.group_once(step_input, &mut local, group, None, finite)).await?;
         scope.advance(&local);
         let new_names: Vec<_> = local
             .order
@@ -57,14 +66,17 @@ impl Compiler<'_> {
             .filter(|n| !scope.contains(n))
             .cloned()
             .collect();
-        let step_row = scope.fresh("step_row");
+        let step_row = (!shared).then(|| scope.fresh("step_row"));
         let step_nodes = scope.fresh("step_nodes");
         let step_edges = scope.fresh("step_edges");
-        let mut projections = vec![
-            Expr::Column(Column::new_unqualified(&row)).alias(&step_row),
+        let mut projections = Vec::new();
+        if let Some(step_row) = &step_row {
+            projections.push(Expr::Column(Column::new_unqualified(&row)).alias(step_row));
+        }
+        projections.extend([
             step_state.nodes.alias(&step_nodes),
             step_state.edges.alias(&step_edges),
-        ];
+        ]);
         let mut values = Vec::new();
         for name in &new_names {
             let value = if let Some(element) = local.elements.get(name) {
@@ -154,17 +166,15 @@ impl Compiler<'_> {
             nodes: col(&step_nodes),
             edges: col(&step_edges),
         };
+        let mut keys = Vec::new();
+        if let Some(step_row) = &step_row {
+            keys.push(col(&row).eq(col(step_row)));
+        }
+        keys.push(current.end().eq(step_state.start()));
         let mut recursive = work
             .project(restore)?
             .filter(col(&depth).lt(lit(max)))?
-            .join_on(
-                step,
-                JoinType::Inner,
-                [
-                    col(&row).eq(col(&step_row)),
-                    current.end().eq(step_state.start()),
-                ],
-            )?;
+            .join_on(step, JoinType::Inner, keys)?;
         let next = current.concat(&step_state);
         recursive = recursive.filter(next.valid(mode, self.different))?;
         let mut output: Vec<_> = incoming
@@ -234,5 +244,88 @@ fn declarations(path: &ast::PathPattern, names: &mut Vec<String>) {
     factors(&path.factors, names);
     for a in &path.alternatives {
         factors(&a.factors, names);
+    }
+}
+
+fn reads_outer(group: &ast::ParenthesizedPathPatternExpression, scope: &Bindings) -> bool {
+    group
+        .where_clause
+        .as_ref()
+        .is_some_and(|expr| expr_reads_scope(expr, scope))
+        || pattern_reads_outer(&group.pattern, scope)
+}
+
+fn pattern_reads_outer(path: &ast::PathPattern, scope: &Bindings) -> bool {
+    factors_read_outer(&path.factors, scope)
+        || path
+            .alternatives
+            .iter()
+            .any(|term| factors_read_outer(&term.factors, scope))
+}
+
+fn factors_read_outer(factors: &[ast::PathPatternFactor], scope: &Bindings) -> bool {
+    factors.iter().any(|factor| match factor {
+        ast::PathPatternFactor::Node(node) => {
+            map_reads_outer(node.properties.as_ref(), scope)
+                || node
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|expr| expr_reads_scope(expr, scope))
+        }
+        ast::PathPatternFactor::Relationship(edge) => {
+            map_reads_outer(edge.properties.as_ref(), scope)
+                || edge
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|expr| expr_reads_scope(expr, scope))
+        }
+        ast::PathPatternFactor::Parenthesized(group) => reads_outer(group, scope),
+        ast::PathPatternFactor::Alternation { alternatives, .. } => alternatives
+            .iter()
+            .any(|factors| factors_read_outer(factors, scope)),
+    })
+}
+
+fn map_reads_outer(properties: Option<&ast::MapLiteral>, scope: &Bindings) -> bool {
+    properties.is_some_and(|properties| {
+        properties
+            .entries
+            .iter()
+            .any(|(_, value)| expr_reads_scope(value, scope))
+    })
+}
+
+/// True when the expression reads a variable that is already bound outside the
+/// group. Names declared by the group itself are not bound yet. An unknown
+/// expression kind stays on the per-row plan.
+fn expr_reads_scope(expr: &ast::Expr, scope: &Bindings) -> bool {
+    use ast::Expr as E;
+    let named = |name: &ast::Identifier| {
+        scope.contains(&name.value) || scope.references.contains_key(&name.value)
+    };
+    match expr {
+        E::Literal(_) | E::Parameter(_) | E::Wildcard => false,
+        E::Identifier(name) => named(name),
+        E::Property { base, .. } => expr_reads_scope(base, scope),
+        E::Unary { expr, .. }
+        | E::IsNull { expr, .. }
+        | E::IsUnknown { expr, .. }
+        | E::IsTruth { expr, .. }
+        | E::AbsoluteValue { expr }
+        | E::Elements { path: expr }
+        | E::Cast { expr, .. } => expr_reads_scope(expr, scope),
+        E::Binary { left, right, .. } | E::NullIf { left, right } => {
+            expr_reads_scope(left, scope) || expr_reads_scope(right, scope)
+        }
+        E::NumericFunction { args, .. }
+        | E::Coalesce(args)
+        | E::List(args)
+        | E::Function { args, .. } => args.iter().any(|expr| expr_reads_scope(expr, scope)),
+        E::ElementId { variable }
+        | E::PropertyExists { variable, .. }
+        | E::IsLabeled { variable, .. }
+        | E::IsDirected { variable, .. } => named(variable),
+        E::Same { variables } | E::AllDifferent { variables } => variables.iter().any(named),
+        _ => true,
     }
 }
