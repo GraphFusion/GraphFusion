@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep a variable readable after `DELETE` when only some of its rows were
+  removed. Property access still fails for a deleted identity, including
+  through an alias, and that failure rolls the statement back.
 - Refresh a bound element without adopting a one-label-apart neighbor's
   property types. A label edit can still find the moved row, and a later
   comparison keeps the type stored on the bound label set.

@@ -292,15 +292,14 @@ pub(super) async fn apply(
                 delete_graph(&plan, scope, id, &data, delete, ctx, trace).await?;
             data = next;
             writes.affected += affected;
-            // Keep references to surviving elements. Detect deleted aliases as well as
-            // explicitly named targets, so later expressions cannot read stale properties.
+            // A variable can hold both deleted and surviving identities. Remember
+            // the deleted ids on that binding; later reads fail only for those rows.
             let bindings: Vec<_> = scope
                 .elements
                 .iter()
                 .filter(|(_, b)| b.graph == id)
                 .map(|(name, binding)| (name.clone(), binding.clone()))
                 .collect();
-            let mut removed = BTreeSet::new();
             for (name, binding) in bindings {
                 let deleted = if binding.kind == ElementKind::Node {
                     &deleted_nodes
@@ -321,14 +320,14 @@ pub(super) async fn apply(
                     .build()?;
                 let (_, rows) = trace.collect(ctx, &missing).await?;
                 if rows.iter().any(|batch| batch.num_rows() != 0) {
-                    removed.insert(name);
+                    scope
+                        .elements
+                        .get_mut(&name)
+                        .expect("element binding")
+                        .tombstones
+                        .extend(deleted.iter().copied());
                 }
             }
-            scope.elements.retain(|name, _| !removed.contains(name));
-            scope.scalars.retain(|name, _| !removed.contains(name));
-            scope.references.retain(|name, _| !removed.contains(name));
-            scope.domains.retain(|name, _| !removed.contains(name));
-            scope.order.retain(|name| !removed.contains(name));
             if affected != 0 {
                 plan = refresh(plan, scope, id, &data, ctx, trace).await?;
             }
@@ -524,6 +523,19 @@ async fn target(
         return Err(Error::InvalidQuery(
             "mutation target belongs to another working graph".into(),
         ));
+    }
+    if !binding.tombstones.is_empty() {
+        // A genuine null target is skipped later. A non-null identity deleted
+        // earlier in the statement is an error, including through an alias.
+        trace
+            .collect(
+                ctx,
+                &plan
+                    .clone()
+                    .project([binding.ensure_live(binding.column(ID), DataType::UInt64)])?
+                    .build()?,
+            )
+            .await?;
     }
     if let Some(reference) = scope.references.get(name) {
         let value = Expr::Column(scope.scalars.get(name).expect("scalar reference").clone());
@@ -772,20 +784,29 @@ async fn refresh(
             .filter(|c| c.relation.as_ref() != Some(&TableReference::bare(before.alias.as_str())))
             .map(Expr::Column)
             .collect();
-        let (scan, after) = graph::scan_refresh(scope, graph_id, data, &before)?;
+        let (scan, mut after) = graph::scan_refresh(scope, graph_id, data, &before)?;
         let appended: Vec<_> = scan
             .schema()
             .columns()
             .into_iter()
             .map(Expr::Column)
             .collect();
+        let mut projected: Vec<_> = retained.into_iter().chain(appended).collect();
+        after.tombstones = before.tombstones.clone();
+        if !before.tombstones.is_empty() && before.prior_id.is_none() {
+            let prior = format!("__gf_prior_{}", before.alias);
+            projected.push(before.column(ID).alias(&prior));
+            after.prior_id = Some(prior);
+        } else {
+            after.prior_id = before.prior_id.clone();
+        }
         plan = plan
             .join_on(
                 scan,
                 JoinType::Left,
                 [before.column(ID).eq(after.column(ID))],
             )?
-            .project(retained.into_iter().chain(appended))?;
+            .project(projected)?;
         scope.elements.insert(name, after);
     }
     super::references::refresh(plan, scope, graph_id, data, ctx, trace).await

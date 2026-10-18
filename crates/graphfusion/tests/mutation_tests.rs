@@ -396,6 +396,41 @@ async fn deleting_edges_keeps_surviving_node_bindings_and_rejects_stale_aliases(
 }
 
 #[tokio::test]
+async fn partial_delete_keeps_live_rows_of_the_same_variable() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (:N {name: 'Ada'}), (:N {name: 'Bea'})").await;
+    assert!(s
+        .run(
+            "MATCH (n:N)
+             MATCH (d:N WHERE d.name = 'Ada')
+             DETACH DELETE d
+             RETURN n.name AS name",
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:N) RETURN n.name AS name ORDER BY name").await),
+        vec![vec!["Ada"], vec!["Bea"]]
+    );
+    let result = run(
+        &mut s,
+        "MATCH (n:N)
+         LET label = n.name
+         MATCH (d:N WHERE d.name = 'Ada')
+         DETACH DELETE d
+         FILTER label = 'Bea'
+         RETURN n.name AS name, n IS LABELED N AS labeled",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["Bea", "true"]]);
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:N) RETURN n.name AS name").await),
+        vec![vec!["Bea"]]
+    );
+}
+
+#[tokio::test]
 async fn repeated_inserts_do_not_rewrite_one_file_per_previous_row() {
     let dir = Durable::new();
     let db = dir.open();
