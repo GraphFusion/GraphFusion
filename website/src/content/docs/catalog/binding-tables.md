@@ -12,7 +12,7 @@ TABLE { MATCH (p:Person) RETURN p.name AS name }
 RETURN name ORDER BY name;
 ```
 
-A nested query inside `TABLE` executes as an independent binding table. `SESSION SET BINDING TABLE` still accepts a parameter or variable, not a nested query. Pass a driver-owned table by setting `Value::BindingTable` and reading `TABLE $rows`. Columns are scalars: boolean, integer, float, string, bytes or null. An empty table produces no rows.
+A nested query inside `TABLE` executes as an independent binding table. `SESSION SET BINDING TABLE` still accepts a parameter or variable, not a nested query. Pass a driver-owned table by setting `Value::BindingTable` and reading `TABLE $rows`. Columns are scalars: boolean, integer, float, string, bytes or null. Integers and floats in one column widen to float. A column that mixes any other pair of those types is rejected. An empty table produces no rows.
 
 ```gql parse
 SESSION SET BINDING TABLE $rows = { RETURN 1 AS id };

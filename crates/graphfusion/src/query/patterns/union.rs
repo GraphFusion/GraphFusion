@@ -1,7 +1,8 @@
 use super::*;
 use datafusion::{
+    arrow::datatypes::DataType,
     common::ScalarValue,
-    logical_expr::{lit, ExprSchemable},
+    logical_expr::{cast, lit, ExprSchemable},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,7 +30,7 @@ impl Compiler<'_> {
             .iter()
             .map(|c| Ok(Expr::Column(c.clone()).get_type(input.schema())?))
             .collect::<Result<Vec<_>>>()?;
-        let mut element_targets = BTreeMap::new();
+        let mut element_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for name in &names {
             let mut domain = super::super::references::Domain::new();
             let mut known = true;
@@ -50,23 +51,21 @@ impl Compiler<'_> {
                 .iter()
                 .find(|(_, b, _)| b.contains(name))
                 .expect("declared name");
-            if let Some(source) = source_scope.elements.get(name) {
-                let mut element = source.clone();
-                element.alias = scope.fresh("union_element");
-                let mut columns = Vec::new();
-                for (qualifier, field) in source_plan.schema().iter() {
-                    if qualifier.is_some_and(|q| q.table() == source.alias) {
-                        columns.push(field.name().clone());
-                        target.push(Column::new(
-                            Some(datafusion::common::TableReference::bare(
-                                element.alias.clone(),
-                            )),
-                            field.name(),
-                        ));
-                        types.push(field.data_type().clone());
-                    }
+            if source_scope.elements.contains_key(name) {
+                // Branches can store different properties for one element. Align
+                // them here; copying the first branch's physical fields crashes
+                // when a later branch does not have the same column.
+                let element = unified_element(&branches, name, scope.fresh("union_element"))?;
+                let layout = element_layout(&element);
+                let relation = datafusion::common::TableReference::bare(element.alias.clone());
+                element_targets.insert(
+                    name.clone(),
+                    layout.iter().map(|(field, _)| field.clone()).collect(),
+                );
+                for (field, data_type) in &layout {
+                    target.push(Column::new(Some(relation.clone()), field));
+                    types.push(data_type.clone());
                 }
-                element_targets.insert(name.clone(), columns);
                 graph::declare(scope, name, &element)?;
             } else {
                 let source = source_scope.scalars.get(name).expect("scalar binding");
@@ -113,7 +112,7 @@ impl Compiler<'_> {
                                 target_binding.graph,
                                 target_binding.kind,
                             )?;
-                            values.extend(fields.iter().map(|f| source.column(f)));
+                            values.extend(element_values(source, target_binding)?);
                         }
                         None if branch.scalars.contains_key(name) => {
                             return Err(Error::InvalidQuery(format!(
@@ -185,4 +184,124 @@ impl Compiler<'_> {
         let plan = execution::freeze(plan.project(output)?, self.ctx, self.trace, None).await?;
         Ok((plan, state))
     }
+}
+
+fn unified_element(branches: &[Built], name: &str, alias: String) -> Result<graph::ElementBinding> {
+    let elements: Vec<_> = branches
+        .iter()
+        .filter_map(|(_, branch, _)| branch.elements.get(name))
+        .collect();
+    let Some(first) = elements.first().copied() else {
+        return Err(Error::InvalidQuery(
+            "incompatible path-alternative binding types".into(),
+        ));
+    };
+    let mut properties = BTreeMap::new();
+    let mut label_names = BTreeSet::new();
+    let mut source_labels = Vec::new();
+    let mut seen_labels = BTreeSet::new();
+    let mut constrained = true;
+    for element in elements {
+        graph::check_binding(element, first.graph, first.kind)?;
+        constrained &= element.constrained;
+        for labels in &element.source_labels {
+            if seen_labels.insert(labels.clone()) {
+                source_labels.push(labels.clone());
+            }
+        }
+        label_names.extend(element.labels.keys().cloned());
+        for (property, data_type) in &element.properties {
+            match properties.get(property).cloned() {
+                None => {
+                    properties.insert(property.clone(), data_type.clone());
+                }
+                Some(previous) => {
+                    let unified = crate::graph::unify_property_type(&previous, data_type)
+                        .ok_or_else(|| {
+                            Error::InvalidQuery(
+                                "incompatible path-alternative binding types".into(),
+                            )
+                        })?;
+                    properties.insert(property.clone(), unified);
+                }
+            }
+        }
+    }
+    let present = properties
+        .keys()
+        .enumerate()
+        .map(|(index, property)| (property.clone(), format!("__gf_present_{index}")))
+        .collect();
+    let labels = label_names
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| (label, format!("__gf_label_{index}")))
+        .collect();
+    Ok(graph::ElementBinding {
+        alias,
+        graph: first.graph,
+        kind: first.kind,
+        properties,
+        labels,
+        present,
+        constrained: constrained && !source_labels.is_empty(),
+        source_labels,
+        tombstones: BTreeSet::new(),
+        prior_id: None,
+    })
+}
+
+fn element_layout(element: &graph::ElementBinding) -> Vec<(String, DataType)> {
+    let mut fields = vec![(crate::graph::ID.to_string(), DataType::UInt64)];
+    if element.kind == graph::ElementKind::Edge {
+        fields.extend([
+            (crate::graph::SOURCE.to_string(), DataType::UInt64),
+            (crate::graph::DESTINATION.to_string(), DataType::UInt64),
+            ("__gf_directed".to_string(), DataType::Boolean),
+            (crate::graph::FROM.to_string(), DataType::UInt64),
+            (crate::graph::TO.to_string(), DataType::UInt64),
+        ]);
+    }
+    for (name, data_type) in &element.properties {
+        fields.push((name.clone(), data_type.clone()));
+        fields.push((element.present[name].clone(), DataType::Boolean));
+    }
+    for column in element.labels.values() {
+        fields.push((column.clone(), DataType::Boolean));
+    }
+    fields
+}
+
+fn element_values(
+    source: &graph::ElementBinding,
+    unified: &graph::ElementBinding,
+) -> Result<Vec<Expr>> {
+    let mut values = vec![source.column(crate::graph::ID)];
+    if unified.kind == graph::ElementKind::Edge {
+        values.extend([
+            source.column(crate::graph::SOURCE),
+            source.column(crate::graph::DESTINATION),
+            source.column("__gf_directed"),
+            source.column(crate::graph::FROM),
+            source.column(crate::graph::TO),
+        ]);
+    }
+    for (name, data_type) in &unified.properties {
+        values.push(match source.properties.get(name) {
+            Some(actual) if actual == data_type => source.column(name),
+            Some(_) => cast(source.column(name), data_type.clone()),
+            None => lit(ScalarValue::try_from(data_type)?),
+        });
+        values.push(match source.present.get(name) {
+            Some(column) => source.column(column),
+            None => lit(false),
+        });
+    }
+    for label in unified.labels.keys() {
+        values.push(match source.labels.get(label) {
+            Some(column) => source.column(column),
+            None => lit(false),
+        });
+    }
+    Ok(values)
 }
