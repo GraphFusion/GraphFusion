@@ -20,7 +20,7 @@ use datafusion::{
     common::{Column, TableReference},
     datasource::provider_as_source,
     execution::context::SessionContext,
-    logical_expr::{lit, Expr, JoinType, LogicalPlan, LogicalPlanBuilder},
+    logical_expr::{cast, lit, Expr, JoinType, LogicalPlan, LogicalPlanBuilder},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -249,7 +249,7 @@ pub(super) async fn apply(
                 if let Some((patch, ids)) = patch {
                     data = edit_graph(&data, binding.kind, &patch, &ids, &edit, ctx, trace).await?;
                     writes.affected += ids.len();
-                    plan = refresh(plan, scope, id, &data)?;
+                    plan = refresh(plan, scope, id, &data, ctx, trace).await?;
                     plan = freeze(plan, ctx, trace, None).await?;
                 }
             }
@@ -282,7 +282,7 @@ pub(super) async fn apply(
                 {
                     data = edit_graph(&data, binding.kind, &patch, &ids, &edit, ctx, trace).await?;
                     writes.affected += ids.len();
-                    plan = refresh(plan, scope, id, &data)?;
+                    plan = refresh(plan, scope, id, &data, ctx, trace).await?;
                     plan = freeze(plan, ctx, trace, None).await?;
                 }
             }
@@ -292,15 +292,14 @@ pub(super) async fn apply(
                 delete_graph(&plan, scope, id, &data, delete, ctx, trace).await?;
             data = next;
             writes.affected += affected;
-            // Keep references to surviving elements. Detect deleted aliases as well as
-            // explicitly named targets, so later expressions cannot read stale properties.
+            // A variable can hold both deleted and surviving identities. Remember
+            // the deleted ids on that binding; later reads fail only for those rows.
             let bindings: Vec<_> = scope
                 .elements
                 .iter()
                 .filter(|(_, b)| b.graph == id)
                 .map(|(name, binding)| (name.clone(), binding.clone()))
                 .collect();
-            let mut removed = BTreeSet::new();
             for (name, binding) in bindings {
                 let deleted = if binding.kind == ElementKind::Node {
                     &deleted_nodes
@@ -321,16 +320,16 @@ pub(super) async fn apply(
                     .build()?;
                 let (_, rows) = trace.collect(ctx, &missing).await?;
                 if rows.iter().any(|batch| batch.num_rows() != 0) {
-                    removed.insert(name);
+                    scope
+                        .elements
+                        .get_mut(&name)
+                        .expect("element binding")
+                        .tombstones
+                        .extend(deleted.iter().copied());
                 }
             }
-            scope.elements.retain(|name, _| !removed.contains(name));
-            scope.scalars.retain(|name, _| !removed.contains(name));
-            scope.references.retain(|name, _| !removed.contains(name));
-            scope.domains.retain(|name, _| !removed.contains(name));
-            scope.order.retain(|name| !removed.contains(name));
             if affected != 0 {
-                plan = refresh(plan, scope, id, &data)?;
+                plan = refresh(plan, scope, id, &data, ctx, trace).await?;
             }
         }
         _ => unreachable!("mutation dispatch"),
@@ -339,7 +338,7 @@ pub(super) async fn apply(
         // Keep allocated identity projections below reference lookup joins.
         plan = freeze(plan, ctx, trace, None).await?;
     }
-    plan = super::references::refresh(plan, scope, id, &data)?;
+    plan = super::references::refresh(plan, scope, id, &data, ctx, trace).await?;
     if !scope.references.is_empty() {
         plan = freeze(plan, ctx, trace, None).await?;
     }
@@ -432,10 +431,19 @@ async fn insert_element(
         expressions.extend([from.alias(SOURCE), to.alias(DESTINATION)]);
     }
     use datafusion::logical_expr::ExprSchemable;
-    for (name, value) in values {
-        if value.get_type(plan.schema())? != DataType::Null {
-            expressions.push(value.alias(name));
+    for (name, mut value) in values {
+        let ty = value.get_type(plan.schema())?;
+        if ty == DataType::Null {
+            evaluate_null_value(&plan, &value, ctx, trace).await?;
+            continue;
         }
+        // An integer literal is not a different property type from an existing float.
+        if ty == DataType::Int64
+            && stored_property_type(data, kind, &labels, &name) == Some(DataType::Float64)
+        {
+            value = cast(value, DataType::Float64);
+        }
+        expressions.push(value.alias(name));
     }
     let mut next = data.clone();
     let projected = plan.clone().project(expressions)?;
@@ -535,6 +543,19 @@ async fn target(
             "mutation target belongs to another working graph".into(),
         ));
     }
+    if !binding.tombstones.is_empty() {
+        // A genuine null target is skipped later. A non-null identity deleted
+        // earlier in the statement is an error, including through an alias.
+        trace
+            .collect(
+                ctx,
+                &plan
+                    .clone()
+                    .project([binding.ensure_live(binding.column(ID), DataType::UInt64)])?
+                    .build()?,
+            )
+            .await?;
+    }
     if let Some(reference) = scope.references.get(name) {
         let value = Expr::Column(scope.scalars.get(name).expect("scalar reference").clone());
         // Evaluate before null-target elimination: a genuine null is a no-op,
@@ -548,6 +569,34 @@ async fn target(
     }
     Ok(binding)
 }
+fn stored_property_type(
+    data: &GraphData,
+    kind: ElementKind,
+    labels: &BTreeSet<String>,
+    name: &str,
+) -> Option<DataType> {
+    let tables: Vec<&Table> = if kind == ElementKind::Node {
+        data.nodes
+            .iter()
+            .filter(|table| &table.0.labels == labels)
+            .map(|table| &table.0)
+            .collect()
+    } else {
+        data.edges
+            .iter()
+            .filter(|table| &table.table.labels == labels)
+            .map(|table| &table.table)
+            .collect()
+    };
+    tables.iter().find_map(|table| {
+        table
+            .schema
+            .field_with_name(name)
+            .ok()
+            .map(|field| field.data_type().clone())
+    })
+}
+
 fn property_target(expr: &ast::Expr) -> Result<(String, String)> {
     if let ast::Expr::Property { base, key } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
@@ -572,6 +621,28 @@ struct Edit {
     add_label: Option<String>,
     remove_label: Option<String>,
 }
+/// A null result may still validate a graph dereference. Execute that check
+/// before omitting the property from a write, while literal NULL stays free.
+async fn evaluate_null_value(
+    plan: &LogicalPlanBuilder,
+    value: &Expr,
+    ctx: &SessionContext,
+    trace: &mut Trace,
+) -> Result<()> {
+    if !value.column_refs().is_empty() {
+        trace
+            .collect(
+                ctx,
+                &plan
+                    .clone()
+                    .project([value.clone().alias("__gf_null_check")])?
+                    .build()?,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn patch(
     plan: &LogicalPlanBuilder,
     binding: &ElementBinding,
@@ -581,9 +652,11 @@ async fn patch(
     trace: &mut Trace,
 ) -> Result<Option<(LogicalPlan, BTreeSet<u64>)>> {
     use datafusion::logical_expr::ExprSchemable;
+    let target = plan.clone().filter(binding.column(ID).is_not_null())?;
     let mut expressions = vec![binding.column(ID).alias(ID)];
     for (i, (name, value)) in values.into_iter().enumerate() {
         if value.get_type(plan.schema())? == DataType::Null {
+            evaluate_null_value(&target, &value, ctx, trace).await?;
             edit.values.insert(name, None);
         } else {
             let column = format!("__gf_value_{i}");
@@ -591,12 +664,7 @@ async fn patch(
             edit.values.insert(name, Some(column));
         }
     }
-    let patch = plan
-        .clone()
-        .filter(binding.column(ID).is_not_null())?
-        .project(expressions)?
-        .distinct()?
-        .build()?;
+    let patch = target.project(expressions)?.distinct()?.build()?;
     let (schema, batches) = trace.collect(ctx, &patch).await?;
     let mut ids = BTreeSet::new();
     for batch in &batches {
@@ -677,18 +745,23 @@ async fn edit_graph(
         }
         for (name, value) in &edit.values {
             if let Some(column) = value {
+                let mut source = col("__gf_patch", column);
                 if let Ok(existing) = old.schema.field_with_name(name) {
                     let incoming = patch
                         .schema()
                         .field_with_name(None, column)
                         .map_err(|_| Error::Corrupt(format!("missing patch column {column}")))?;
-                    if incoming.data_type() != existing.data_type() {
+                    if incoming.data_type() == &DataType::Int64
+                        && existing.data_type() == &DataType::Float64
+                    {
+                        source = cast(source, DataType::Float64);
+                    } else if incoming.data_type() != existing.data_type() {
                         return Err(Error::UnsupportedFeature(format!(
                             "mixed types for graph property {name}"
                         )));
                     }
                 }
-                projections.push(col("__gf_patch", column).alias(name));
+                projections.push(source.alias(name));
             }
         }
         let mut labels = old.labels.clone();
@@ -720,11 +793,13 @@ async fn edit_graph(
     GraphData::from_mutation(nodes, edges)
 }
 
-fn refresh(
+async fn refresh(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     graph_id: ObjectId,
     data: &GraphData,
+    ctx: &SessionContext,
+    trace: &mut Trace,
 ) -> Result<LogicalPlanBuilder> {
     let old: Vec<_> = scope
         .elements
@@ -733,6 +808,13 @@ fn refresh(
         .map(|(name, b)| (name.clone(), b.clone()))
         .collect();
     for (name, before) in old {
+        let ids = delete_ids(
+            Some(plan.clone().project([before.column(ID).alias(ID)])?),
+            ctx,
+            trace,
+        )
+        .await?;
+        let before = graph::refresh_source(data, &before, &ids)?;
         let retained: Vec<_> = plan
             .schema()
             .columns()
@@ -740,27 +822,36 @@ fn refresh(
             .filter(|c| c.relation.as_ref() != Some(&TableReference::bare(before.alias.as_str())))
             .map(Expr::Column)
             .collect();
-        let (scan, after) = graph::scan_refresh(scope, graph_id, data, &before)?;
+        let (scan, mut after) = graph::scan_refresh(scope, graph_id, data, &before)?;
         let appended: Vec<_> = scan
             .schema()
             .columns()
             .into_iter()
             .map(Expr::Column)
             .collect();
+        let mut projected: Vec<_> = retained.into_iter().chain(appended).collect();
+        after.tombstones = before.tombstones.clone();
+        if !before.tombstones.is_empty() && before.prior_id.is_none() {
+            let prior = format!("__gf_prior_{}", before.alias);
+            projected.push(before.column(ID).alias(&prior));
+            after.prior_id = Some(prior);
+        } else {
+            after.prior_id = before.prior_id.clone();
+        }
         plan = plan
             .join_on(
                 scan,
                 JoinType::Left,
                 [before.column(ID).eq(after.column(ID))],
             )?
-            .project(retained.into_iter().chain(appended))?;
+            .project(projected)?;
         scope.elements.insert(name, after);
     }
-    super::references::refresh(plan, scope, graph_id, data)
+    super::references::refresh(plan, scope, graph_id, data, ctx, trace).await
 }
 
 /// Collect identities once, skipping null targets before touching any fragment.
-async fn delete_ids(
+pub(super) async fn delete_ids(
     plan: Option<LogicalPlanBuilder>,
     ctx: &SessionContext,
     trace: &mut Trace,

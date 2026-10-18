@@ -1,7 +1,10 @@
 mod repl;
 
 use graphfusion::{
-    arrow::{record_batch::RecordBatch, util::pretty::pretty_format_batches},
+    arrow::{
+        record_batch::RecordBatch,
+        util::{display::FormatOptions, pretty::pretty_format_batches_with_options},
+    },
     gql,
     graph::{EdgeTable, GraphData, NodeTable},
     Database, OpenOptions, StatementOutput, TransactionAction, TransactionStatus,
@@ -303,7 +306,13 @@ fn print_outputs(outputs: Vec<StatementOutput>, explain: bool) -> CliResult<()> 
                     result.batches
                 };
                 if !batches[0].schema().fields().is_empty() {
-                    println!("{}", pretty_format_batches(&batches)?);
+                    // Arrow's default null token is empty, so [NULL] prints as []
+                    // and a null cell is indistinguishable from an empty string.
+                    let options = FormatOptions::new().with_null("NULL");
+                    println!(
+                        "{}",
+                        pretty_format_batches_with_options(&batches, &options)?
+                    );
                 }
                 if explain {
                     println!(
