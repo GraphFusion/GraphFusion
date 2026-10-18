@@ -280,6 +280,36 @@ async fn empty_groups_and_collect_have_consistent_null_behavior() {
 }
 
 #[tokio::test]
+async fn ungrouped_references_are_invalid_queries() {
+    let mut s = fixture().await;
+    for sql in [
+        "FOR n IN [1, 2, 3] RETURN COLLECT_LIST(n) AS xs ORDER BY n DESC",
+        "MATCH (n:N) RETURN COUNT(*) AS c ORDER BY n.k",
+        "SELECT COUNT(*) AS c FROM g MATCH (n:N) HAVING n.v > 0",
+        "FOR x IN [1, 2] RETURN x, COUNT(*) AS c GROUP BY ()",
+    ] {
+        let error = s.query(sql).await.unwrap_err().to_string();
+        assert!(
+            error.contains("invalid query: expression is not grouped or aggregated"),
+            "{sql}: {error}"
+        );
+        assert!(!error.contains("__gf_"), "{sql}: {error}");
+    }
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 2] RETURN n AS n, COUNT(*) AS c ORDER BY n",
+        &[&["1", "1"], &["2", "2"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3] RETURN COLLECT_LIST(n) AS xs ORDER BY COUNT(*)",
+        &[&["[1, 2, 3]"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn aggregate_errors_are_checked_and_never_publish_writes() {
     let mut s = fixture().await;
     for sql in [
