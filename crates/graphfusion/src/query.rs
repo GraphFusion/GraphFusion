@@ -6,6 +6,7 @@ mod execution;
 mod expressions;
 mod graph;
 mod mutations;
+mod native;
 mod path_values;
 mod paths;
 mod patterns;
