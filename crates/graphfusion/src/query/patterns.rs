@@ -455,6 +455,8 @@ impl Compiler<'_> {
             Some((ast::PathPatternFactor::Node(node), rest)) => (node, rest),
             _ => (&empty, factors),
         };
+        // Keep predicates from earlier patterns pending until their variables are bound.
+        let pending = self.predicates.len();
         // The first edge already carries both anonymous endpoint identities.
         let opened = if endpoint.is_none() && reuses_known_endpoint(first) {
             match remaining.split_first() {
@@ -521,6 +523,7 @@ impl Compiler<'_> {
             };
             (plan, state, remaining)
         };
+        plan = self.flush_ready(plan, scope, pending)?;
         for factor in rest {
             match factor {
                 ast::PathPatternFactor::Node(node) => {
@@ -651,8 +654,35 @@ impl Compiler<'_> {
                 }
             }
             plan = plan.filter(state.valid(mode, self.different))?;
+            plan = self.flush_ready(plan, scope, pending)?;
         }
         Ok((plan, state))
+    }
+    fn flush_ready(&mut self, mut plan: Plan, scope: &Bindings, start: usize) -> Result<Plan> {
+        let pending = self.predicates.split_off(start);
+        let mut deferred = Vec::new();
+        for predicate in pending {
+            if predicate_is_noop(&predicate) {
+                continue;
+            }
+            if predicate_is_ready(&predicate, scope) {
+                plan = graph::predicates_for(
+                    plan,
+                    scope,
+                    self.session,
+                    &predicate.binding,
+                    &predicate.labels,
+                    predicate.expression.as_ref(),
+                    predicate.properties.as_ref(),
+                    predicate.predicate.as_ref(),
+                    &predicate.native,
+                )?;
+            } else {
+                deferred.push(predicate);
+            }
+        }
+        self.predicates.extend(deferred);
+        Ok(plan)
     }
     fn open_edge(
         &mut self,
@@ -875,5 +905,61 @@ fn depends_on(expr: &ast::Expr, name: &str) -> bool {
             variables.iter().any(|v| v.value == name)
         }
         _ => true, // A new expression kind must be audited before it enables this proof.
+    }
+}
+
+fn predicate_is_noop(predicate: &Predicate) -> bool {
+    predicate.labels.is_empty()
+        && predicate.expression.is_none()
+        && predicate
+            .properties
+            .as_ref()
+            .is_none_or(|properties| properties.entries.is_empty())
+        && predicate.predicate.is_none()
+}
+
+fn predicate_is_ready(predicate: &Predicate, scope: &Bindings) -> bool {
+    predicate.properties.as_ref().is_none_or(|properties| {
+        properties
+            .entries
+            .iter()
+            .all(|(_, value)| expr_is_ready(value, scope))
+    }) && predicate
+        .predicate
+        .as_ref()
+        .is_none_or(|predicate| expr_is_ready(predicate, scope))
+}
+
+/// A predicate can run only when every variable it reads is already bound.
+/// Unknown expression kinds stay deferred.
+fn expr_is_ready(expr: &ast::Expr, scope: &Bindings) -> bool {
+    use ast::Expr as E;
+    let bound = |name: &ast::Identifier| {
+        scope.contains(&name.value) || scope.references.contains_key(&name.value)
+    };
+    match expr {
+        E::Literal(_) | E::Parameter(_) | E::Wildcard => true,
+        E::Identifier(name) => bound(name),
+        E::Property { base, .. } => expr_is_ready(base, scope),
+        E::Unary { expr, .. }
+        | E::IsNull { expr, .. }
+        | E::IsUnknown { expr, .. }
+        | E::IsTruth { expr, .. }
+        | E::AbsoluteValue { expr }
+        | E::Elements { path: expr }
+        | E::Cast { expr, .. } => expr_is_ready(expr, scope),
+        E::Binary { left, right, .. } | E::NullIf { left, right } => {
+            expr_is_ready(left, scope) && expr_is_ready(right, scope)
+        }
+        E::NumericFunction { args, .. }
+        | E::Coalesce(args)
+        | E::List(args)
+        | E::Function { args, .. } => args.iter().all(|expr| expr_is_ready(expr, scope)),
+        E::ElementId { variable }
+        | E::PropertyExists { variable, .. }
+        | E::IsLabeled { variable, .. }
+        | E::IsDirected { variable, .. } => bound(variable),
+        E::Same { variables } | E::AllDifferent { variables } => variables.iter().all(bound),
+        _ => false,
     }
 }

@@ -57,6 +57,10 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- Apply a MATCH predicate as soon as every variable it reads is bound, so a
+  start-node filter runs before a later variable-length expansion. A predicate
+  that names an element declared later in the same MATCH still waits for that
+  element.
 - Reject a binding-table column that mixes a number with a boolean, string, or
   bytes value. Integers and floats in one column still widen to float.
 - Resolve a `LET` copy of a label-constrained element from that label set, so
