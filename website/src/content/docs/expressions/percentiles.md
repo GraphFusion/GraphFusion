@@ -13,6 +13,6 @@ RETURN PERCENTILE_CONT(value, 0.5) AS continuous,
        PERCENTILE_DISC(value, 0.5) AS discrete;
 ```
 
-The continuous result interpolates (25 here) and has Float64 type. The discrete result chooses an input value (20 here) and preserves its numeric type, including exact Int64 values. Null inputs are omitted; ALL/DISTINCT controls duplicate contribution.
+The continuous result interpolates (25 here) and has Float64 type. An integer continuous percentile interpolates the exact integers and rounds that blend once to Float64. The discrete result chooses an input value (20 here) and preserves its numeric type, including exact Int64 values. Null inputs are omitted; ALL/DISTINCT controls duplicate contribution.
 
 Out-of-range or row-dependent fractions are errors. Use [GROUP BY](/query/group-by/) for per-group percentiles.

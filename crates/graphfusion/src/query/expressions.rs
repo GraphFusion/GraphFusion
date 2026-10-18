@@ -107,7 +107,12 @@ impl<'a> Binder<'a> {
                 ast::Literal::Unknown => ScalarValue::Boolean(None),
                 ast::Literal::Boolean(v) => ScalarValue::Boolean(Some(*v)),
                 ast::Literal::Integer(v) => ScalarValue::Int64(Some(*v)),
-                ast::Literal::Decimal(v) => ScalarValue::Float64(Some(*v)),
+                ast::Literal::Decimal(v) => {
+                    if !v.is_finite() {
+                        return Err(Error::InvalidQuery("non-finite decimal literal".into()));
+                    }
+                    ScalarValue::Float64(Some(*v))
+                }
                 ast::Literal::String(v) => ScalarValue::Utf8(Some(v.clone())),
                 ast::Literal::Bytes(v) => ScalarValue::Binary(Some(v.clone())),
                 _ => return Err(super::unsupported("temporal query literals")),
@@ -153,7 +158,7 @@ impl<'a> Binder<'a> {
                             } else {
                                 "e"
                             },
-                            element.column(crate::graph::ID),
+                            element.ensure_live(element.column(crate::graph::ID), DataType::UInt64),
                         ));
                     }
                     return Err(Error::InvalidQuery(format!(
@@ -245,7 +250,7 @@ impl<'a> Binder<'a> {
                     if element.kind != super::graph::ElementKind::Edge {
                         return Err(Error::InvalidQuery("IS DIRECTED requires an edge".into()));
                     }
-                    element.column("__gf_directed")
+                    element.ensure_live(element.column("__gf_directed"), DataType::Boolean)
                 } else if let Some(reference) = self
                     .bindings
                     .and_then(|b| b.references.get(&variable.value))
@@ -344,7 +349,19 @@ impl<'a> Binder<'a> {
                     B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge => {
                         let a = left.get_type(self.schema)?;
                         let b = right.get_type(self.schema)?;
-                        if a != b
+                        if is_list(&a) || is_list(&b) {
+                            // Empty lists are List(Null) and numeric lists keep their
+                            // element type. Widen to one list type before comparing.
+                            let unified = common_value_type(&a, &b).map_err(|_| {
+                                Error::InvalidQuery(format!("incomparable types {a} and {b}"))
+                            })?;
+                            if a != unified {
+                                left = left.cast_to(&unified, self.schema)?;
+                            }
+                            if b != unified {
+                                right = right.cast_to(&unified, self.schema)?;
+                            }
+                        } else if a != b
                             && a != DataType::Null
                             && b != DataType::Null
                             && !(numeric(&a) && numeric(&b))
@@ -372,6 +389,16 @@ impl<'a> Binder<'a> {
                         DataType::Int64
                     };
                     super::arithmetic::checked(left, operator, right, data_type)
+                } else if matches!(op, B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge) {
+                    let left_type = left.get_type(self.schema)?;
+                    let right_type = right.get_type(self.schema)?;
+                    if super::lists::is_list(&left_type) && super::lists::is_list(&right_type) {
+                        // DataFusion treats null list elements as equal and a null
+                        // element beside a value as unequal. GQL comparisons stay unknown.
+                        super::lists::compare(left, right, &left_type, &right_type, operator)?
+                    } else {
+                        Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
+                    }
                 } else {
                     Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
                 }
@@ -429,17 +456,35 @@ impl<'a> Binder<'a> {
                     .map(|arg| self.bind(arg))
                     .collect::<Result<Vec<_>>>()?;
                 self.compatible(&args)?;
+                let args = self.align_lists(args)?;
                 datafusion::functions::core::expr_fn::coalesce(args)
             }
             E::NullIf { left, right } => {
                 let left = self.bind(left)?;
                 let right = self.bind(right)?;
                 self.compatible(&[left.clone(), right.clone()])?;
-                if left.get_type(self.schema)? == DataType::Null
-                    && right.get_type(self.schema)? == DataType::Null
-                {
+                let (left, right) = self.align_list_pair(left, right)?;
+                let left_type = left.get_type(self.schema)?;
+                let right_type = right.get_type(self.schema)?;
+                if left_type == DataType::Null && right_type == DataType::Null {
                     // Both values are null; avoid DataFusion's fallback to a string type.
                     left
+                } else if super::lists::is_list(&left_type) && super::lists::is_list(&right_type) {
+                    // NULLIF is CASE WHEN equal THEN NULL ELSE left. Unknown equality
+                    // keeps the left list; only a true comparison removes it.
+                    let equal = super::lists::compare(
+                        left.clone(),
+                        right,
+                        &left_type,
+                        &right_type,
+                        Operator::Eq,
+                    )?;
+                    let null = datafusion::logical_expr::lit(ScalarValue::try_from(&left_type)?);
+                    Expr::Case(datafusion::logical_expr::expr::Case::new(
+                        None,
+                        vec![(Box::new(equal), Box::new(null))],
+                        Some(Box::new(left)),
+                    ))
                 } else {
                     datafusion::functions::core::expr_fn::nullif(left, right)
                 }
@@ -527,9 +572,45 @@ impl<'a> Binder<'a> {
             .collect::<Result<Vec<_>>>()?;
         Ok(datafusion::functions_nested::expr_fn::make_array(values))
     }
+
+    fn align_list_pair(&self, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
+        let mut aligned = self.align_lists(vec![left, right])?;
+        let right = aligned.pop().expect("aligned pair");
+        let left = aligned.pop().expect("aligned pair");
+        Ok((left, right))
+    }
+
+    /// Cast list operands to their common element type. Scalar families stay
+    /// untouched so numeric widening remains DataFusion's coercion.
+    fn align_lists(&self, expressions: Vec<Expr>) -> Result<Vec<Expr>> {
+        let mut types = Vec::with_capacity(expressions.len());
+        for expr in &expressions {
+            types.push(expr.get_type(self.schema)?);
+        }
+        if !types.iter().any(is_list) {
+            return Ok(expressions);
+        }
+        let mut unified = DataType::Null;
+        for data_type in &types {
+            unified = common_value_type(&unified, data_type)?;
+        }
+        let mut aligned = Vec::with_capacity(expressions.len());
+        for (expr, data_type) in expressions.into_iter().zip(types) {
+            aligned.push(if data_type == unified {
+                expr
+            } else {
+                expr.cast_to(&unified, self.schema)?
+            });
+        }
+        Ok(aligned)
+    }
 }
 
-fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
+fn is_list(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::List(_) | DataType::LargeList(_))
+}
+
+pub(super) fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
     if left == right || *right == DataType::Null {
         return Ok(left.clone());
     }
