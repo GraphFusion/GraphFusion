@@ -933,3 +933,29 @@ async fn stored_truth_values_use_the_matching_fragment() {
         ]
     );
 }
+
+#[tokio::test]
+async fn optional_misses_and_reference_aliases_keep_stored_boolean_semantics() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {name:'number',v:1}),(:D {name:'text',v:'1'})").await.unwrap();
+    for q in [
+        "OPTIONAL MATCH (n) WHERE FALSE LET classified = (n.v = '1') IS UNKNOWN RETURN classified",
+        "OPTIONAL MATCH (n) WHERE FALSE FILTER n.v = '1' OR TRUE RETURN TRUE AS classified",
+    ] {
+        assert_eq!(
+            strings(&s.query(q).await.unwrap()),
+            vec![vec!["true".to_string()]],
+            "{q}"
+        );
+    }
+    for q in [
+        "MATCH (n) LET r=n FILTER r.v = '1' RETURN r.name AS name",
+        "MATCH (n) LET r=n LET eq=r.v = '1' FILTER eq RETURN r.name AS name",
+    ] {
+        assert_eq!(
+            strings(&s.query(q).await.unwrap()),
+            vec![vec!["text".to_string()]],
+            "{q}"
+        );
+    }
+}

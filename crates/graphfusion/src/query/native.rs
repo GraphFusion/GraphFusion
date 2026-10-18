@@ -769,12 +769,12 @@ pub(super) fn fragment_boolean(
     };
     if filters
         .keys()
-        .any(|name| !scope.elements.contains_key(name))
+        .any(|name| fragment_binding(scope, name).is_none())
     {
         return Ok((plan, None));
     }
     let mixed = filters.iter().any(|(name, atom)| {
-        let Some(binding) = scope.elements.get(name).cloned() else {
+        let Some(binding) = fragment_binding(scope, name) else {
             return false;
         };
         property_mixes(scope, &binding, atom)
@@ -785,8 +785,20 @@ pub(super) fn fragment_boolean(
     let mut plan = plan;
     let mut combined: Option<Expr> = None;
     for (name, atom) in filters {
-        let binding = scope.elements.get(&name).expect("element variable").clone();
-        let (next, expr) = compile_on_fragments(plan, scope, &binding, &atom)?;
+        let binding = fragment_binding(scope, &name).expect("element variable");
+        let (next, mut expr) = compile_on_fragments(plan, scope, &binding, &atom)?;
+        if !scope.elements.contains_key(&name) {
+            let reference = scope.references.get(&name).expect("resolved reference");
+            let column = scope.scalars.get(&name).expect("reference column").clone();
+            expr = Expr::Case(datafusion::logical_expr::expr::Case::new(
+                None,
+                vec![(
+                    Box::new(reference.guard(Expr::Column(column))),
+                    Box::new(expr),
+                )],
+                Some(Box::new(compile(&atom, &Schema::empty())?)),
+            ));
+        }
         plan = next;
         combined = Some(match combined {
             Some(previous) => previous.and(expr),
@@ -794,6 +806,17 @@ pub(super) fn fragment_boolean(
         });
     }
     Ok((plan, combined))
+}
+
+// Multi-part references retain their existing cross-domain type validation.
+fn fragment_binding(scope: &Bindings, name: &str) -> Option<ElementBinding> {
+    scope.elements.get(name).cloned().or_else(|| {
+        let reference = scope.references.get(name)?;
+        match reference.parts.as_slice() {
+            [binding] => Some(binding.clone()),
+            _ => None,
+        }
+    })
 }
 
 fn property_mixes(scope: &Bindings, binding: &ElementBinding, atom: &NativeAtom) -> bool {
@@ -897,6 +920,14 @@ fn compile_on_fragments(
         1 => parts.pop().expect("fragment comparison"),
         _ => coalesce(parts),
     };
+    let expr = Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(binding.column(crate::graph::ID).is_null()),
+            Box::new(compile(atom, &Schema::empty())?),
+        )],
+        Some(Box::new(expr)),
+    ));
     Ok((plan, binding.ensure_live(expr, DataType::Boolean)))
 }
 
