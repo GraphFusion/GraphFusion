@@ -124,6 +124,48 @@ async fn insert_rejects_nonconcrete_labels_without_publishing_writes() {
 }
 
 #[tokio::test]
+async fn insert_bare_label_set_keeps_case_distinct_labels() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (A & a {name: 'n'})-[A & a]->()").await;
+    let result = run(
+        &mut s,
+        "MATCH (n:A) \
+         RETURN n.name AS name, n IS LABELED A AS upper, n IS LABELED a AS lower",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["n", "true", "true"]]);
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:A & a) RETURN n.name AS name").await),
+        vec![vec!["n"]]
+    );
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:a) RETURN n.name AS name").await),
+        vec![vec!["n"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
+                "MATCH ()-[e]->() RETURN e IS LABELED A AS upper, e IS LABELED a AS lower",
+            )
+            .await
+        ),
+        vec![vec!["true", "true"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
+                "MATCH ()-[e:A & a]->() RETURN e IS LABELED a AS lower"
+            )
+            .await
+        ),
+        vec![vec!["true"]]
+    );
+}
+
+#[tokio::test]
 async fn matched_insert_preserves_bags_and_shared_nodes_and_edge_directions() {
     let db = Database::new();
     let mut s = session(&db);
