@@ -246,6 +246,8 @@ fn unified_element(branches: &[Built], name: &str, alias: String) -> Result<grap
         present,
         constrained: constrained && !source_labels.is_empty(),
         source_labels,
+        tombstones: BTreeSet::new(),
+        prior_id: None,
     })
 }
 

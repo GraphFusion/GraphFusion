@@ -290,6 +290,16 @@ impl Table {
             .map(|(batch, deleted)| deleted.filter(batch).map_err(Error::from))
             .collect()
     }
+    pub(crate) fn contains_any(&self, ids: &BTreeSet<u64>) -> Result<bool> {
+        if let Some(file) = &self.file_rows {
+            return Ok(file
+                .locate(ids)?
+                .into_iter()
+                .any(|(_, row)| !self.file_deleted.contains(row)));
+        }
+        Ok(ids.iter().any(|id| self.resident.index.get(*id).is_some()))
+    }
+
     /// Only selected rows are gathered; unaffected property buffers stay shared.
     pub(crate) fn select_ids(&self, ids: &BTreeSet<u64>) -> Result<Option<Arc<dyn TableProvider>>> {
         if let Some(file) = &self.file_rows {
