@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Widen integer, float, and empty lists in `UNION`, `INTERSECT`, `EXCEPT`, and
+  `OTHERWISE`, including nested lists. String and boolean lists stay incompatible
+  with number lists.
 - Compare integer lists with float lists, and compare an empty list with a typed
   list. The operands widen to one element type first, including nested lists.
   `COALESCE` and `NULLIF` use that same list type.

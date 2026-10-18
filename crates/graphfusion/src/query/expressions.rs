@@ -585,7 +585,7 @@ fn is_list(data_type: &DataType) -> bool {
     matches!(data_type, DataType::List(_) | DataType::LargeList(_))
 }
 
-fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
+pub(super) fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {
     if left == right || *right == DataType::Null {
         return Ok(left.clone());
     }
