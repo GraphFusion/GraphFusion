@@ -153,7 +153,7 @@ impl<'a> Binder<'a> {
                             } else {
                                 "e"
                             },
-                            element.column(crate::graph::ID),
+                            element.ensure_live(element.column(crate::graph::ID), DataType::UInt64),
                         ));
                     }
                     return Err(Error::InvalidQuery(format!(
