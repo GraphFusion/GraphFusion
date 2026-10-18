@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Match every orientation in `<~[]~>` and `<~/label/~>`. The closing `>` adds
+  rightward directed edges to the left-or-undirected pattern.
 - Keep working-table order when a query resolves an element reference. A
   preceding `ORDER BY` stays in effect through `LET`, and `FOR` walks a list of
   element references in list order.

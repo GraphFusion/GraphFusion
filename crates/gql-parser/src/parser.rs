@@ -4012,7 +4012,12 @@ impl Parser {
             }
             SimplifiedPrefix::LtTilde => {
                 self.expect(TokenKind::Tilde)?;
-                Ok(Direction::LeftOrUndirected)
+                // `<~/label/~` is left or undirected. `<~/label/~>` also walks right.
+                if self.eat(TokenKind::Gt).is_some() {
+                    Ok(Direction::Any)
+                } else {
+                    Ok(Direction::LeftOrUndirected)
+                }
             }
         }
     }
@@ -4333,8 +4338,14 @@ impl Parser {
                     self.parse_pattern_element_body(TokenKind::RBracket)?;
                 self.expect(TokenKind::RBracket)?;
                 self.expect(TokenKind::Tilde)?;
+                // `<~[]~` is left or undirected. A closing `>` adds rightward edges.
+                let direction = if self.eat(TokenKind::Gt).is_some() {
+                    Direction::Any
+                } else {
+                    Direction::LeftOrUndirected
+                };
                 return Ok(RelationshipPattern {
-                    direction: Direction::LeftOrUndirected,
+                    direction,
                     variable,
                     temporary,
                     labels,
@@ -4344,8 +4355,13 @@ impl Parser {
                     quantifier: self.parse_optional_path_quantifier()?,
                 });
             }
+            let direction = if self.eat(TokenKind::Gt).is_some() {
+                Direction::Any
+            } else {
+                Direction::LeftOrUndirected
+            };
             return Ok(RelationshipPattern {
-                direction: Direction::LeftOrUndirected,
+                direction,
                 variable: None,
                 temporary: false,
                 labels: Vec::new(),

@@ -560,6 +560,42 @@ fn parses_standard_use_graph_clause_without_graph_keyword() {
 }
 
 #[test]
+fn parses_left_or_undirected_closed_by_an_angle() {
+    let program = parse(
+        "MATCH (a)<~>(b), \
+               (a)<~[every]~>(b), \
+               (a)<~/LABEL/~>(b), \
+               (a)<~[left_or_undirected]~(b), \
+               (a)<~/LABEL/~(b) \
+         RETURN a",
+    )
+    .unwrap();
+    let Statement::Query(query) = &program.statements[0] else {
+        panic!("expected query statement");
+    };
+    let patterns = &first_match(query).patterns;
+    assert_eq!(patterns[0].chains[0].relationship.direction, Direction::Any);
+    assert_eq!(patterns[1].chains[0].relationship.direction, Direction::Any);
+    assert_eq!(
+        patterns[1].chains[0].relationship.variable,
+        Some(ident("every"))
+    );
+    assert_eq!(patterns[2].chains[0].relationship.direction, Direction::Any);
+    assert_eq!(
+        patterns[2].chains[0].relationship.labels,
+        vec![ident("LABEL")]
+    );
+    assert_eq!(
+        patterns[3].chains[0].relationship.direction,
+        Direction::LeftOrUndirected
+    );
+    assert_eq!(
+        patterns[4].chains[0].relationship.direction,
+        Direction::LeftOrUndirected
+    );
+}
+
+#[test]
 fn parses_full_undirected_relationship_pattern() {
     let program = parse("MATCH (a)~[r:KNOWS {since: 2020}]~(b) RETURN r, a, b").unwrap();
 
