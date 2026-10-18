@@ -153,6 +153,41 @@ async fn for_lists_indices_nulls_and_parameters() {
 }
 
 #[tokio::test]
+async fn byte_lists_keep_null_elements() {
+    let mut s = Database::new().session();
+    let result = query(
+        &mut s,
+        "FOR x IN [X'0A', NULL, X'0B'] WITH ORDINALITY i RETURN i, x ORDER BY i",
+    )
+    .await;
+    assert_eq!(result.schema.field(1).data_type(), &DataType::Binary);
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec!["1".to_string(), "0A".to_string()],
+            vec!["2".to_string(), "NULL".to_string()],
+            vec!["3".to_string(), "0B".to_string()],
+        ]
+    );
+    check(
+        &mut s,
+        "FOR x IN [NULL, X'FF'] RETURN x",
+        &[&["NULL"], &["FF"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR xs IN [[X'0A', NULL], [X'0B']] FOR x IN xs RETURN x",
+        &[&["0A"], &["NULL"], &["0B"]],
+    )
+    .await;
+    s.execute("SESSION SET VALUE $xs = [X'0A', NULL]; SESSION SET VALUE $typed LIST<BYTES> = [NULL, X'FF']").unwrap();
+    check(&mut s, "FOR x IN $xs RETURN x", &[&["0A"], &["NULL"]]).await;
+    check(&mut s, "FOR x IN $typed RETURN x", &[&["NULL"], &["FF"]]).await;
+    assert!(s.query("RETURN [X'0A', 'text'] AS bad").await.is_err());
+}
+
+#[tokio::test]
 async fn nested_lists_unify_empty_null_and_numeric_elements() {
     let mut s = Database::new().session();
     for source in [

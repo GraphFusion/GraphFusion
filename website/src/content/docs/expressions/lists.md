@@ -12,7 +12,12 @@ RETURN [1, 2, 3] AS numbers, [] AS empty,
        ['Alice', 'Bob'] AS names;
 ```
 
-Lists can contain nulls and compatible numeric values. Nested lists find a common supported element type, including empty and all-null sublists. General heterogeneous union-valued lists are not executable.
+Lists can contain nulls and compatible numeric values. A null byte string is a null element of that list, as with numbers, strings and booleans. Nested lists find a common supported element type, including empty and all-null sublists. General heterogeneous union-valued lists are not executable.
+
+```gql test
+FOR value IN [X'0A', NULL, X'FF']
+RETURN value;
+```
 
 Comparisons widen integer and float lists to one element type, and they accept an empty list beside a typed list. `[1, 2] = [1.0, 2.0]` is true and `[1] = []` is false. `COALESCE` and `NULLIF` use the same list type.
 
