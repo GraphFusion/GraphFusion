@@ -1,4 +1,4 @@
-use super::expressions::Binder;
+use super::{expressions::Binder, native::NativePush};
 use crate::{
     catalog::ObjectId,
     gql as ast,
@@ -201,6 +201,9 @@ pub(super) struct Bindings {
     pub references: BTreeMap<String, super::references::ReferenceBinding>,
     pub sources: BTreeMap<ObjectId, std::sync::Arc<GraphData>>,
     pub domains: BTreeMap<String, super::references::Domain>,
+    /// Element a `LET` name was copied from. Resolving that reference reads
+    /// the source label set instead of every fragment of the element kind.
+    pub reference_sources: BTreeMap<String, ElementBinding>,
     next: usize,
 }
 impl Bindings {
@@ -258,6 +261,15 @@ pub(super) async fn matches(
             }
         }
     }
+    let (clause_filters, clause_push) = match &clause.where_clause {
+        Some(predicate) if !where_runs_after_search(clause, session)? => {
+            match super::native::clause_filters(session, plan.schema(), scope, predicate)? {
+                Some(filters) => (filters, true),
+                None => (BTreeMap::new(), false),
+            }
+        }
+        _ => (BTreeMap::new(), false),
+    };
     let mut compiler = super::patterns::Compiler {
         session,
         graph_id,
@@ -266,6 +278,9 @@ pub(super) async fn matches(
         trace,
         different,
         predicates: Vec::new(),
+        clause_filters,
+        clause_push,
+        clause_hit: BTreeSet::new(),
     };
     let mut edge_lists: Vec<Expr> = Vec::new();
     for path in &clause.patterns {
@@ -287,11 +302,75 @@ pub(super) async fn matches(
         edge_lists.push(state.edges);
     }
     plan = compiler.apply_predicates(plan, scope, 0)?;
+    let pushed = compiler.clause_push
+        && compiler
+            .clause_filters
+            .keys()
+            .all(|name| compiler.clause_hit.contains(name));
     if let Some(predicate) = &clause.where_clause {
-        let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
-        plan = plan.filter(expr)?;
+        if !pushed {
+            let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
+            plan = plan.filter(expr)?;
+        }
     }
     Ok(plan)
+}
+
+/// A selective path search applies the match `WHERE` after ranking. Pushing
+/// that predicate into the scan would change which path wins.
+fn where_runs_after_search(clause: &ast::MatchClause, session: &SessionState) -> Result<bool> {
+    for path in &clause.patterns {
+        if search_is_selective(path, session)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn search_is_selective(path: &ast::PathPattern, session: &SessionState) -> Result<bool> {
+    if !matches!(
+        super::paths::prefix(path.prefix.as_ref(), session)?.1,
+        super::paths::Selection::All
+    ) {
+        return Ok(true);
+    }
+    if let Some(group) = &path.parenthesized {
+        if search_is_selective(&group.pattern, session)? {
+            return Ok(true);
+        }
+    }
+    for factor in &path.factors {
+        if factor_is_selective(factor, session)? {
+            return Ok(true);
+        }
+    }
+    for term in &path.alternatives {
+        for factor in &term.factors {
+            if factor_is_selective(factor, session)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn factor_is_selective(factor: &ast::PathPatternFactor, session: &SessionState) -> Result<bool> {
+    match factor {
+        ast::PathPatternFactor::Parenthesized(group) => {
+            search_is_selective(&group.pattern, session)
+        }
+        ast::PathPatternFactor::Alternation { alternatives, .. } => {
+            for branch in alternatives {
+                for factor in branch {
+                    if factor_is_selective(factor, session)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        ast::PathPatternFactor::Node(_) | ast::PathPatternFactor::Relationship(_) => Ok(false),
+    }
 }
 
 pub(super) fn check_binding(
@@ -316,6 +395,7 @@ pub(super) fn declare(scope: &mut Bindings, name: &str, binding: &ElementBinding
     scope.order.push(name.into());
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 pub(super) fn node(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
@@ -323,6 +403,7 @@ pub(super) fn node(
     graph: &GraphData,
     pattern: &ast::NodePattern,
     endpoint: Option<Expr>,
+    native: &NativePush,
 ) -> Result<(LogicalPlanBuilder, ElementBinding)> {
     if pattern.temporary || pattern.quantifier.is_some() {
         return Err(super::unsupported("temporary or quantified node pattern"));
@@ -358,6 +439,7 @@ pub(super) fn node(
             None,
             label_filter(pattern.label_expression.as_ref(), &pattern.labels),
             None,
+            native,
         )?;
         plan = if let Some(endpoint) = endpoint {
             plan.join_on(
@@ -391,6 +473,7 @@ pub(super) fn predicates_for(
     expression: Option<&ast::LabelExpression>,
     properties: Option<&ast::MapLiteral>,
     predicate: Option<&ast::Expr>,
+    native: &NativePush,
 ) -> Result<LogicalPlanBuilder> {
     if let Some(expression) = expression {
         plan = plan.filter(binding.label(expression))?;
@@ -401,13 +484,16 @@ pub(super) fn predicates_for(
     }
     if let Some(properties) = properties {
         for (name, value) in &properties.entries {
+            if native.properties.contains(&name.value) {
+                continue;
+            }
             let right = Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
             let equality = Binder::with_bindings(session, plan.schema(), scope)
                 .equals(binding.property(&name.value), right)?;
             plan = plan.filter(equality)?;
         }
     }
-    if let Some(predicate) = predicate {
+    if let Some(predicate) = predicate.filter(|_| !native.pushed_where) {
         let expression =
             Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
         plan = plan.filter(expression)?;
@@ -437,7 +523,15 @@ pub(super) fn scan(
     kind: ElementKind,
     direction: Option<ast::Direction>,
 ) -> Result<(LogicalPlan, ElementBinding)> {
-    scan_filtered(scope, graph_id, graph, kind, direction, None)
+    scan_filtered(
+        scope,
+        graph_id,
+        graph,
+        kind,
+        direction,
+        None,
+        &NativePush::default(),
+    )
 }
 
 pub(super) fn scan_filtered(
@@ -447,8 +541,11 @@ pub(super) fn scan_filtered(
     kind: ElementKind,
     direction: Option<ast::Direction>,
     filter: Option<LabelFilter<'_>>,
+    native: &NativePush,
 ) -> Result<(LogicalPlan, ElementBinding)> {
-    scan_tables(scope, graph_id, graph, kind, direction, None, filter, None)
+    scan_tables(
+        scope, graph_id, graph, kind, direction, None, filter, None, native,
+    )
 }
 
 pub(super) fn scan_insert(
@@ -468,7 +565,33 @@ pub(super) fn scan_insert(
         Some((inserted, directed)),
         None,
         None,
+        &NativePush::default(),
     )
+}
+
+/// Derive refresh metadata from the identities still carried by the working
+/// table, rather than unrelated fragments adjacent to its previous label sets.
+pub(super) fn refresh_source(
+    data: &GraphData,
+    before: &ElementBinding,
+    ids: &BTreeSet<u64>,
+) -> Result<ElementBinding> {
+    let tables: Vec<_> = match before.kind {
+        ElementKind::Node => data.nodes.iter().map(|table| &table.0).collect(),
+        ElementKind::Edge => data.edges.iter().map(|table| &table.table).collect(),
+    };
+    let mut selected = Vec::new();
+    for table in tables {
+        if table.contains_any(ids)? {
+            selected.push(table);
+        }
+    }
+    let mut source = before.clone();
+    if !selected.is_empty() {
+        source.properties = graph::property_types(selected.iter().copied())?;
+        source.source_labels = selected.iter().map(|table| table.labels.clone()).collect();
+    }
+    Ok(source)
 }
 
 /// Re-read an element after a write without adopting another type's schema.
@@ -487,6 +610,7 @@ pub(super) fn scan_refresh(
         None,
         None,
         before.constrained.then_some(before),
+        &NativePush::default(),
     )
 }
 
@@ -500,6 +624,7 @@ fn scan_tables(
     inserted: Option<(&Table, bool)>,
     filter: Option<LabelFilter<'_>>,
     refresh_of: Option<&ElementBinding>,
+    native: &NativePush,
 ) -> Result<(LogicalPlan, ElementBinding)> {
     let all_tables: Vec<(&Table, bool)> = match kind {
         ElementKind::Node => graph.nodes.iter().map(|table| (&table.0, false)).collect(),
@@ -524,19 +649,66 @@ fn scan_tables(
         Some(table) => vec![table],
         None => matched,
     };
-    // A label that matches nothing still names the element kind's properties.
-    // A bare null literal has no column and makes an empty aggregate emit a group.
-    let schema_source = if scanned.is_empty() && inserted.is_none() && refresh_of.is_none() {
-        all_tables
+    // A label that matches nothing still names the element kind's properties, so
+    // an empty aggregate does not invent a group from a constant null. The
+    // columns stay untyped: copying another label's type makes `n.id = 1` fail
+    // when some unrelated fragment stores that name as a string.
+    let properties = if let Some(before) = refresh_of {
+        before.properties.clone()
+    } else if scanned.is_empty() && inserted.is_none() {
+        let mut properties = BTreeMap::new();
+        for (table, _) in &all_tables {
+            for field in table.schema.fields() {
+                if !field.name().starts_with("__gf_") {
+                    properties
+                        .entry(field.name().clone())
+                        .or_insert(DataType::Null);
+                }
+            }
+        }
+        properties
     } else {
-        scanned.clone()
+        graph::property_types(scanned.iter().map(|(table, _)| *table))?
     };
-    let properties = graph::property_types(schema_source.iter().map(|(table, _)| *table))?;
-    let source_labels: Vec<_> = scanned
-        .iter()
-        .map(|(table, _)| table.labels.clone())
-        .collect();
-    let labels: BTreeSet<_> = source_labels.iter().flatten().cloned().collect();
+    if let Some(atom) = &native.filter {
+        super::native::validate(atom, scanned.iter().map(|(table, _)| *table))?;
+    }
+    // A refresh also reads a one-label-apart fragment so a label edit can find
+    // the moved row. That neighbor must not contribute property names or types:
+    // unifying it would stringify a value the pattern had already excluded.
+    let (properties, source_labels, labels) = if let Some(before) = refresh_of {
+        let exact = scanned.iter().filter(|(table, _)| {
+            before
+                .source_labels
+                .iter()
+                .any(|labels| labels == &table.labels)
+        });
+        let mut properties = before.properties.clone();
+        for (name, data_type) in graph::property_types(exact.map(|(table, _)| *table))? {
+            properties.entry(name).or_insert(data_type);
+        }
+        let labels = if scanned.is_empty() {
+            before
+                .source_labels
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        } else {
+            scanned
+                .iter()
+                .flat_map(|(table, _)| table.labels.iter().cloned())
+                .collect::<BTreeSet<_>>()
+        };
+        (properties, before.source_labels.clone(), labels)
+    } else {
+        let source_labels: Vec<_> = scanned
+            .iter()
+            .map(|(table, _)| table.labels.clone())
+            .collect();
+        let labels = source_labels.iter().flatten().cloned().collect();
+        (properties, source_labels, labels)
+    };
     let binding = ElementBinding {
         alias: format!("__gf_element_{}", scope.next),
         graph: graph_id,
@@ -603,6 +775,9 @@ fn scan_tables(
             if reverse && both {
                 scan = scan.filter(col(graph::SOURCE).not_eq(col(graph::DESTINATION)))?;
             }
+            if let Some(atom) = &native.filter {
+                scan = scan.filter(super::native::compile(atom, table.schema.as_ref())?)?;
+            }
             let mut projections = vec![col(graph::ID)];
             if kind == ElementKind::Edge {
                 projections.extend([
@@ -624,13 +799,24 @@ fn scan_tables(
                 ]);
             }
             for (name, data_type) in &binding.properties {
-                let present = table.schema.field_with_name(name).ok();
-                projections.push(match present {
-                    Some(field) if field.data_type() == data_type => col(name),
-                    Some(_) => cast(col(name), data_type.clone()).alias(name),
-                    None => lit(ScalarValue::try_from(data_type)?).alias(name),
+                let field = table.schema.field_with_name(name).ok();
+                // A neighbor fragment can store the same name differently. Cast
+                // only a widening that fits; an incompatible value stays null
+                // instead of failing the rows this fragment does not describe.
+                let compatible = field.is_some_and(|field| {
+                    field.data_type() == data_type
+                        || graph::property_fits(field.data_type(), data_type)
                 });
-                projections.push(lit(present.is_some()).alias(&binding.present[name]));
+                projections.push(if compatible {
+                    if field.is_some_and(|field| field.data_type() == data_type) {
+                        col(name)
+                    } else {
+                        cast(col(name), data_type.clone()).alias(name)
+                    }
+                } else {
+                    lit(ScalarValue::try_from(data_type)?).alias(name)
+                });
+                projections.push(lit(compatible).alias(&binding.present[name]));
             }
             for (label, column) in &binding.labels {
                 projections.push(lit(table.labels.contains(label)).alias(column));
@@ -671,6 +857,8 @@ fn scan_tables(
         binding,
     ))
 }
+/// Exact label sets define the binding schema. A one-label-apart fragment is
+/// included only so a label edit can find the moved row.
 fn refreshes(table: &Table, before: &ElementBinding) -> bool {
     if before
         .source_labels
