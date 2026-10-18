@@ -155,8 +155,12 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
 
 pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
     Ok(match atom {
-        NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
-        NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
+        NativeAtom::And(left, right) => {
+            super::expressions::logical_and(compile(left, schema)?, compile(right, schema)?)
+        }
+        NativeAtom::Or(left, right) => {
+            super::expressions::logical_or(compile(left, schema)?, compile(right, schema)?)
+        }
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
         NativeAtom::Compare {
             property,

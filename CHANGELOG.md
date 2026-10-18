@@ -12,6 +12,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Evaluate `AND`, `OR`, and `XOR` per row. An operand that cannot change that
+  row is skipped, so a guarded division by zero no longer fails because other
+  rows in the batch still need the quotient. A row that needs the operand still
+  reports the arithmetic error.
 
 ## 0.2.0 — 2026-10-05
 

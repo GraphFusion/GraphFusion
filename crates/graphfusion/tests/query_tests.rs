@@ -370,3 +370,107 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         Err(Error::SessionClosed)
     ));
 }
+
+fn column(result: &QueryResult, index: usize) -> Vec<ScalarValue> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .map(move |row| ScalarValue::try_from_array(batch.column(index), row).unwrap())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn boolean_operators_skip_operands_that_cannot_change_the_row() {
+    let mut session = Database::new().session();
+    let kept = session
+        .query("FOR n IN [0, 2, 4] FILTER n = 0 OR 10 / n > 2 RETURN n AS n ORDER BY n")
+        .await
+        .unwrap();
+    assert_eq!(
+        column(&kept, 0),
+        vec![ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(2))]
+    );
+
+    let projected = session
+        .query(
+            "FOR n IN [0, 2, 4] \
+             RETURN n = 0 OR 10 / n > 2 AS keep \
+             ORDER BY n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        column(&projected, 0),
+        vec![
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(false)),
+        ]
+    );
+
+    let divided = session
+        .query("FOR n IN [0, 2, 4] FILTER n <> 0 AND 10 / n > 2 RETURN n AS n ORDER BY n")
+        .await
+        .unwrap();
+    assert_eq!(column(&divided, 0), vec![ScalarValue::Int64(Some(2))]);
+
+    let guarded = session
+        .query(
+            "FOR n IN [0, 4, 2] \
+             FILTER n = 0 OR n = 4 OR 10 / n > 2 \
+             RETURN n AS n ORDER BY n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        column(&guarded, 0),
+        vec![
+            ScalarValue::Int64(Some(0)),
+            ScalarValue::Int64(Some(2)),
+            ScalarValue::Int64(Some(4)),
+        ]
+    );
+
+    let constants = session
+        .query("FOR n IN [0, 0, 0] FILTER n = 0 OR 10 / 0 > 2 RETURN n AS n")
+        .await
+        .unwrap();
+    assert_eq!(constants.row_count(), 3);
+
+    let truth = session
+        .query(
+            "RETURN TRUE OR 1 / 0 > 1 AS t, \
+             FALSE AND 1 / 0 > 1 AS f, \
+             NULL XOR 1 / 0 > 1 AS x, \
+             NOT (FALSE AND 1 / 0 > 1) AS n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&truth),
+        vec![
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(None),
+            ScalarValue::Boolean(Some(true)),
+        ]
+    );
+
+    for query in [
+        "FOR n IN [0, 2, 4] FILTER n = 1 OR 10 / n > 2 RETURN n AS n",
+        "FOR n IN [0, NULL] FILTER n = 0 OR 10 / 0 > 2 RETURN n AS n",
+        "RETURN NULL OR 1 / 0 > 1 AS n",
+        "RETURN TRUE XOR 1 / 0 > 1 AS n",
+        "RETURN FALSE OR 1 / 0 > 1 AS n",
+        "RETURN TRUE AND 1 / 0 > 1 AS n",
+    ] {
+        let err = session.query(query).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("zero"),
+            "{query}: {err}"
+        );
+    }
+}

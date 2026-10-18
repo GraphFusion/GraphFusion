@@ -2,7 +2,7 @@ use crate::{gql as ast, Error, Result, SessionState, Value};
 use datafusion::{
     arrow::datatypes::DataType,
     common::{Column, DFSchema, ScalarValue},
-    logical_expr::{expr::BinaryExpr, Expr, ExprSchemable, Operator},
+    logical_expr::{expr::BinaryExpr, lit, Expr, ExprSchemable, Operator},
 };
 
 pub(super) struct Binder<'a> {
@@ -313,11 +313,11 @@ impl<'a> Binder<'a> {
                     B::And | B::Or | B::Xor => {
                         self.require(&left, boolean, "boolean operand")?;
                         self.require(&right, boolean, "boolean operand")?;
-                        match op {
-                            B::And => Operator::And,
-                            B::Or => Operator::Or,
-                            _ => Operator::NotEq,
-                        }
+                        return Ok(match op {
+                            B::And => logical_and(left, right),
+                            B::Or => logical_or(left, right),
+                            _ => logical_xor(left, right),
+                        });
                     }
                     B::Add | B::Sub | B::Mul | B::Div => {
                         self.require(&left, numeric, "numeric operand")?;
@@ -585,4 +585,123 @@ fn string(data_type: &DataType) -> bool {
         data_type,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
     )
+}
+
+/// Three-valued `AND` that evaluates `right` only on rows where `left` is not false.
+///
+/// DataFusion's physical `AND` evaluates the other operand for every row unless
+/// almost the whole batch is already false. A searched `CASE` drops decided rows
+/// before the next `WHEN`. The result is an integer flag, not a boolean `CASE`:
+/// comparing a boolean `CASE` with a literal is rewritten back into that batch
+/// operator.
+pub(super) fn logical_and(left: Expr, right: Expr) -> Expr {
+    boolean_flag(
+        vec![
+            (same_bool(left.clone(), false), lit(0_i64)),
+            (same_bool(right.clone(), false), lit(0_i64)),
+            (
+                eager_and(same_bool(left, true), same_bool(right, true)),
+                lit(1_i64),
+            ),
+        ],
+        lit(ScalarValue::Int64(None)),
+    )
+}
+
+/// Three-valued `OR` that evaluates `right` only on rows where `left` is not true.
+pub(super) fn logical_or(left: Expr, right: Expr) -> Expr {
+    boolean_flag(
+        vec![
+            (same_bool(left.clone(), true), lit(1_i64)),
+            (same_bool(right.clone(), true), lit(1_i64)),
+            (
+                eager_and(same_bool(left, false), same_bool(right, false)),
+                lit(0_i64),
+            ),
+        ],
+        lit(ScalarValue::Int64(None)),
+    )
+}
+
+/// Three-valued `XOR`. A null operand makes the result null without evaluating
+/// the other operand.
+pub(super) fn logical_xor(left: Expr, right: Expr) -> Expr {
+    boolean_flag(
+        vec![
+            (left.clone().is_null(), lit(ScalarValue::Int64(None))),
+            (right.clone().is_null(), lit(ScalarValue::Int64(None))),
+            (left.not_eq(right), lit(1_i64)),
+        ],
+        lit(0_i64),
+    )
+}
+
+fn same_bool(expr: Expr, value: bool) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(expr),
+        Operator::IsNotDistinctFrom,
+        Box::new(lit(value)),
+    ))
+}
+
+/// Both inputs have already been evaluated by an earlier `WHEN`.
+fn eager_and(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::And,
+        Box::new(right),
+    ))
+}
+
+fn boolean_flag(when_then: Vec<(Expr, Expr)>, else_expr: Expr) -> Expr {
+    use datafusion::logical_expr::expr::Case;
+    let flag = Expr::Case(Case::new(
+        None,
+        when_then
+            .into_iter()
+            .map(|(when, then)| (Box::new(when), Box::new(then)))
+            .collect(),
+        Some(Box::new(else_expr)),
+    ));
+    flag_udf().call(vec![flag])
+}
+
+fn flag_udf() -> &'static datafusion::logical_expr::ScalarUDF {
+    use datafusion::{
+        arrow::array::{BooleanArray, Int64Array},
+        error::DataFusionError,
+        logical_expr::{create_udf, ColumnarValue, ScalarUDF, Volatility},
+    };
+    use std::sync::{Arc, LazyLock};
+
+    static FLAG: LazyLock<ScalarUDF> = LazyLock::new(|| {
+        create_udf(
+            "gql_boolean_flag",
+            vec![DataType::Int64],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|args| {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let flags = arrays[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("expected Int64 boolean flag".into())
+                    })?;
+                let output: BooleanArray =
+                    flags.iter().map(|value| value.map(|n| n != 0)).collect();
+                if args
+                    .iter()
+                    .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+                {
+                    Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                        &output, 0,
+                    )?))
+                } else {
+                    Ok(ColumnarValue::Array(Arc::new(output)))
+                }
+            }),
+        )
+    });
+    &FLAG
 }
