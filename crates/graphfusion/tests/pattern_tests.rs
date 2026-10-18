@@ -149,6 +149,22 @@ async fn questioned_paths_expose_conditional_singletons() {
         .unwrap_err()
         .to_string()
         .contains("conditional"));
+    // The absent branch reuses the anchored endpoint instead of joining a node scan.
+    let plan = query(&mut s, q).await.logical_plan;
+    let absent = plan
+        .split("make_array(array_element(")
+        .nth(1)
+        .expect("reused endpoint")
+        .split("Projection:")
+        .next()
+        .expect("absent branch");
+    assert!(
+        !absent.contains("Inner Join") && !absent.contains("__gf_scan"),
+        "absent branch scanned nodes:\n{absent}"
+    );
+    let q = "MATCH p = ((a)-[e:E]->(b))?(c) RETURN COUNT(*) AS n";
+    // Four zero-hop anchors plus one row for each :E edge.
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["9"]]);
 }
 #[tokio::test]
 async fn union_and_multiset_alternation_preserve_the_right_bags() {

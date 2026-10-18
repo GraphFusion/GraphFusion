@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep an anchored optional path segment on its known endpoint. The empty
+  alternative no longer scans every node to copy that same id.
 - Widen integer, float, and empty lists in `UNION`, `INTERSECT`, `EXCEPT`, and
   `OTHERWISE`, including nested lists. String and boolean lists stay incompatible
   with number lists.
