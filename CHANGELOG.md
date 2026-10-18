@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep working-table order when a query resolves an element reference. A
+  preceding `ORDER BY` stays in effect through `LET`, and `FOR` walks a list of
+  element references in list order.
 - Reject a null INSERT endpoint as an invalid query. A failed OPTIONAL MATCH no
   longer surfaces an internal Arrow error, and the statement inserts nothing.
 - Cap a selective search of one unbounded edge at the complete node-derived hop
