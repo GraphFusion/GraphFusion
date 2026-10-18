@@ -12,6 +12,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Apply an earlier `LIMIT` or `OFFSET` before a later `ORDER BY`, so the later
+  sort reorders only that window.
 
 ## 0.2.0 — 2026-10-05
 

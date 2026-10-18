@@ -23,3 +23,13 @@ RETURN n ORDER BY n ASC NULLS LAST;
 Ordering can refer to output aliases, including element aliases and their properties. With DISTINCT, ordering expressions must depend on projected results. Aggregate queries may order by available grouping and aggregate expressions.
 
 ORDER BY can also appear in the linear pipeline before the result clause. A later operation can affect row order; put the final ORDER BY with the result when ordering matters to the caller.
+
+An earlier `LIMIT` or `OFFSET` selects its window before a later `ORDER BY`. That later sort reorders only the selected rows.
+
+```gql test
+FOR n IN [10, 20, 30]
+ORDER BY n ASC
+OFFSET 1
+ORDER BY n DESC
+RETURN n;
+```
