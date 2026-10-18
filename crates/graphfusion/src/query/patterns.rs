@@ -438,7 +438,11 @@ impl Compiler<'_> {
         let opened = if endpoint.is_none() && reuses_known_endpoint(first) {
             match remaining.split_first() {
                 Some((ast::PathPatternFactor::Relationship(edge), rest))
-                    if edge.quantifier.is_none() && !edge.temporary =>
+                    if !edge.temporary
+                        && edge
+                            .quantifier
+                            .as_ref()
+                            .is_none_or(|q| matches!(raw_bounds(q), Ok((min, _)) if min >= 1)) =>
                 {
                     Some((edge, rest))
                 }
@@ -448,7 +452,38 @@ impl Compiler<'_> {
             None
         };
         let (mut plan, mut state, rest) = if let Some((edge, rest)) = opened {
-            let (plan, state) = self.open_edge(plan, scope, edge)?;
+            let (plan, state) = if let Some(q) = &edge.quantifier {
+                let mut edge = edge.clone();
+                let (min, max) = raw_bounds(q)?;
+                if max.is_none() && mode == ast::PathMode::Walk && !self.different {
+                    edge.quantifier = Some(ast::PathPatternQuantifier::Range {
+                        min: Some(min),
+                        max: finite.map(|bound| bound.max(min).max(1)),
+                    });
+                }
+                let native = NativePush::prepare(
+                    self.session,
+                    plan.schema(),
+                    scope,
+                    edge.variable.as_ref().map(|name| name.value.as_str()),
+                    edge.properties.as_ref(),
+                    edge.where_clause.as_ref(),
+                )?;
+                paths::expand(
+                    plan,
+                    scope,
+                    self.session,
+                    self.graph_id,
+                    self.data,
+                    &edge,
+                    None,
+                    mode,
+                    self.different,
+                    &native,
+                )?
+            } else {
+                self.open_edge(plan, scope, edge)?
+            };
             (plan.filter(state.valid(mode, self.different))?, state, rest)
         } else {
             let (plan, state) = match endpoint {
@@ -498,7 +533,7 @@ impl Compiler<'_> {
                             self.graph_id,
                             self.data,
                             &edge,
-                            &state,
+                            Some(&state),
                             mode,
                             self.different,
                             &native,

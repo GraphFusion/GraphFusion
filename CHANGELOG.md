@@ -2,6 +2,11 @@
 
 ## 0.3.0 — Unreleased
 
+- Read a positive-length quantified edge from the edge itself when the path
+  start is anonymous and unconstrained. `()-[:E]->+()` no longer cross-joins
+  every node before the first hop. A named, labeled, or constrained start still
+  reads the node tables, and a quantifier that allows zero repetitions still
+  anchors on every node.
 - Reject a decimal literal that overflows to infinity. `1e999` is a bad number,
   rather than the Float64 value `inf`, in queries and session initializers.
 - Start an anonymous path at its first edge. `()-[]->()` no longer cross-joins
