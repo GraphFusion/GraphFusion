@@ -12,6 +12,14 @@
 - A label that matches no fragment keeps property names as untyped columns.
   It does not borrow another type's Arrow type, so a filter on the empty
   match is not rejected because unrelated labels disagree.
+- An integer inserted or assigned into an existing float property widens to
+  float. The stored column type does not change, and a narrowing assignment
+  is still rejected.
+- An all-null binding-table column stays untyped, so comparing it with a
+  graph property does not fail as a string/integer mismatch.
+- Compare a filter on each fragment's stored property type before a multi-type
+  scan unifies those columns. An integer comparison stays numeric, and a
+  fragment that cannot compare is unknown rather than a match.
 
 ## 0.2.0 — 2026-10-05
 
