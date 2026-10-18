@@ -235,6 +235,84 @@ async fn typed_parameter_nulls_and_numeric_initializers_keep_their_type_family()
 }
 
 #[tokio::test]
+async fn float_parameters_reject_integers_that_are_not_exact() {
+    let mut session = Database::new().session();
+    for statement in [
+        "SESSION SET VALUE $f FLOAT = 9007199254740993",
+        "SESSION SET VALUE $f DOUBLE = -9007199254740993",
+        "SESSION SET VALUE $f REAL = 9223372036854775807",
+        "SESSION SET VALUE $xs LIST<FLOAT> = [1, 9007199254740993]",
+        "SESSION SET VALUE $nested LIST<LIST<FLOAT>> = [[9007199254740995]]",
+    ] {
+        assert!(
+            matches!(session.execute(statement), Err(Error::InvalidDefinition(_))),
+            "{statement}"
+        );
+    }
+    assert!(matches!(
+        session.query("RETURN $f AS f").await,
+        Err(Error::NotFound(_))
+    ));
+
+    session
+        .execute(
+            "SESSION SET VALUE $exact FLOAT = 9007199254740992; \
+             SESSION SET VALUE $next FLOAT = 9007199254740994; \
+             SESSION SET VALUE $one FLOAT = 1; \
+             SESSION SET VALUE $half FLOAT = 1.5; \
+             SESSION SET VALUE $missing FLOAT = NULL; \
+             SESSION SET VALUE $xs LIST<FLOAT> = [9007199254740992, NULL, 2]; \
+             SESSION SET VALUE $big INTEGER = 9007199254740993",
+        )
+        .unwrap();
+    let result = session
+        .query(
+            "RETURN $exact AS exact, $next AS next, $one AS one, $half AS half, \
+             $missing AS missing, $big AS big",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(result.schema.field(4).data_type(), &DataType::Float64);
+    assert_eq!(result.schema.field(5).data_type(), &DataType::Int64);
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(Some(9007199254740994.0)),
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Float64(Some(1.5)),
+            ScalarValue::Float64(None),
+            ScalarValue::Int64(Some(9007199254740993)),
+        ]
+    );
+    let list = session
+        .query("FOR x IN $xs RETURN x ORDER BY x")
+        .await
+        .unwrap();
+    assert_eq!(list.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        column(&list),
+        vec![
+            ScalarValue::Float64(Some(2.0)),
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(None),
+        ]
+    );
+}
+
+fn column(result: &QueryResult) -> Vec<ScalarValue> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .map(|row| ScalarValue::try_from_array(batch.column(0), row).unwrap())
+        })
+        .collect()
+}
+
+#[tokio::test]
 async fn let_scope_delimited_identifiers_filter_and_result_aliases() {
     let mut session = Database::new().session();
     let result = session.query("LET `a.b` = 6 LET y = `a.b` + 1 FILTER y > 5 RETURN y AS result ORDER BY result DESC NULLS FIRST LIMIT 1").await.unwrap();

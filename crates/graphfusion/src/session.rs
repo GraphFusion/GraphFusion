@@ -1038,9 +1038,8 @@ fn check_value(tx: &mut StatementTxn, value: &Value, t: &ValueType) -> Result<()
         };
     }
     let valid = match (t.kind.as_str(), value) {
-        ("any", _)
-        | ("boolean", Value::Boolean(_))
-        | ("float", Value::Float(_) | Value::Integer(_)) => true,
+        ("any", _) | ("boolean", Value::Boolean(_)) | ("float", Value::Float(_)) => true,
+        ("float", Value::Integer(v)) => integer_fits_float(*v),
         ("integer", Value::Integer(v)) => {
             let bits = t.parameters.get("precision").copied().unwrap_or(64);
             if t.parameters.get("signed") == Some(&0) {
@@ -1127,6 +1126,14 @@ fn check_value(tx: &mut StatementTxn, value: &Value, t: &ValueType) -> Result<()
         )))
     }
 }
+/// An integer satisfies FLOAT only when Float64 can store that same value.
+fn integer_fits_float(integer: i64) -> bool {
+    let as_float = integer as f64;
+    // Values that round to 2^63 saturate when cast back to i64, so a round trip
+    // alone would accept integers that float cannot store.
+    as_float < 9223372036854775808.0 && as_float as i64 == integer
+}
+
 fn validate_timezone(zone: &str) -> Result<()> {
     if zone == "UTC" || zone == "Z" {
         return Ok(());
