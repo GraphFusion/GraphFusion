@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Reject a null INSERT endpoint as an invalid query. A failed OPTIONAL MATCH no
+  longer surfaces an internal Arrow error, and the statement inserts nothing.
 - Cap a selective search of one unbounded edge at the complete node-derived hop
   bound. `ANY SHORTEST` and the other selectors no longer expand every trail out
   to the edge count when a shorter bound is complete. `ALL` still follows the

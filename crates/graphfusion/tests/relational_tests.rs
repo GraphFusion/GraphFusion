@@ -579,11 +579,36 @@ async fn optional_mutation_null_targets_are_noops_without_losing_rows() {
     };
     assert_eq!(result.affected_elements, 0);
     assert_eq!(rows(result), &[vec!["1"], vec!["3"], vec!["20"]]);
-    assert!(s
+    let err = s
         .run("OPTIONAL MATCH (b:Absent) INSERT (:N {v: 9})-[:E]->(b)")
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(err.to_string().contains("null INSERT endpoint"), "{err}");
     check(&mut s, "MATCH (n:N) RETURN COUNT(*) AS c", &[&["3"]]).await;
+    let mut t = fixture().await;
+    let err = t
+        .run("MATCH (a:N) OPTIONAL MATCH (a)-[:E]->(b) INSERT (a)-[:F]->(b)")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("null INSERT endpoint"), "{err}");
+    check(&mut t, "MATCH ()-[e:F]->() RETURN COUNT(*) AS c", &[&["0"]]).await;
+    let err = t
+        .run("OPTIONAL MATCH (a:Absent) INSERT (a)-[:E]->(:N {v: 8})")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("null INSERT endpoint"), "{err}");
+    check(&mut t, "MATCH (n:N {v: 8}) RETURN COUNT(*) AS c", &[&["0"]]).await;
+    let err = t
+        .run("MATCH (a:N {v: 1}) OPTIONAL MATCH (a)-[:Missing]->(b) INSERT (a)-[:G]->(:N {v: 9})-[:G]->(b)")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("null INSERT endpoint"), "{err}");
+    check(&mut t, "MATCH (n:N {v: 9}) RETURN COUNT(*) AS c", &[&["0"]]).await;
+    check(&mut t, "MATCH ()-[e:G]->() RETURN COUNT(*) AS c", &[&["0"]]).await;
+    t.run("MATCH (a:N {v: 1})-[:E]->(b) INSERT (a)-[:F]->(b)")
+        .await
+        .unwrap();
+    check(&mut t, "MATCH ()-[e:F]->() RETURN COUNT(*) AS c", &[&["1"]]).await;
 }
 
 #[tokio::test]
