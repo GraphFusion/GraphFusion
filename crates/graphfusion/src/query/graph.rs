@@ -113,6 +113,9 @@ pub(super) struct Bindings {
     pub references: BTreeMap<String, super::references::ReferenceBinding>,
     pub sources: BTreeMap<ObjectId, std::sync::Arc<GraphData>>,
     pub domains: BTreeMap<String, super::references::Domain>,
+    /// Element a `LET` name was copied from. Resolving that reference reads
+    /// the source label set instead of every fragment of the element kind.
+    pub reference_sources: BTreeMap<String, ElementBinding>,
     next: usize,
 }
 impl Bindings {
