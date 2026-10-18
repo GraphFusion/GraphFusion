@@ -15,6 +15,6 @@ RETURN b.name AS destination;
 
 The duplicated alternative still returns Bob once. Replacing `|` with `|+|` returns two occurrences.
 
-Branches align variables by name and pad absent bindings with typed nulls. Incompatible element kinds or group/singleton exposures are rejected. Equal incoming rows remain separate; deduplication does not collapse the entire input table.
+Branches align variables by name and pad absent bindings with typed nulls. A shared element uses one binding: integers widen to float, other mixed scalars are read as strings, and a property stored on only one branch is null on the other. Incompatible element kinds or group/singleton exposures are rejected. Equal incoming rows remain separate; deduplication does not collapse the entire input table.
 
 A variable absent from one branch is conditional. Its implicit reuse inside the same MATCH is restricted, but it can appear in expressions or in a later MATCH. See [questioned paths](/patterns/questioned/) for another source of conditional bindings.
