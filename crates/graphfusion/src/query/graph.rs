@@ -481,6 +481,31 @@ pub(super) fn scan_insert(
     )
 }
 
+/// Derive refresh metadata from the identities still carried by the working
+/// table, rather than unrelated fragments adjacent to its previous label sets.
+pub(super) fn refresh_source(
+    data: &GraphData,
+    before: &ElementBinding,
+    ids: &BTreeSet<u64>,
+) -> Result<ElementBinding> {
+    let tables: Vec<_> = match before.kind {
+        ElementKind::Node => data.nodes.iter().map(|table| &table.0).collect(),
+        ElementKind::Edge => data.edges.iter().map(|table| &table.table).collect(),
+    };
+    let mut selected = Vec::new();
+    for table in tables {
+        if table.contains_any(ids)? {
+            selected.push(table);
+        }
+    }
+    let mut source = before.clone();
+    if !selected.is_empty() {
+        source.properties = graph::property_types(selected.iter().copied())?;
+        source.source_labels = selected.iter().map(|table| table.labels.clone()).collect();
+    }
+    Ok(source)
+}
+
 /// Re-read an element after a write without adopting another type's schema.
 pub(super) fn scan_refresh(
     scope: &mut Bindings,

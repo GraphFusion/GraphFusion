@@ -249,7 +249,7 @@ pub(super) async fn apply(
                 if let Some((patch, ids)) = patch {
                     data = edit_graph(&data, binding.kind, &patch, &ids, &edit, ctx, trace).await?;
                     writes.affected += ids.len();
-                    plan = refresh(plan, scope, id, &data)?;
+                    plan = refresh(plan, scope, id, &data, ctx, trace).await?;
                     plan = freeze(plan, ctx, trace, None).await?;
                 }
             }
@@ -282,7 +282,7 @@ pub(super) async fn apply(
                 {
                     data = edit_graph(&data, binding.kind, &patch, &ids, &edit, ctx, trace).await?;
                     writes.affected += ids.len();
-                    plan = refresh(plan, scope, id, &data)?;
+                    plan = refresh(plan, scope, id, &data, ctx, trace).await?;
                     plan = freeze(plan, ctx, trace, None).await?;
                 }
             }
@@ -330,7 +330,7 @@ pub(super) async fn apply(
             scope.domains.retain(|name, _| !removed.contains(name));
             scope.order.retain(|name| !removed.contains(name));
             if affected != 0 {
-                plan = refresh(plan, scope, id, &data)?;
+                plan = refresh(plan, scope, id, &data, ctx, trace).await?;
             }
         }
         _ => unreachable!("mutation dispatch"),
@@ -339,7 +339,7 @@ pub(super) async fn apply(
         // Keep allocated identity projections below reference lookup joins.
         plan = freeze(plan, ctx, trace, None).await?;
     }
-    plan = super::references::refresh(plan, scope, id, &data)?;
+    plan = super::references::refresh(plan, scope, id, &data, ctx, trace).await?;
     if !scope.references.is_empty() {
         plan = freeze(plan, ctx, trace, None).await?;
     }
@@ -743,11 +743,13 @@ async fn edit_graph(
     GraphData::from_mutation(nodes, edges)
 }
 
-fn refresh(
+async fn refresh(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     graph_id: ObjectId,
     data: &GraphData,
+    ctx: &SessionContext,
+    trace: &mut Trace,
 ) -> Result<LogicalPlanBuilder> {
     let old: Vec<_> = scope
         .elements
@@ -756,6 +758,13 @@ fn refresh(
         .map(|(name, b)| (name.clone(), b.clone()))
         .collect();
     for (name, before) in old {
+        let ids = delete_ids(
+            Some(plan.clone().project([before.column(ID).alias(ID)])?),
+            ctx,
+            trace,
+        )
+        .await?;
+        let before = graph::refresh_source(data, &before, &ids)?;
         let retained: Vec<_> = plan
             .schema()
             .columns()
@@ -779,11 +788,11 @@ fn refresh(
             .project(retained.into_iter().chain(appended))?;
         scope.elements.insert(name, after);
     }
-    super::references::refresh(plan, scope, graph_id, data)
+    super::references::refresh(plan, scope, graph_id, data, ctx, trace).await
 }
 
 /// Collect identities once, skipping null targets before touching any fragment.
-async fn delete_ids(
+pub(super) async fn delete_ids(
     plan: Option<LogicalPlanBuilder>,
     ctx: &SessionContext,
     trace: &mut Trace,

@@ -295,6 +295,13 @@ pub(super) fn resolve(
                 } else {
                     graph::scan(scope, id, &data, kind, None)?
                 };
+                if template.as_ref().is_some_and(|source| {
+                    source.constrained && source.graph == id && source.kind == kind
+                }) {
+                    scope
+                        .reference_sources
+                        .insert(name.clone(), binding.clone());
+                }
                 let matched = key(0)
                     .eq(lit(id))
                     .and(key(1).eq(lit(if kind == ElementKind::Node { "n" } else { "e" })))
@@ -334,11 +341,13 @@ pub(super) async fn prepare(
     super::execution::freeze(plan, ctx, trace, None).await
 }
 
-pub(super) fn refresh(
+pub(super) async fn refresh(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     graph: ObjectId,
     data: &GraphData,
+    ctx: &datafusion::execution::context::SessionContext,
+    trace: &mut super::execution::Trace,
 ) -> Result<LogicalPlanBuilder> {
     scope.sources.insert(graph, Arc::new(data.clone()));
     // Drop only lookup columns. LET values were materialized before the write,
@@ -352,6 +361,24 @@ pub(super) fn refresh(
         .collect();
     for name in names {
         let old = scope.references.remove(&name).expect("existing reference");
+        if let Some(source) = scope.reference_sources.get(&name).cloned() {
+            if source.graph == graph {
+                let mut ids = BTreeSet::new();
+                for binding in old.parts.iter().filter(|binding| binding.graph == graph) {
+                    ids.extend(
+                        super::mutations::delete_ids(
+                            Some(plan.clone().project([binding.column(ID).alias(ID)])?),
+                            ctx,
+                            trace,
+                        )
+                        .await?,
+                    );
+                }
+                scope
+                    .reference_sources
+                    .insert(name.clone(), graph::refresh_source(data, &source, &ids)?);
+            }
+        }
         aliases.extend(
             old.parts
                 .iter()
