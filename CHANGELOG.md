@@ -83,6 +83,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Repeat a quantifier after a simplified path across the whole slash pattern.
+  `-/E F/->{2}` repeats the E-then-F sequence, `-/L|R/->{1,2}` can mix labels
+  between repetitions, and a quantifier on one label no longer discards the
+  outer one.
 
 ## 0.2.0 — 2026-10-05
 
