@@ -3955,6 +3955,8 @@ impl Parser {
             return Ok(Some(match leading_override {
                 Some(Direction::Left) => Direction::LeftOrRight,
                 Some(Direction::Undirected) => Direction::UndirectedOrRight,
+                // `<~label>` adds the rightward orientation to left-or-undirected.
+                Some(Direction::LeftOrUndirected) => Direction::Any,
                 Some(direction) => direction,
                 None => Direction::Right,
             }));

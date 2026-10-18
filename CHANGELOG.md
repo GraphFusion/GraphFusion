@@ -85,6 +85,8 @@
   fragment that cannot compare is unknown rather than a match.
 - Construct a list of byte strings that includes null. The null stays a null
   element instead of failing while the list is built.
+- Treat a simplified `<~label>` direction override as any orientation, so the
+  closing `>` also matches rightward directed edges.
 - Interpolate an integer PERCENTILE_CONT from the exact endpoints and round
   once to Float64, so large integers keep low bits through the blend.
 - Evaluate `COALESCE` and `NULLIF` of a property on each fragment's stored
