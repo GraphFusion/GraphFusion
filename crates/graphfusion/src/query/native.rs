@@ -34,6 +34,18 @@ pub(super) enum NativeAtom {
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// `IS [NOT] TRUE` / `IS [NOT] FALSE`. Unknown is its own category: it is
+    /// not true and not false, unlike `NOT`, which leaves unknown unknown.
+    Truth {
+        inner: Box<NativeAtom>,
+        negated: bool,
+        value: bool,
+    },
+    /// `IS [NOT] UNKNOWN`.
+    Unknown {
+        inner: Box<NativeAtom>,
+        negated: bool,
+    },
     /// A boolean that does not read the fragment, such as `TRUE` or `1 = 1`.
     Closed(Expr),
     Compare {
@@ -151,7 +163,9 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(left, tables)?;
             validate_atom(right, tables)
         }
-        NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Not(inner)
+        | NativeAtom::Truth { inner, .. }
+        | NativeAtom::Unknown { inner, .. } => validate_atom(inner, tables),
         NativeAtom::Closed(_) => Ok(()),
         NativeAtom::Compare {
             property,
@@ -184,6 +198,31 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
         NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
         NativeAtom::Xor(left, right) => xor(compile(left, schema)?, compile(right, schema)?),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::Truth {
+            inner,
+            negated,
+            value,
+        } => {
+            let expr = compile(inner, schema)?;
+            let truth = if *value {
+                expr.is_true()
+            } else {
+                expr.is_false()
+            };
+            if *negated {
+                Expr::Not(Box::new(truth))
+            } else {
+                truth
+            }
+        }
+        NativeAtom::Unknown { inner, negated } => {
+            let expr = compile(inner, schema)?;
+            if *negated {
+                expr.is_not_null()
+            } else {
+                expr.is_null()
+            }
+        }
         NativeAtom::Closed(expr) => expr.clone(),
         NativeAtom::Compare {
             property,
@@ -271,6 +310,15 @@ enum Local {
     Or(Box<Local>, Box<Local>),
     Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Truth {
+        inner: Box<Local>,
+        negated: bool,
+        value: bool,
+    },
+    Unknown {
+        inner: Box<Local>,
+        negated: bool,
+    },
     Closed(ast::Expr),
     Atom {
         property: String,
@@ -376,6 +424,19 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
+        ast::Expr::IsTruth {
+            expr,
+            negated,
+            value,
+        } => Some(Local::Truth {
+            inner: Box::new(local_tree(expr, variable)?),
+            negated: *negated,
+            value: *value,
+        }),
+        ast::Expr::IsUnknown { expr, negated } => Some(Local::Unknown {
+            inner: Box::new(local_tree(expr, variable)?),
+            negated: *negated,
+        }),
         other => {
             if let Some((property, op, value)) = comparison(other, variable) {
                 Some(Local::Atom {
@@ -470,6 +531,21 @@ fn bind_local(
         },
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
+        }
+        Local::Truth {
+            inner,
+            negated,
+            value,
+        } => bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Truth {
+            inner: Box::new(inner),
+            negated: *negated,
+            value: *value,
+        }),
+        Local::Unknown { inner, negated } => {
+            bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Unknown {
+                inner: Box::new(inner),
+                negated: *negated,
+            })
         }
         Local::Closed(expr) => {
             let Some((bound, data_type)) = bind_closed(session, schema, scope, expr)? else {
@@ -693,12 +769,12 @@ pub(super) fn fragment_boolean(
     };
     if filters
         .keys()
-        .any(|name| !scope.elements.contains_key(name))
+        .any(|name| fragment_binding(scope, name).is_none())
     {
         return Ok((plan, None));
     }
     let mixed = filters.iter().any(|(name, atom)| {
-        let Some(binding) = scope.elements.get(name).cloned() else {
+        let Some(binding) = fragment_binding(scope, name) else {
             return false;
         };
         property_mixes(scope, &binding, atom)
@@ -709,8 +785,20 @@ pub(super) fn fragment_boolean(
     let mut plan = plan;
     let mut combined: Option<Expr> = None;
     for (name, atom) in filters {
-        let binding = scope.elements.get(&name).expect("element variable").clone();
-        let (next, expr) = compile_on_fragments(plan, scope, &binding, &atom)?;
+        let binding = fragment_binding(scope, &name).expect("element variable");
+        let (next, mut expr) = compile_on_fragments(plan, scope, &binding, &atom)?;
+        if !scope.elements.contains_key(&name) {
+            let reference = scope.references.get(&name).expect("resolved reference");
+            let column = scope.scalars.get(&name).expect("reference column").clone();
+            expr = Expr::Case(datafusion::logical_expr::expr::Case::new(
+                None,
+                vec![(
+                    Box::new(reference.guard(Expr::Column(column))),
+                    Box::new(expr),
+                )],
+                Some(Box::new(compile(&atom, &Schema::empty())?)),
+            ));
+        }
         plan = next;
         combined = Some(match combined {
             Some(previous) => previous.and(expr),
@@ -718,6 +806,17 @@ pub(super) fn fragment_boolean(
         });
     }
     Ok((plan, combined))
+}
+
+// Multi-part references retain their existing cross-domain type validation.
+fn fragment_binding(scope: &Bindings, name: &str) -> Option<ElementBinding> {
+    scope.elements.get(name).cloned().or_else(|| {
+        let reference = scope.references.get(name)?;
+        match reference.parts.as_slice() {
+            [binding] => Some(binding.clone()),
+            _ => None,
+        }
+    })
 }
 
 fn property_mixes(scope: &Bindings, binding: &ElementBinding, atom: &NativeAtom) -> bool {
@@ -732,7 +831,9 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
-        NativeAtom::Not(inner) => atom_mixes(inner, tables),
+        NativeAtom::Not(inner)
+        | NativeAtom::Truth { inner, .. }
+        | NativeAtom::Unknown { inner, .. } => atom_mixes(inner, tables),
         NativeAtom::Closed(_) => false,
         NativeAtom::Compare { property, .. } => {
             let mut seen: Vec<&DataType> = Vec::new();
@@ -803,15 +904,30 @@ fn compile_on_fragments(
         plan = plan.join_on(
             scan,
             JoinType::Left,
-            [binding.column(crate::graph::ID).eq(id)],
+            [binding.column(crate::graph::ID).eq(id.clone())],
         )?;
-        parts.push(compile_qualified(atom, &alias, schema.as_ref())?);
+        parts.push(Expr::Case(datafusion::logical_expr::expr::Case::new(
+            None,
+            vec![(
+                Box::new(id.is_not_null()),
+                Box::new(compile_qualified(atom, &alias, schema.as_ref())?),
+            )],
+            Some(Box::new(unknown())),
+        )));
     }
     let expr = match parts.len() {
         0 => unknown(),
         1 => parts.pop().expect("fragment comparison"),
         _ => coalesce(parts),
     };
+    let expr = Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(binding.column(crate::graph::ID).is_null()),
+            Box::new(compile(atom, &Schema::empty())?),
+        )],
+        Some(Box::new(expr)),
+    ));
     Ok((plan, binding.ensure_live(expr, DataType::Boolean)))
 }
 
@@ -828,6 +944,31 @@ fn compile_qualified(atom: &NativeAtom, alias: &str, schema: &Schema) -> Result<
             compile_qualified(right, alias, schema)?,
         ),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile_qualified(inner, alias, schema)?)),
+        NativeAtom::Truth {
+            inner,
+            negated,
+            value,
+        } => {
+            let expr = compile_qualified(inner, alias, schema)?;
+            let truth = if *value {
+                expr.is_true()
+            } else {
+                expr.is_false()
+            };
+            if *negated {
+                Expr::Not(Box::new(truth))
+            } else {
+                truth
+            }
+        }
+        NativeAtom::Unknown { inner, negated } => {
+            let expr = compile_qualified(inner, alias, schema)?;
+            if *negated {
+                expr.is_not_null()
+            } else {
+                expr.is_null()
+            }
+        }
         NativeAtom::Closed(expr) => expr.clone(),
         NativeAtom::Compare {
             property,

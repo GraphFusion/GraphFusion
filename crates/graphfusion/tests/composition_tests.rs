@@ -519,6 +519,114 @@ async fn mixed_label_filters_compare_stored_types() {
     );
 }
 
+async fn names(session: &mut graphfusion::Session, query: &str) -> Vec<String> {
+    strings(&session.query(query).await.unwrap())
+        .into_iter()
+        .map(|row| row.into_iter().next().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn truth_predicates_compare_stored_types() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:P {name: 'ten', v: 10}),
+                    (:P {name: 'nine', v: 9}),
+                    (:D {name: 'text', v: '10'})",
+        )
+        .await
+        .unwrap();
+    session.execute("SESSION SET VALUE $digits = '10'").unwrap();
+
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS TRUE RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["text".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS FALSE RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS UNKNOWN RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["nine".to_string(), "ten".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS NOT TRUE RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["nine".to_string(), "ten".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = '10') IS NOT UNKNOWN RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["text".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n) WHERE (n.v = $digits) IS TRUE RETURN n.name AS name"
+        )
+        .await,
+        vec!["text".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n WHERE (n.v = '10') IS UNKNOWN) RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["nine".to_string(), "ten".to_string()]
+    );
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n:P) WHERE (n.v > 9) IS TRUE RETURN n.name AS name"
+        )
+        .await,
+        vec!["ten".to_string()]
+    );
+    let mismatch = session
+        .query("MATCH (n:D) WHERE (n.v > 9) IS TRUE RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("incomparable types"),
+        "{mismatch}"
+    );
+
+    let mut session = social().await;
+    assert_eq!(
+        names(
+            &mut session,
+            "MATCH (n:Person|Metric) WHERE (n.score > 1) IS TRUE
+             RETURN n.name AS name ORDER BY name"
+        )
+        .await,
+        vec!["Bea".to_string(), "load".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn parenthesized_where_compares_stored_types() {
     let mut session = Database::new().session();
@@ -809,4 +917,45 @@ async fn parenthesized_predicate_includes_later_alternative_fragments() {
         strings(&r),
         vec![vec!["doc".to_string()], vec!["late".to_string()]]
     );
+}
+
+#[tokio::test]
+async fn stored_truth_values_use_the_matching_fragment() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {name:'ten',v:10}),(:P {name:'nine',v:9}),(:D {name:'text',v:'10'})").await.unwrap();
+    let r = s.query("MATCH (n) LET classified = (n.v = '10') IS UNKNOWN RETURN n.name AS name, classified ORDER BY name").await.unwrap();
+    assert_eq!(
+        strings(&r),
+        vec![
+            vec!["nine".to_string(), "true".to_string()],
+            vec!["ten".to_string(), "true".to_string()],
+            vec!["text".to_string(), "false".to_string()]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn optional_misses_and_reference_aliases_keep_stored_boolean_semantics() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {name:'number',v:1}),(:D {name:'text',v:'1'})").await.unwrap();
+    for q in [
+        "OPTIONAL MATCH (n) WHERE FALSE LET classified = (n.v = '1') IS UNKNOWN RETURN classified",
+        "OPTIONAL MATCH (n) WHERE FALSE FILTER n.v = '1' OR TRUE RETURN TRUE AS classified",
+    ] {
+        assert_eq!(
+            strings(&s.query(q).await.unwrap()),
+            vec![vec!["true".to_string()]],
+            "{q}"
+        );
+    }
+    for q in [
+        "MATCH (n) LET r=n FILTER r.v = '1' RETURN r.name AS name",
+        "MATCH (n) LET r=n LET eq=r.v = '1' FILTER eq RETURN r.name AS name",
+    ] {
+        assert_eq!(
+            strings(&s.query(q).await.unwrap()),
+            vec![vec!["text".to_string()]],
+            "{q}"
+        );
+    }
 }

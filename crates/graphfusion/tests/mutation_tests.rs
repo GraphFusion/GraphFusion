@@ -687,3 +687,19 @@ async fn fragment_comparison_rejects_deleted_elements_and_rolls_back() {
     );
     assert_eq!(s.query("MATCH (n) RETURN n").await.unwrap().row_count(), 3);
 }
+
+#[tokio::test]
+async fn stored_reference_comparison_rejects_deleted_aliases() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1,k:1}),(:P {v:2,k:2}),(:D {v:'1',k:3})").await.unwrap();
+    let error = s
+        .run("MATCH (n) LET r=n MATCH (m:P {k:1}) DELETE m FILTER r.v = '1' RETURN 1 AS value")
+        .await
+        .err()
+        .expect("deleted alias comparison committed");
+    assert!(
+        error.to_string().contains("deleted or unavailable"),
+        "{error}"
+    );
+    assert_eq!(s.query("MATCH (n) RETURN n").await.unwrap().row_count(), 3);
+}
