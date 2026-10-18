@@ -12,7 +12,7 @@ RETURN 6 * 7 AS answer, 7 / 2 AS quotient,
        'Graph' || 'Fusion' AS name, 1 <> 2 AS different;
 ```
 
-Arithmetic uses checked kernels. Integer overflow, division by zero and non-finite floating results raise errors in both constant expressions and batch evaluation. The binder rejects implicit text-to-number and boolean-to-number conversions.
+Arithmetic uses checked kernels. Integer overflow, division by zero and non-finite floating results raise errors in both constant expressions and batch evaluation. A decimal literal that overflows to infinity is rejected as a bad number before execution. The binder rejects implicit text-to-number and boolean-to-number conversions.
 
 Comparisons require compatible families, with supported numeric widening. Null operands follow nullable semantics; `NULL = NULL` is not a test for null. Use [IS NULL](/expressions/null/) or a [truth predicate](/expressions/boolean/).
 

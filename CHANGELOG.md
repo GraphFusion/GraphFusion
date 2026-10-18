@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Reject a decimal literal that overflows to infinity. `1e999` is a bad number,
+  rather than the Float64 value `inf`, in queries and session initializers.
 - Start an anonymous path at its first edge. `()-[]->()` no longer cross-joins
   every node to recover a source id the edge already stores. A named, labeled,
   or constrained start node still reads the node tables.
