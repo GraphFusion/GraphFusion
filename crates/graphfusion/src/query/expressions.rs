@@ -79,7 +79,14 @@ impl<'a> Binder<'a> {
                 "incomparable types {a} and {b}"
             )));
         }
-        Ok(left.eq(right))
+        Ok(super::arithmetic::exact_numeric_compare(
+            left.clone(),
+            Operator::Eq,
+            right.clone(),
+            &a,
+            &b,
+        )
+        .unwrap_or_else(|| left.eq(right)))
     }
 
     pub fn predicate(&self, expr: &ast::Expr) -> Result<Expr> {
@@ -353,14 +360,24 @@ impl<'a> Binder<'a> {
                                 "incomparable types {a} and {b}"
                             )));
                         }
-                        match op {
+                        let operator = match op {
                             B::Eq => Operator::Eq,
                             B::Neq => Operator::NotEq,
                             B::Lt => Operator::Lt,
                             B::Le => Operator::LtEq,
                             B::Gt => Operator::Gt,
                             _ => Operator::GtEq,
+                        };
+                        if let Some(expr) = super::arithmetic::exact_numeric_compare(
+                            left.clone(),
+                            operator,
+                            right.clone(),
+                            &a,
+                            &b,
+                        ) {
+                            return Ok(expr);
                         }
+                        operator
                     }
                 };
                 if matches!(op, B::Add | B::Sub | B::Mul | B::Div) {

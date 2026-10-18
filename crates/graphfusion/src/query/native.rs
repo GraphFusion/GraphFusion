@@ -184,8 +184,19 @@ fn compare_property(
     if !comparable(&stored, value_type) {
         return Ok(unknown());
     }
-    let mut left = column(property);
-    let mut right = value;
+    let left = column(property);
+    let right = value;
+    if let Some(expr) = super::arithmetic::exact_numeric_compare(
+        left.clone(),
+        op,
+        right.clone(),
+        &stored,
+        value_type,
+    ) {
+        return Ok(expr);
+    }
+    let mut left = left;
+    let mut right = right;
     if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
         left = cast(left, DataType::Float64);
         right = cast(right, DataType::Float64);
