@@ -256,6 +256,52 @@ async fn let_scope_delimited_identifiers_filter_and_result_aliases() {
 }
 
 #[tokio::test]
+async fn insert_return_star_projects_declared_elements() {
+    let mut session = Database::new().session();
+    let outputs = session
+        .run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (n:Seen {k: 1})-[e:E]->(m:Seen {k: 2}) RETURN *")
+        .await
+        .unwrap();
+    let graphfusion::StatementOutput::Query(result) = outputs.last().unwrap() else {
+        panic!("expected the insert result, got {outputs:?}");
+    };
+    assert_eq!(
+        result
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["n", "e", "m"]
+    );
+    let values = row(result);
+    let text = values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    assert!(text[0].contains("__gql_element_kind:n"), "{text:?}");
+    assert!(text[1].contains("__gql_element_kind:e"), "{text:?}");
+    assert!(text[2].contains("__gql_element_kind:n"), "{text:?}");
+    let stored = session
+        .query("MATCH (n:Seen) RETURN n.k AS k ORDER BY k")
+        .await
+        .unwrap();
+    let keys = stored
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(move |i| {
+                ScalarValue::try_from_array(batch.column(0), i)
+                    .unwrap()
+                    .to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["1".to_string(), "2".to_string()]);
+    assert!(session.run("INSERT (:Seen) RETURN *").await.is_err());
+}
+
+#[tokio::test]
 async fn select_distinct_and_pagination_preserve_empty_result_schema() {
     let mut session = Database::new().session();
     assert_eq!(
