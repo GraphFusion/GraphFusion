@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-`FOR item IN list` produces one row per list element for each incoming row. Empty and null lists produce zero rows. A null entry in a nonempty list produces a row containing null.
+`FOR item IN list` produces one row per list element for each incoming row, in list order. Empty and null lists produce zero rows. A null entry in a nonempty list produces a row containing null. Property lookup on an element reference does not regroup those rows.
 
 ```gql test
 FOR name IN ['Alice', 'Bob', 'Cara'] WITH ORDINALITY position

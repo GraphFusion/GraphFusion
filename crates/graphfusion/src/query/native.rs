@@ -5,7 +5,9 @@
 //! column, and casting both sides to strings would make `10 > 9` false.
 //! Each fragment therefore keeps its stored type. A missing property, or a
 //! stored type that cannot be compared with the literal, is unknown: `NOT`
-//! unknown stays unknown and does not keep the row.
+//! unknown stays unknown and does not keep the row. `AND`, `OR`, `XOR`, and
+//! closed booleans stay on that per-fragment result, so `OR FALSE` cannot
+//! compare the stringified column instead.
 
 use super::{
     expressions::Binder,
@@ -13,19 +15,27 @@ use super::{
 };
 use crate::{gql as ast, graph::Table, Error, Result, SessionState};
 use datafusion::{
-    arrow::datatypes::{DataType, Schema, SchemaRef},
+    arrow::datatypes::{DataType, Schema},
     common::{Column, DFSchema, ScalarValue, TableReference},
     datasource::provider_as_source,
     functions::core::expr_fn::coalesce,
-    logical_expr::{cast, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator},
+    logical_expr::{
+        cast, expr::BinaryExpr, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator,
+    },
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Partition key for a conjunct that does not read an element property.
+const CLOSED: &str = "\0";
 
 #[derive(Clone, Debug)]
 pub(super) enum NativeAtom {
     And(Box<NativeAtom>, Box<NativeAtom>),
     Or(Box<NativeAtom>, Box<NativeAtom>),
+    Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    /// A boolean that does not read the fragment, such as `TRUE` or `1 = 1`.
+    Closed(Expr),
     Compare {
         property: String,
         op: Operator,
@@ -93,9 +103,11 @@ impl NativePush {
 
 /// Split a match-level `WHERE` into per-variable fragment predicates.
 ///
-/// `AND` can be split across variables. `OR` and `NOT` stay together, so they
-/// are pushed only when every comparison names the same variable. A value that
-/// reads another column stays on the unified plan.
+/// `AND` can be split across variables. `OR`, `XOR`, and `NOT` stay together, so
+/// they are pushed only when every comparison names the same variable. A closed
+/// boolean (`TRUE`, `FALSE`, `UNKNOWN`, or a row-independent expression) stays
+/// inside that predicate. A value that reads another column stays on the unified
+/// plan.
 pub(super) fn clause_filters(
     session: &SessionState,
     schema: &DFSchema,
@@ -105,6 +117,11 @@ pub(super) fn clause_filters(
     let Some(parts) = partition(expr) else {
         return Ok(None);
     };
+    let parts = fold_closed(parts);
+    // A predicate with no element property is bound on the working table.
+    if parts.contains_key(CLOSED) {
+        return Ok(None);
+    }
     let mut filters = BTreeMap::new();
     for (variable, local) in parts {
         let Some(atom) = bind_local(session, schema, scope, &local)? else {
@@ -128,11 +145,14 @@ pub(super) fn validate<'a>(
 
 fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     match atom {
-        NativeAtom::And(left, right) | NativeAtom::Or(left, right) => {
+        NativeAtom::And(left, right)
+        | NativeAtom::Or(left, right)
+        | NativeAtom::Xor(left, right) => {
             validate_atom(left, tables)?;
             validate_atom(right, tables)
         }
         NativeAtom::Not(inner) => validate_atom(inner, tables),
+        NativeAtom::Closed(_) => Ok(()),
         NativeAtom::Compare {
             property,
             value_type,
@@ -159,34 +179,43 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
 }
 
 pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
-    compile_in(atom, schema, None)
-}
-
-fn compile_in(atom: &NativeAtom, schema: &Schema, alias: Option<&str>) -> Result<Expr> {
     Ok(match atom {
-        NativeAtom::And(left, right) => {
-            compile_in(left, schema, alias)?.and(compile_in(right, schema, alias)?)
-        }
-        NativeAtom::Or(left, right) => {
-            compile_in(left, schema, alias)?.or(compile_in(right, schema, alias)?)
-        }
-        NativeAtom::Not(inner) => Expr::Not(Box::new(compile_in(inner, schema, alias)?)),
+        NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
+        NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
+        NativeAtom::Xor(left, right) => xor(compile(left, schema)?, compile(right, schema)?),
+        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::Closed(expr) => expr.clone(),
         NativeAtom::Compare {
             property,
             op,
             value,
             value_type,
-        } => compare_property(schema, property, *op, value.clone(), value_type, alias)?,
+        } => compare_property(
+            schema,
+            &column(property),
+            property,
+            *op,
+            value.clone(),
+            value_type,
+        )?,
     })
+}
+
+fn xor(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::NotEq,
+        Box::new(right),
+    ))
 }
 
 fn compare_property(
     schema: &Schema,
+    left: &Expr,
     property: &str,
     op: Operator,
     value: Expr,
     value_type: &DataType,
-    alias: Option<&str>,
 ) -> Result<Expr> {
     let Some(stored) = schema
         .field_with_name(property)
@@ -198,10 +227,7 @@ fn compare_property(
     if !comparable(&stored, value_type) {
         return Ok(unknown());
     }
-    let mut left = match alias {
-        Some(alias) => Expr::Column(Column::new(Some(TableReference::bare(alias)), property)),
-        None => column(property),
-    };
+    let mut left = left.clone();
     let mut right = value;
     if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
         left = cast(left, DataType::Float64);
@@ -243,7 +269,9 @@ fn conjoin(atoms: Vec<NativeAtom>) -> Option<NativeAtom> {
 enum Local {
     And(Box<Local>, Box<Local>),
     Or(Box<Local>, Box<Local>),
+    Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Closed(ast::Expr),
     Atom {
         property: String,
         op: Operator,
@@ -266,13 +294,46 @@ fn partition(expr: &ast::Expr) -> Option<BTreeMap<String, Local>> {
                 combined.insert(name, local);
             }
         }
-        return Some(combined);
+        return Some(fold_closed(combined));
+    }
+    if property_names(expr).is_empty() {
+        return Some(BTreeMap::from([(
+            CLOSED.to_string(),
+            Local::Closed(expr.clone()),
+        )]));
     }
     let variable = sole_variable(expr)?;
     Some(BTreeMap::from([(
         variable.clone(),
         local_tree(expr, &variable)?,
     )]))
+}
+
+/// A closed conjunct is part of every variable predicate. Alone, it is not a
+/// fragment filter and the caller binds it on the working table.
+fn fold_closed(mut parts: BTreeMap<String, Local>) -> BTreeMap<String, Local> {
+    let Some(closed) = parts.remove(CLOSED) else {
+        return parts;
+    };
+    let names: Vec<_> = parts.keys().cloned().collect();
+    if names.is_empty() {
+        parts.insert(CLOSED.to_string(), closed);
+        return parts;
+    }
+    for name in names {
+        let existing = parts.remove(&name).expect("variable conjunct");
+        parts.insert(
+            name,
+            Local::And(Box::new(existing), Box::new(closed.clone())),
+        );
+    }
+    parts
+}
+
+fn property_names(expr: &ast::Expr) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    property_bases(expr, &mut names);
+    names
 }
 
 fn sole_variable(expr: &ast::Expr) -> Option<String> {
@@ -303,15 +364,31 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             Box::new(local_tree(left, variable)?),
             Box::new(local_tree(right, variable)?),
         )),
+        ast::Expr::Binary {
+            left,
+            op: ast::BinaryOp::Xor,
+            right,
+        } => Some(Local::Xor(
+            Box::new(local_tree(left, variable)?),
+            Box::new(local_tree(right, variable)?),
+        )),
         ast::Expr::Unary {
             op: ast::UnaryOp::Not,
             expr,
         } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
-        other => comparison(other, variable).map(|(property, op, value)| Local::Atom {
-            property,
-            op,
-            value,
-        }),
+        other => {
+            if let Some((property, op, value)) = comparison(other, variable) {
+                Some(Local::Atom {
+                    property,
+                    op,
+                    value,
+                })
+            } else if mentions(other, variable) {
+                None
+            } else {
+                Some(Local::Closed(other.clone()))
+            }
+        }
     }
 }
 
@@ -384,8 +461,24 @@ fn bind_local(
             (Some(left), Some(right)) => Some(NativeAtom::Or(Box::new(left), Box::new(right))),
             _ => None,
         },
+        Local::Xor(left, right) => match (
+            bind_local(session, schema, scope, left)?,
+            bind_local(session, schema, scope, right)?,
+        ) {
+            (Some(left), Some(right)) => Some(NativeAtom::Xor(Box::new(left), Box::new(right))),
+            _ => None,
+        },
         Local::Not(inner) => {
             bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
+        }
+        Local::Closed(expr) => {
+            let Some((bound, data_type)) = bind_closed(session, schema, scope, expr)? else {
+                return Ok(None);
+            };
+            if !matches!(data_type, DataType::Boolean | DataType::Null) {
+                return Ok(None);
+            }
+            Some(NativeAtom::Closed(bound))
         }
         Local::Atom {
             property,
@@ -568,114 +661,104 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
     }
 }
 
-/// A parenthesized path predicate runs after its pattern has been unified.
-/// When a property mixes stored types, compare each fragment before that cast.
-pub(super) fn group_stored_predicate(
-    mut plan: LogicalPlanBuilder,
+/// Keep a working-table predicate on stored types when a property was unified
+/// across non-numeric fragments. A single stored type, including integer/float
+/// widening, stays on the unified column.
+pub(super) fn fragment_predicate(
+    plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     session: &SessionState,
-    expr: &ast::Expr,
+    predicate: &ast::Expr,
+) -> Result<Option<LogicalPlanBuilder>> {
+    let columns = plan.schema().columns();
+    let (plan, expr) = fragment_boolean(plan, scope, session, predicate)?;
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+    Ok(Some(plan.filter(expr)?.project(
+        columns.into_iter().map(Expr::Column).collect::<Vec<_>>(),
+    )?))
+}
+
+/// Boolean value of a mixed-type comparison tree, or `None` when the unified
+/// column can compare it.
+pub(super) fn fragment_boolean(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    predicate: &ast::Expr,
 ) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
-    let Some(filters) = clause_filters(session, plan.schema(), scope, expr)? else {
+    let Some(filters) = clause_filters(session, plan.schema(), scope, predicate)? else {
         return Ok((plan, None));
     };
-    let mut prepared = Vec::new();
-    for (variable, atom) in filters {
-        let Some(binding) = scope.elements.get(&variable).cloned() else {
-            return Ok((plan, None));
-        };
-        let sources = fragment_sources(scope, &binding);
-        if sources.is_empty() {
-            return Ok((plan, None));
-        }
-        prepared.push((binding, atom, sources));
-    }
-    if !prepared
-        .iter()
-        .any(|(_, atom, sources)| atom_needs_stored_types(atom, sources))
+    if filters
+        .keys()
+        .any(|name| !scope.elements.contains_key(name))
     {
         return Ok((plan, None));
     }
-    for (_, atom, sources) in &prepared {
-        validate_schemas(atom, sources)?;
-    }
-    let mut parts = Vec::new();
-    for (binding, atom, sources) in &prepared {
-        let mut compiled = Vec::new();
-        for (schema, provider) in sources {
-            let alias = scope.fresh("pred");
-            let scan =
-                LogicalPlanBuilder::scan(&alias, provider_as_source(provider.clone()), None)?
-                    .build()?;
-            let id = Expr::Column(Column::new(
-                Some(TableReference::bare(alias.as_str())),
-                crate::graph::ID,
-            ));
-            plan = std::mem::replace(&mut plan, LogicalPlanBuilder::empty(false)).join_on(
-                scan,
-                JoinType::Left,
-                [binding.column(crate::graph::ID).eq(id)],
-            )?;
-            compiled.push(compile_in(atom, schema, Some(&alias))?);
-        }
-        parts.push(coalesce_exprs(compiled));
-    }
-    let predicate = parts
-        .into_iter()
-        .reduce(|left, right| left.and(right))
-        .unwrap_or_else(|| lit(true));
-    Ok((plan, Some(predicate)))
-}
-
-type FragmentSource = (
-    SchemaRef,
-    std::sync::Arc<dyn datafusion::datasource::TableProvider>,
-);
-
-fn atom_needs_stored_types(atom: &NativeAtom, sources: &[FragmentSource]) -> bool {
-    let mut names = BTreeSet::new();
-    atom_properties(atom, &mut names);
-    names
-        .iter()
-        .any(|property| property_mixes(sources, property))
-}
-
-fn atom_properties(atom: &NativeAtom, names: &mut BTreeSet<String>) {
-    match atom {
-        NativeAtom::And(left, right) | NativeAtom::Or(left, right) => {
-            atom_properties(left, names);
-            atom_properties(right, names);
-        }
-        NativeAtom::Not(inner) => atom_properties(inner, names),
-        NativeAtom::Compare { property, .. } => {
-            names.insert(property.clone());
-        }
-    }
-}
-
-fn property_mixes(sources: &[FragmentSource], property: &str) -> bool {
-    let mut seen: Vec<&DataType> = Vec::new();
-    for (schema, _) in sources {
-        let Some(field) = schema.field_with_name(property).ok() else {
-            continue;
+    let mixed = filters.iter().any(|(name, atom)| {
+        let Some(binding) = scope.elements.get(name).cloned() else {
+            return false;
         };
-        let data_type = field.data_type();
-        if seen.iter().any(|previous| {
-            *previous != data_type && !(previous.is_numeric() && data_type.is_numeric())
-        }) {
-            return true;
-        }
-        if !seen.contains(&data_type) {
-            seen.push(data_type);
-        }
+        property_mixes(scope, &binding, atom)
+    });
+    if !mixed {
+        return Ok((plan, None));
     }
-    false
+    let mut plan = plan;
+    let mut combined: Option<Expr> = None;
+    for (name, atom) in filters {
+        let binding = scope.elements.get(&name).expect("element variable").clone();
+        let (next, expr) = compile_on_fragments(plan, scope, &binding, &atom)?;
+        plan = next;
+        combined = Some(match combined {
+            Some(previous) => previous.and(expr),
+            None => expr,
+        });
+    }
+    Ok((plan, combined))
 }
 
-fn fragment_sources(scope: &Bindings, binding: &ElementBinding) -> Vec<FragmentSource> {
+fn property_mixes(scope: &Bindings, binding: &ElementBinding, atom: &NativeAtom) -> bool {
     let Some(data) = scope.sources.get(&binding.graph) else {
-        return Vec::new();
+        return false;
     };
+    atom_mixes(atom, &element_tables(data, binding))
+}
+
+fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
+    match atom {
+        NativeAtom::And(left, right)
+        | NativeAtom::Or(left, right)
+        | NativeAtom::Xor(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
+        NativeAtom::Not(inner) => atom_mixes(inner, tables),
+        NativeAtom::Closed(_) => false,
+        NativeAtom::Compare { property, .. } => {
+            let mut seen: Vec<&DataType> = Vec::new();
+            for table in tables {
+                let Some(field) = table.schema.field_with_name(property).ok() else {
+                    continue;
+                };
+                let data_type = field.data_type();
+                if seen.iter().any(|previous| {
+                    *previous != data_type && !(previous.is_numeric() && data_type.is_numeric())
+                }) {
+                    return true;
+                }
+                if !seen.contains(&data_type) {
+                    seen.push(data_type);
+                }
+            }
+            false
+        }
+    }
+}
+
+fn element_tables<'a>(
+    data: &'a crate::graph::GraphData,
+    binding: &ElementBinding,
+) -> Vec<&'a Table> {
     let tables: Vec<&Table> = match binding.kind {
         ElementKind::Node => data.nodes.iter().map(|node| &node.0).collect(),
         ElementKind::Edge => data.edges.iter().map(|edge| &edge.table).collect(),
@@ -688,46 +771,72 @@ fn fragment_sources(scope: &Bindings, binding: &ElementBinding) -> Vec<FragmentS
                 .iter()
                 .any(|labels| labels == &table.labels)
         })
-        .map(|table| (table.schema.clone(), table.provider.clone()))
         .collect()
 }
 
-fn validate_schemas(atom: &NativeAtom, sources: &[FragmentSource]) -> Result<()> {
-    match atom {
-        NativeAtom::And(left, right) | NativeAtom::Or(left, right) => {
-            validate_schemas(left, sources)?;
-            validate_schemas(right, sources)
-        }
-        NativeAtom::Not(inner) => validate_schemas(inner, sources),
-        NativeAtom::Compare {
-            property,
-            value_type,
-            ..
-        } => {
-            let mut stored = None;
-            for (schema, _) in sources {
-                let Some(field) = schema.field_with_name(property).ok() else {
-                    continue;
-                };
-                if comparable(field.data_type(), value_type) {
-                    return Ok(());
-                }
-                stored.get_or_insert_with(|| field.data_type().clone());
-            }
-            match stored {
-                Some(stored) => Err(Error::InvalidQuery(format!(
-                    "incomparable types {stored} and {value_type}"
-                ))),
-                None => Ok(()),
-            }
-        }
+fn compile_on_fragments(
+    mut plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    binding: &ElementBinding,
+    atom: &NativeAtom,
+) -> Result<(LogicalPlanBuilder, Expr)> {
+    let fragments = {
+        let data = scope
+            .sources
+            .get(&binding.graph)
+            .ok_or_else(|| Error::Corrupt("missing graph for fragment comparison".into()))?;
+        let tables = element_tables(data, binding);
+        validate(atom, tables.iter().copied())?;
+        tables
+            .iter()
+            .map(|table| (table.schema.clone(), table.provider.clone()))
+            .collect::<Vec<_>>()
+    };
+    let mut parts = Vec::new();
+    for (schema, provider) in fragments {
+        let alias = scope.fresh("frag");
+        let scan = LogicalPlanBuilder::scan(&alias, provider_as_source(provider), None)?.build()?;
+        let id = Expr::Column(Column::new(
+            Some(TableReference::bare(alias.as_str())),
+            crate::graph::ID,
+        ));
+        plan = plan.join_on(
+            scan,
+            JoinType::Left,
+            [binding.column(crate::graph::ID).eq(id)],
+        )?;
+        parts.push(compile_qualified(atom, &alias, schema.as_ref())?);
     }
+    let expr = match parts.len() {
+        0 => unknown(),
+        1 => parts.pop().expect("fragment comparison"),
+        _ => coalesce(parts),
+    };
+    Ok((plan, binding.ensure_live(expr, DataType::Boolean)))
 }
 
-fn coalesce_exprs(parts: Vec<Expr>) -> Expr {
-    match parts.len() {
-        0 => unknown(),
-        1 => parts.into_iter().next().expect("fragment predicate"),
-        _ => coalesce(parts),
-    }
+fn compile_qualified(atom: &NativeAtom, alias: &str, schema: &Schema) -> Result<Expr> {
+    Ok(match atom {
+        NativeAtom::And(left, right) => {
+            compile_qualified(left, alias, schema)?.and(compile_qualified(right, alias, schema)?)
+        }
+        NativeAtom::Or(left, right) => {
+            compile_qualified(left, alias, schema)?.or(compile_qualified(right, alias, schema)?)
+        }
+        NativeAtom::Xor(left, right) => xor(
+            compile_qualified(left, alias, schema)?,
+            compile_qualified(right, alias, schema)?,
+        ),
+        NativeAtom::Not(inner) => Expr::Not(Box::new(compile_qualified(inner, alias, schema)?)),
+        NativeAtom::Closed(expr) => expr.clone(),
+        NativeAtom::Compare {
+            property,
+            op,
+            value,
+            value_type,
+        } => {
+            let left = Expr::Column(Column::new(Some(TableReference::bare(alias)), property));
+            compare_property(schema, &left, property, *op, value.clone(), value_type)?
+        }
+    })
 }
