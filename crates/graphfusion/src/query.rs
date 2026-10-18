@@ -6,6 +6,7 @@ mod execution;
 mod expressions;
 mod graph;
 mod mutations;
+mod native;
 mod path_values;
 mod paths;
 mod patterns;
@@ -562,6 +563,13 @@ async fn plan_body(
                         .map(Expr::Column)
                         .collect();
                     let expression = binder.bind(&item.value)?;
+                    if let ast::Expr::Identifier(source) = &item.value {
+                        if let Some(element) = scope.elements.get(&source.value) {
+                            scope
+                                .reference_sources
+                                .insert(item.name.value.clone(), element.clone());
+                        }
+                    }
                     let domain = references::domain(&item.value, &scope);
                     let column = scope.scalar(&item.name.value);
                     if let Some(domain) = domain {

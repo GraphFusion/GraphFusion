@@ -275,6 +275,7 @@ pub(super) fn resolve(
         plan = plan.project(projection)?;
         let key = |i: usize| Expr::Column(datafusion::common::Column::new_unqualified(&keys[i].1));
         let sources = scope.sources.clone();
+        let template = scope.reference_sources.get(&name).cloned();
         let mut parts = Vec::new();
         for (id, data) in sources {
             for kind in [ElementKind::Node, ElementKind::Edge] {
@@ -285,7 +286,15 @@ pub(super) fn resolve(
                 {
                     continue;
                 }
-                let (scan, binding) = graph::scan(scope, id, &data, kind, None)?;
+                // A LET copy of one matched element keeps that label set's
+                // property types. An unconstrained match still unions the kind.
+                let (scan, binding) = if let Some(source) = template.as_ref().filter(|source| {
+                    source.constrained && source.graph == id && source.kind == kind
+                }) {
+                    graph::scan_refresh(scope, id, &data, source)?
+                } else {
+                    graph::scan(scope, id, &data, kind, None)?
+                };
                 let matched = key(0)
                     .eq(lit(id))
                     .and(key(1).eq(lit(if kind == ElementKind::Node { "n" } else { "e" })))

@@ -2,6 +2,7 @@
 use super::{
     execution,
     graph::{self, Bindings, ElementKind},
+    native::NativePush,
 };
 use crate::{
     catalog::ObjectId,
@@ -282,6 +283,7 @@ pub(super) fn expand(
     state: &State,
     mode: ast::PathMode,
     different: bool,
+    native: &NativePush,
 ) -> Result<(LogicalPlanBuilder, State)> {
     let (min, max) = bounds(
         edge.quantifier.as_ref().expect("quantified edge"),
@@ -346,6 +348,7 @@ pub(super) fn expand(
         ElementKind::Edge,
         Some(edge.direction),
         graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
+        native,
     )?;
     let mut local = scope.clone();
     if let Some(name) = &edge.variable {
@@ -365,6 +368,7 @@ pub(super) fn expand(
         edge.label_expression.as_ref(),
         edge.properties.as_ref(),
         edge.where_clause.as_ref(),
+        native,
     )?;
     if different || mode == ast::PathMode::Trail {
         recursive = recursive.filter(Expr::Not(Box::new(array_has(

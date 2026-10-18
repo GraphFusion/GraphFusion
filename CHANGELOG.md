@@ -11,6 +11,19 @@
   binding tables with `TABLE` / `BINDING TABLE`.
 - Reject a binding-table column that mixes a number with a boolean, string, or
   bytes value. Integers and floats in one column still widen to float.
+- Resolve a `LET` copy of a label-constrained element from that label set, so
+  its property types are not widened by another label that stores the same name.
+- A label that matches no fragment keeps property names as untyped columns.
+  It does not borrow another type's Arrow type, so a filter on the empty
+  match is not rejected because unrelated labels disagree.
+- An integer inserted or assigned into an existing float property widens to
+  float. The stored column type does not change, and a narrowing assignment
+  is still rejected.
+- An all-null binding-table column stays untyped, so comparing it with a
+  graph property does not fail as a string/integer mismatch.
+- Compare a filter on each fragment's stored property type before a multi-type
+  scan unifies those columns. An integer comparison stays numeric, and a
+  fragment that cannot compare is unknown rather than a match.
 
 ## 0.2.0 — 2026-10-05
 
