@@ -1128,3 +1128,30 @@ async fn stored_value_wrappers_keep_filters_aliases_and_optional_nulls() {
         .unwrap();
     assert_eq!(strings(&r), vec![vec!["true".to_string()]]);
 }
+
+#[tokio::test]
+async fn stored_wrappers_handle_absent_properties_and_nested_boolean_nulls() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {name:'number',v:1}),(:Q {name:'missing'})").await.unwrap();
+    for predicate in ["NULLIF(n.v, '1') IS NULL", "COALESCE(n.v, '1') = '1'"] {
+        for q in [
+            format!("MATCH (n) WHERE {predicate} RETURN n.name AS name"),
+            format!("MATCH (n) FILTER {predicate} RETURN n.name AS name"),
+            format!("MATCH (n) LET ok={predicate} FILTER ok RETURN n.name AS name"),
+        ] {
+            assert_eq!(
+                strings(&s.query(&q).await.unwrap()),
+                vec![vec!["missing".to_string()]],
+                "{q}"
+            );
+        }
+    }
+    s.run("INSERT (:D {name:'text',v:'10'})").await.unwrap();
+    let r = s
+        .query(
+            "MATCH (n) WHERE COALESCE(NULLIF(NULL, NULL), n.v = '10', FALSE) RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&r), vec![vec!["text".to_string()]]);
+}

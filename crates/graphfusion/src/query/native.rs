@@ -733,7 +733,11 @@ fn bind_local(
             if !matches!(data_type, DataType::Boolean | DataType::Null) {
                 return Ok(None);
             }
-            Some(NativeAtom::Closed(bound))
+            Some(NativeAtom::Closed(if data_type == DataType::Null {
+                unknown()
+            } else {
+                bound
+            }))
         }
         Local::Atom {
             property,
@@ -1081,6 +1085,13 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
         NativeAtom::Closed(_) | NativeAtom::Literal(_) => false,
         NativeAtom::Coalesce(args) => args.iter().any(|atom| atom_mixes(atom, tables)),
         NativeAtom::NullIf(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
+        NativeAtom::NullIfNull { property, .. } | NativeAtom::ValueCoalesce { property, .. }
+            if tables
+                .iter()
+                .any(|table| table.schema.field_with_name(property).is_err()) =>
+        {
+            true
+        }
         NativeAtom::Compare { property, .. }
         | NativeAtom::NullIfNull { property, .. }
         | NativeAtom::ValueCoalesce { property, .. } => {
