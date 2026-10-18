@@ -2,6 +2,7 @@
 use super::{
     execution,
     graph::{self, Bindings, ElementKind},
+    native::NativePush,
 };
 use crate::{
     catalog::ObjectId,
@@ -279,9 +280,10 @@ pub(super) fn expand(
     graph_id: ObjectId,
     data: &GraphData,
     edge: &ast::RelationshipPattern,
-    state: &State,
+    state: Option<&State>,
     mode: ast::PathMode,
     different: bool,
+    native: &NativePush,
 ) -> Result<(LogicalPlanBuilder, State)> {
     let (min, max) = bounds(
         edge.quantifier.as_ref().expect("quantified edge"),
@@ -305,17 +307,60 @@ pub(super) fn expand(
     let node_name = scope.fresh("path_nodes");
     let edge_name = scope.fresh("path_edges");
     let depth_name = scope.fresh("path_depth");
-    let mut projections: Vec<_> = incoming
-        .iter()
-        .zip(&names)
-        .map(|(c, n)| Expr::Column(c.clone()).alias(n))
-        .collect();
-    projections.extend([
-        state.nodes.clone().alias(&node_name),
-        state.edges.clone().alias(&edge_name),
-        lit(0_u64).alias(&depth_name),
-    ]);
-    let anchor = plan.project(projections)?;
+    let anchor = if let Some(state) = state {
+        let mut projections: Vec<_> = incoming
+            .iter()
+            .zip(&names)
+            .map(|(c, n)| Expr::Column(c.clone()).alias(n))
+            .collect();
+        projections.extend([
+            state.nodes.clone().alias(&node_name),
+            state.edges.clone().alias(&edge_name),
+            lit(0_u64).alias(&depth_name),
+        ]);
+        plan.project(projections)?
+    } else {
+        // The first hop is the anchor, so a positive lower bound never builds
+        // a depth-zero row for every node.
+        let (edge_scan, binding) = graph::scan_filtered(
+            scope,
+            graph_id,
+            data,
+            ElementKind::Edge,
+            Some(edge.direction),
+            graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
+            native,
+        )?;
+        let mut local = scope.clone();
+        if let Some(name) = &edge.variable {
+            graph::declare(&mut local, &name.value, &binding)?;
+        }
+        let mut seeded = plan.cross_join(edge_scan)?;
+        seeded = graph::predicates_for(
+            seeded,
+            &local,
+            session,
+            &binding,
+            &edge.labels,
+            edge.label_expression.as_ref(),
+            edge.properties.as_ref(),
+            edge.where_clause.as_ref(),
+            native,
+        )?;
+        let first = State::new(binding.column(FROM)).append(binding.column(ID), binding.column(TO));
+        seeded = seeded.filter(first.valid(mode, different))?;
+        let mut projections: Vec<_> = incoming
+            .iter()
+            .zip(&names)
+            .map(|(c, n)| Expr::Column(c.clone()).alias(n))
+            .collect();
+        projections.extend([
+            first.nodes.alias(&node_name),
+            first.edges.alias(&edge_name),
+            lit(1_u64).alias(&depth_name),
+        ]);
+        seeded.project(projections)?
+    };
     let work = LogicalPlanBuilder::scan(
         &work_name,
         provider_as_source(Arc::new(CteWorkTable::new(
@@ -346,6 +391,7 @@ pub(super) fn expand(
         ElementKind::Edge,
         Some(edge.direction),
         graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
+        native,
     )?;
     let mut local = scope.clone();
     if let Some(name) = &edge.variable {
@@ -365,6 +411,7 @@ pub(super) fn expand(
         edge.label_expression.as_ref(),
         edge.properties.as_ref(),
         edge.where_clause.as_ref(),
+        native,
     )?;
     if different || mode == ast::PathMode::Trail {
         recursive = recursive.filter(Expr::Not(Box::new(array_has(
@@ -397,7 +444,12 @@ pub(super) fn expand(
     if let Some(name) = &edge.variable {
         let ids = array_slice(
             current.edges.clone(),
-            cast(array_length(state.edges.clone()), DataType::Int64) + lit(1_i64),
+            match state {
+                Some(state) => {
+                    cast(array_length(state.edges.clone()), DataType::Int64) + lit(1_i64)
+                }
+                None => lit(1_i64),
+            },
             current.length(),
             None,
         );
