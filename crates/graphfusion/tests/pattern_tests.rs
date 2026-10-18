@@ -541,7 +541,7 @@ async fn group_scope_limits_and_runtime_errors_are_atomic() {
 #[tokio::test]
 async fn independent_repeated_group_reuses_one_step() {
     let mut s = graph().await;
-    let shared = "MATCH p = (a)((x)-[:E]->(y)){1,2}(b) RETURN a.name AS a, b.name AS b, PATH_LENGTH(p) AS hops ORDER BY a, hops, b";
+    let shared = "MATCH p = (a)((x)-[:E]->{1,1}(y)){1,2}(b) RETURN a.name AS a, b.name AS b, PATH_LENGTH(p) AS hops ORDER BY a, hops, b";
     let result = query(&mut s, shared).await;
     assert!(
         !result.logical_plan.contains("step_row"),
@@ -551,7 +551,7 @@ async fn independent_repeated_group_reuses_one_step() {
     let flat = "MATCH p = (a)-[:E]->{1,2}(b) RETURN a.name AS a, b.name AS b, PATH_LENGTH(p) AS hops ORDER BY a, hops, b";
     assert_eq!(rows(&result), rows(&query(&mut s, flat).await));
     let dependent =
-        "MATCH (a)((x)-[:Loop]->(y WHERE x.name = a.name)){1}(b) RETURN a.name AS a, b.name AS b";
+        "MATCH (a)((x)-[:Loop]->{1,1}(y WHERE x.name = a.name)){1}(b) RETURN a.name AS a, b.name AS b";
     let dependent_result = query(&mut s, dependent).await;
     assert!(
         dependent_result.logical_plan.contains("step_row"),
@@ -736,4 +736,43 @@ async fn shared_elements_accept_an_empty_alternative_in_either_order() {
         assert_eq!(rows(&result), vec![vec!["1"]]);
         assert_eq!(result.schema.field(0).data_type(), &DataType::Int64);
     }
+}
+
+#[tokio::test]
+async fn plain_repeated_group_expands_from_the_frontier() {
+    let mut s = graph().await;
+    let q =
+        "MATCH (a {name:'A'})((x)-[:E]->(m)-[:E]->(y)){1,2}(b) RETURN b.name AS name ORDER BY name";
+    let result = query(&mut s, q).await;
+    assert_eq!(
+        rows(&result),
+        vec![vec!["B"], vec!["C"], vec!["D"], vec!["D"]]
+    );
+    let plan = &result.logical_plan;
+    let recursive = plan.find("RecursiveQuery").expect(plan);
+    let body = &plan[recursive..];
+    assert!(
+        body.contains("__gf_from"),
+        "plain group must read edges inside the recursive term:\n{plan}"
+    );
+    assert!(
+        !body.contains("__gf_step_row"),
+        "plain group must not join a precomputed step:\n{plan}"
+    );
+    let outer = "MATCH (a {name:'A'})((x)-[:E]->(y) WHERE y.name <> a.name){1,3}(b) RETURN b.name AS name ORDER BY name";
+    assert_eq!(
+        rows(&query(&mut s, outer).await),
+        vec![vec!["B"], vec!["C"], vec!["D"], vec!["D"]]
+    );
+    let nested = query(
+        &mut s,
+        "MATCH p = (a {name:'A'})((x)-[:E]->{1,2}(y)){1,2}(b) RETURN MAX(PATH_LENGTH(p)) AS longest",
+    )
+    .await;
+    assert_eq!(rows(&nested), vec![vec!["4"]]);
+    assert!(
+        nested.logical_plan.contains("__gf_step_nodes"),
+        "a quantified body still freezes its step:\n{}",
+        nested.logical_plan
+    );
 }

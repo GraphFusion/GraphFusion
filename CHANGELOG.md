@@ -57,6 +57,10 @@
   change it or widen a bound element with another type's schema.
 - Execute linear query `NEXT` / `YIELD` chains, and read session or nested
   binding tables with `TABLE` / `BINDING TABLE`.
+- Expand a repeated group of plain nodes and edges from the current endpoint
+  inside the recursive term, instead of first materializing every one-step
+  match in the graph. A quantifier, alternative, or optional subpath inside
+  the group still precomputes that one-step relation.
 - Build a repeated group's one-step relation once when it does not read an
   outer variable, instead of crossing that relation with every input row. A
   group that reads an outer variable still keeps a separate step per row.
