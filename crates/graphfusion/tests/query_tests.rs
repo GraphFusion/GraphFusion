@@ -302,6 +302,45 @@ async fn typed_parameter_nulls_and_numeric_initializers_keep_their_type_family()
 }
 
 #[tokio::test]
+async fn char_length_limits_the_session_value() {
+    let mut session = Database::new().session();
+    session
+        .execute("SESSION SET VALUE $s CHAR(2) = 'ab'; SESSION SET VALUE $short CHAR(2) = 'a'; SESSION SET VALUE $mark CHAR(1) = 'é'")
+        .unwrap();
+    let result = session
+        .query("RETURN $s AS s, $short AS short, $mark AS mark")
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Utf8(Some("ab".into())),
+            ScalarValue::Utf8(Some("a".into())),
+            ScalarValue::Utf8(Some("é".into())),
+        ]
+    );
+    for declaration in [
+        "SESSION SET VALUE $bad CHAR(2) = 'abc'",
+        "SESSION SET VALUE $bad CHAR(2) = 'abcd'",
+        "SESSION SET VALUE $bad CHAR(1) = 'éx'",
+        "SESSION SET VALUE $bad CHAR(0) = ''",
+        "SESSION SET VALUE $bad CHAR(2, 4) = 'ab'",
+        "SESSION SET VALUE $items LIST<CHAR(2)> = ['ab', 'abcd']",
+    ] {
+        assert!(
+            matches!(
+                session.execute(declaration),
+                Err(Error::InvalidDefinition(_))
+            ),
+            "{declaration}"
+        );
+    }
+    session
+        .execute("SESSION SET VALUE $items LIST<CHAR(2)> = ['ab', 'a']")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn let_scope_delimited_identifiers_filter_and_result_aliases() {
     let mut session = Database::new().session();
     let result = session.query("LET `a.b` = 6 LET y = `a.b` + 1 FILTER y > 5 RETURN y AS result ORDER BY result DESC NULLS FIRST LIMIT 1").await.unwrap();

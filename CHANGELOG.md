@@ -83,6 +83,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Enforce `CHAR(n)` as a maximum of `n` characters. A longer value is rejected,
+  matching `VARCHAR(n)` and `STRING(n)`.
 - `COALESCE` a null with a byte string. The null takes the byte-string type
   instead of failing while the call is planned.
 - Construct a list of byte strings that includes null. The null stays a null
