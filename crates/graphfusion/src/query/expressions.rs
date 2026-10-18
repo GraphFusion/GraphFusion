@@ -429,19 +429,30 @@ impl<'a> Binder<'a> {
                     .map(|arg| self.bind(arg))
                     .collect::<Result<Vec<_>>>()?;
                 self.compatible(&args)?;
-                datafusion::functions::core::expr_fn::coalesce(args)
+                let mut types = Vec::with_capacity(args.len());
+                for arg in &args {
+                    types.push(arg.get_type(self.schema)?);
+                }
+                super::arithmetic::exact_coalesce(args.clone(), &types)
+                    .unwrap_or_else(|| datafusion::functions::core::expr_fn::coalesce(args))
             }
             E::NullIf { left, right } => {
                 let left = self.bind(left)?;
                 let right = self.bind(right)?;
                 self.compatible(&[left.clone(), right.clone()])?;
-                if left.get_type(self.schema)? == DataType::Null
-                    && right.get_type(self.schema)? == DataType::Null
-                {
+                let left_type = left.get_type(self.schema)?;
+                let right_type = right.get_type(self.schema)?;
+                if left_type == DataType::Null && right_type == DataType::Null {
                     // Both values are null; avoid DataFusion's fallback to a string type.
                     left
                 } else {
-                    datafusion::functions::core::expr_fn::nullif(left, right)
+                    super::arithmetic::exact_nullif(
+                        left.clone(),
+                        right.clone(),
+                        &left_type,
+                        &right_type,
+                    )
+                    .unwrap_or_else(|| datafusion::functions::core::expr_fn::nullif(left, right))
                 }
             }
             E::NumericFunction {

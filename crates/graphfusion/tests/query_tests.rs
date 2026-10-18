@@ -370,3 +370,157 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         Err(Error::SessionClosed)
     ));
 }
+
+#[tokio::test]
+async fn coalesce_and_nullif_preserve_exact_integers() {
+    let mut session = Database::new().session();
+    let kept = session
+        .query(
+            "RETURN NULLIF(9007199254740993, 9007199254740992.0) AS near, \
+             NULLIF(9007199254740993, 1.0) AS other, \
+             NULLIF(1, 1.5) AS int_left, \
+             NULLIF(1.5, 1) AS float_left, \
+             NULLIF(1.0, 9007199254740993) AS float_other",
+        )
+        .await
+        .unwrap();
+    assert_eq!(kept.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(kept.schema.field(2).data_type(), &DataType::Int64);
+    assert_eq!(kept.schema.field(3).data_type(), &DataType::Float64);
+    assert_eq!(
+        row(&kept),
+        vec![
+            ScalarValue::Int64(Some(9007199254740993)),
+            ScalarValue::Int64(Some(9007199254740993)),
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Float64(Some(1.5)),
+            ScalarValue::Float64(Some(1.0)),
+        ]
+    );
+
+    let cleared = session
+        .query(
+            "RETURN NULLIF(9007199254740992, 9007199254740992.0) AS exact, \
+             NULLIF(1, 1.0) AS one, \
+             NULLIF(1.0, 1) AS one_float, \
+             NULLIF(0, -0.0) AS zero, \
+             NULLIF(-0.0, 0) AS neg_zero",
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(cleared.schema.field(2).data_type(), &DataType::Float64);
+    assert_eq!(cleared.schema.field(4).data_type(), &DataType::Float64);
+    assert_eq!(
+        row(&cleared),
+        vec![
+            ScalarValue::Int64(None),
+            ScalarValue::Int64(None),
+            ScalarValue::Float64(None),
+            ScalarValue::Int64(None),
+            ScalarValue::Float64(None),
+        ]
+    );
+
+    session
+        .set_parameter("min", Value::Integer(i64::MIN))
+        .unwrap();
+    session
+        .set_parameter("max", Value::Integer(i64::MAX))
+        .unwrap();
+    let bounds = session
+        .query("RETURN NULLIF($min, -9223372036854775808.0) AS min, NULLIF($max, 1.0) AS max")
+        .await
+        .unwrap();
+    assert_eq!(bounds.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(bounds.schema.field(1).data_type(), &DataType::Int64);
+    assert_eq!(
+        row(&bounds),
+        vec![ScalarValue::Int64(None), ScalarValue::Int64(Some(i64::MAX))]
+    );
+
+    let widened = session
+        .query(
+            "RETURN COALESCE(1, 1.5) AS first, \
+             COALESCE(NULL, 1, 1.5) AS second, \
+             COALESCE(1.5, 9007199254740993) AS float_first, \
+             COALESCE(9007199254740992, 1.0) AS exact, \
+             COALESCE($min, 1.0) AS min",
+        )
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        row(&widened),
+        vec![
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Float64(Some(1.5)),
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(Some(i64::MIN as f64)),
+        ]
+    );
+
+    for query in [
+        "RETURN COALESCE(9007199254740993, 1.0) AS n",
+        "RETURN COALESCE(NULL, 9007199254740993, 1.0) AS n",
+        "RETURN COALESCE($max, 1.0) AS n",
+        "FOR v IN [1, 9007199254740993] RETURN COALESCE(v, 1.0) AS n",
+    ] {
+        let error = session.query(query).await.unwrap_err();
+        assert!(
+            error.to_string().contains("not exactly representable"),
+            "{query}: {error}"
+        );
+    }
+
+    let rows = session
+        .query(
+            "FOR v IN [9007199254740993, NULL] \
+             RETURN NULLIF(v, 9007199254740992.0) AS n ORDER BY v",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        column(&rows),
+        vec![
+            ScalarValue::Int64(Some(9007199254740993)),
+            ScalarValue::Int64(None),
+        ]
+    );
+    let mixed = session
+        .query("FOR v IN [1, NULL] RETURN COALESCE(v, 1.5) AS n ORDER BY v")
+        .await
+        .unwrap();
+    assert_eq!(
+        column(&mixed),
+        vec![
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Float64(Some(1.5)),
+        ]
+    );
+    let unchanged = session
+        .query("RETURN COALESCE(9007199254740993, 1) AS n, NULLIF(1, NULL) AS kept")
+        .await
+        .unwrap();
+    assert_eq!(unchanged.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        row(&unchanged),
+        vec![
+            ScalarValue::Int64(Some(9007199254740993)),
+            ScalarValue::Int64(Some(1))
+        ]
+    );
+}
+
+fn column(result: &QueryResult) -> Vec<ScalarValue> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .map(|row| ScalarValue::try_from_array(batch.column(0), row).unwrap())
+        })
+        .collect()
+}
