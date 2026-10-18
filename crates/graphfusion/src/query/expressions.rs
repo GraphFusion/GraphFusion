@@ -344,7 +344,19 @@ impl<'a> Binder<'a> {
                     B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge => {
                         let a = left.get_type(self.schema)?;
                         let b = right.get_type(self.schema)?;
-                        if a != b
+                        if is_list(&a) || is_list(&b) {
+                            // Empty lists are List(Null) and numeric lists keep their
+                            // element type. Widen to one list type before comparing.
+                            let unified = common_value_type(&a, &b).map_err(|_| {
+                                Error::InvalidQuery(format!("incomparable types {a} and {b}"))
+                            })?;
+                            if a != unified {
+                                left = left.cast_to(&unified, self.schema)?;
+                            }
+                            if b != unified {
+                                right = right.cast_to(&unified, self.schema)?;
+                            }
+                        } else if a != b
                             && a != DataType::Null
                             && b != DataType::Null
                             && !(numeric(&a) && numeric(&b))
@@ -439,12 +451,14 @@ impl<'a> Binder<'a> {
                     .map(|arg| self.bind(arg))
                     .collect::<Result<Vec<_>>>()?;
                 self.compatible(&args)?;
+                let args = self.align_lists(args)?;
                 datafusion::functions::core::expr_fn::coalesce(args)
             }
             E::NullIf { left, right } => {
                 let left = self.bind(left)?;
                 let right = self.bind(right)?;
                 self.compatible(&[left.clone(), right.clone()])?;
+                let (left, right) = self.align_list_pair(left, right)?;
                 let left_type = left.get_type(self.schema)?;
                 let right_type = right.get_type(self.schema)?;
                 if left_type == DataType::Null && right_type == DataType::Null {
@@ -533,6 +547,42 @@ impl<'a> Binder<'a> {
         }
         Ok(())
     }
+
+    fn align_list_pair(&self, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
+        let mut aligned = self.align_lists(vec![left, right])?;
+        let right = aligned.pop().expect("aligned pair");
+        let left = aligned.pop().expect("aligned pair");
+        Ok((left, right))
+    }
+
+    /// Cast list operands to their common element type. Scalar families stay
+    /// untouched so numeric widening remains DataFusion's coercion.
+    fn align_lists(&self, expressions: Vec<Expr>) -> Result<Vec<Expr>> {
+        let mut types = Vec::with_capacity(expressions.len());
+        for expr in &expressions {
+            types.push(expr.get_type(self.schema)?);
+        }
+        if !types.iter().any(is_list) {
+            return Ok(expressions);
+        }
+        let mut unified = DataType::Null;
+        for data_type in &types {
+            unified = common_value_type(&unified, data_type)?;
+        }
+        let mut aligned = Vec::with_capacity(expressions.len());
+        for (expr, data_type) in expressions.into_iter().zip(types) {
+            aligned.push(if data_type == unified {
+                expr
+            } else {
+                expr.cast_to(&unified, self.schema)?
+            });
+        }
+        Ok(aligned)
+    }
+}
+
+fn is_list(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::List(_) | DataType::LargeList(_))
 }
 
 fn common_value_type(left: &DataType, right: &DataType) -> Result<DataType> {

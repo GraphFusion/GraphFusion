@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Compare integer lists with float lists, and compare an empty list with a typed
+  list. The operands widen to one element type first, including nested lists.
+  `COALESCE` and `NULLIF` use that same list type.
 - Compare lists with three-valued logic. A null element stays unknown unless an
   earlier element, or the lengths after an equal prefix, already decides the
   result. `NULLIF` uses that same equality, so an unknown list comparison keeps

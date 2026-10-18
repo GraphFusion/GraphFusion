@@ -632,6 +632,58 @@ async fn composite_null_only_rows_strings_and_graph_focus() {
 }
 
 #[tokio::test]
+async fn list_comparisons_widen_numbers_and_accept_empty_lists() {
+    let mut s = Database::new().session();
+    check(
+        &mut s,
+        "RETURN [1, 2] = [1.0, 2.0] AS same, [1] < [1.5] AS less, \
+         [3] >= [2.5] AS greater, [1] <> [1.0] AS different, \
+         [1] = [] AS empty_eq, [] < [1] AS empty_lt, [] = [] AS both_empty, \
+         [[1], []] = [[1.0], []] AS nested",
+        &[&[
+            "true", "true", "true", "false", "false", "true", "true", "true",
+        ]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN NULLIF([1, 2], [1.0, 2.0]) AS removed, NULLIF([1], []) AS kept, \
+         COALESCE([1], [2.0]) AS first",
+        &[&["NULL", "[1]", "[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [[1], [1.0], [], [2]] FILTER x = [1] OR x < [] RETURN x ORDER BY x",
+        &[&["[1.0]"], &["[1.0]"]],
+    )
+    .await;
+    let kept = query(&mut s, "RETURN NULLIF([1, NULL], [1.0, NULL]) AS kept").await;
+    let DataType::List(item) = kept.schema.field(0).data_type() else {
+        panic!("expected a list");
+    };
+    assert_eq!(item.data_type(), &DataType::Float64);
+    let lists = kept.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::ListArray>()
+        .unwrap();
+    let values = lists.value(0);
+    let values = values
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(
+        values,
+        &datafusion::arrow::array::Float64Array::from(vec![Some(1.0), None])
+    );
+
+    for query in ["RETURN [1] = ['a'] AS bad", "RETURN [TRUE] < [1] AS bad"] {
+        assert!(s.query(query).await.is_err(), "{query}");
+    }
+}
+
+#[tokio::test]
 async fn list_comparisons_keep_null_elements_unknown() {
     let mut s = fixture().await;
     check(
