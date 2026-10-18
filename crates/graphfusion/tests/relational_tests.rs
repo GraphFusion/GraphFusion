@@ -632,6 +632,64 @@ async fn composite_null_only_rows_strings_and_graph_focus() {
 }
 
 #[tokio::test]
+async fn list_comparisons_keep_null_elements_unknown() {
+    let mut s = fixture().await;
+    check(
+        &mut s,
+        "RETURN ([1, NULL] = [1, NULL]) IS NULL AS same,
+                ([1, NULL] = [1, 2]) IS NULL AS maybe,
+                ([1, NULL] <> [1, 2]) IS NULL AS maybe_not,
+                [1, 3, NULL] = [1, 2, NULL] AS earlier,
+                [1] = [1, NULL] AS length,
+                [1] < [1, NULL] AS prefix,
+                ([1, NULL] < [1, 2]) IS NULL AS order_unknown,
+                [1, 2] < [1, 3] AS order,
+                [1, 2] = [1, 2] AS equal,
+                [1, 2] <= [1, 2] AS le,
+                [1, 3] <= [1, 2] AS not_le,
+                ([1, NULL] <= [1, 2]) IS NULL AS le_unknown,
+                [] = [] AS empty,
+                [] < [NULL] AS empty_prefix,
+                ([NULL] = [NULL]) IS NULL AS nulls,
+                ([[1, NULL]] = [[1, NULL]]) IS NULL AS nested,
+                ([true, NULL] = [true, false]) IS NULL AS flags,
+                (['a', NULL] = ['a', NULL]) IS NULL AS names,
+                [2, NULL] > [1, 9] AS decided,
+                true OR [1, NULL] = [1, NULL] AS either,
+                NULLIF([1, 2], [1, 2]) IS NULL AS removed,
+                NULLIF([1, NULL], [1, NULL]) IS NULL AS kept,
+                [X'01', X'02'] < [X'01', X'03'] AS bytes,
+                [X'01'] = [X'01'] AS same_bytes",
+        &[&[
+            "true", "true", "true", "false", "false", "true", "true", "true", "true", "true",
+            "false", "true", "true", "true", "true", "true", "true", "true", "true", "true",
+            "true", "false", "true", "true",
+        ]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [[1, NULL], [1, 2], [1, 3]] FILTER x = [1, 2] OR x = [1, NULL] RETURN x",
+        &[&["[1, 2]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN NULLIF([1, NULL], [1, NULL]) WITH ORDINALITY i RETURN i, x ORDER BY i",
+        &[&["1", "1"], &["2", "NULL"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (a:N {v: 1}), (b:N {v: 2})
+         RETURN [a] = [a] AS same, [a] = [b] AS different,
+                ([a, NULL] = [a, NULL]) IS NULL AS unknown",
+        &[&["true", "false", "true"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn output_aliases_shadow_elements_in_group_having_and_order_contexts() {
     let mut s = fixture().await;
     s.run("INSERT (:N {v: 4})").await.unwrap();

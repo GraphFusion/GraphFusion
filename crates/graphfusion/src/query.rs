@@ -5,6 +5,7 @@ mod binding;
 mod execution;
 mod expressions;
 mod graph;
+mod lists;
 mod mutations;
 mod native;
 mod path_values;

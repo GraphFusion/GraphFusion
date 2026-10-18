@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Compare lists with three-valued logic. A null element stays unknown unless an
+  earlier element, or the lengths after an equal prefix, already decides the
+  result. `NULLIF` uses that same equality, so an unknown list comparison keeps
+  the original list.
 - Align a shared element across path alternatives when the branches store
   different properties. Integers widen to float, other mixed scalars are read
   as strings, and a property present on only one branch is null on the other.
