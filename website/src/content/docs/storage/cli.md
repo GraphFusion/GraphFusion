@@ -53,6 +53,8 @@ The whole program parses before execution. Catalog/session/query/write statement
 
 --explain executes the program and prints its actual plan diagnostics, including writes. It is not a dry run. Success outputs are buffered; if a later statement fails, earlier autocommits can remain durable even though the invocation returns an error without those buffered outputs.
 
+Null cells and null list elements print as `NULL`. An empty list stays `[]` and an empty string stays blank.
+
 ## Inspect an AST
 
 Use `run --dump-ast` to parse a query or file and print its syntax tree without executing it:

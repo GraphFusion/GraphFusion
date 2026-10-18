@@ -13,7 +13,7 @@ FILTER answer > 40
 RETURN answer;
 ```
 
-An element alias preserves graph, element kind and identity. Subsequent property lookups resolve that element.
+An element alias preserves graph, element kind and identity. Subsequent property lookups resolve that element. Resolving the reference keeps the incoming row order, so an earlier `ORDER BY` still applies.
 
 ```gql test
 MATCH (p:Person {name: 'Alice'})

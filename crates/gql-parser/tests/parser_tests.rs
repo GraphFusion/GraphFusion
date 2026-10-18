@@ -867,6 +867,64 @@ fn parses_simplified_path_pattern_expressions() {
 }
 
 #[test]
+fn simplified_outer_quantifier_wraps_the_slash_pattern() {
+    let program =
+        parse("MATCH (a)-/E F/->{1,2}(b), (a)-/L|R/->{2}(c), (a)-/E{2}/->{3}(d) RETURN a").unwrap();
+    let Statement::Query(query) = &program.statements[0] else {
+        panic!("expected query statement");
+    };
+    let patterns = &first_match(query).patterns;
+
+    let PathPatternFactor::Parenthesized(sequence) = &patterns[0].factors[1] else {
+        panic!("expected a repeated E F sequence");
+    };
+    assert_eq!(
+        sequence.quantifier,
+        Some(PathPatternQuantifier::Range {
+            min: Some(1),
+            max: Some(2)
+        })
+    );
+    let labels: Vec<_> = sequence
+        .pattern
+        .factors
+        .iter()
+        .filter_map(|factor| match factor {
+            PathPatternFactor::Relationship(edge) => {
+                assert!(edge.quantifier.is_none());
+                edge.labels.first().map(|label| label.value.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels, vec!["E", "F"]);
+
+    let PathPatternFactor::Parenthesized(choice) = &patterns[1].factors[1] else {
+        panic!("expected a repeated label alternation");
+    };
+    assert_eq!(choice.quantifier, Some(PathPatternQuantifier::Fixed(2)));
+    assert!(matches!(
+        choice.pattern.factors.first(),
+        Some(PathPatternFactor::Alternation { .. })
+    ));
+
+    let PathPatternFactor::Parenthesized(nested) = &patterns[2].factors[1] else {
+        panic!("expected an outer quantifier around E{{2}}");
+    };
+    assert_eq!(nested.quantifier, Some(PathPatternQuantifier::Fixed(3)));
+    let PathPatternFactor::Relationship(edge) = nested
+        .pattern
+        .factors
+        .iter()
+        .find(|factor| matches!(factor, PathPatternFactor::Relationship(_)))
+        .expect("inner edge")
+    else {
+        unreachable!("inner edge");
+    };
+    assert_eq!(edge.quantifier, Some(PathPatternQuantifier::Fixed(2)));
+}
+
+#[test]
 fn parses_optional_match_statement_block() {
     let program = parse(
         "OPTIONAL { MATCH (a)-[:KNOWS]->(b) OPTIONAL MATCH (b)-[:LIKES]->(c) } RETURN a, b, c; \
@@ -1598,13 +1656,16 @@ fn parses_insert_undirected_edge_pattern() {
     assert_eq!(pattern.start.variable, Some(ident("a")));
     assert_eq!(
         pattern.start.labels,
-        vec![ident("Person"), ident("Employee")]
+        vec![ident("Person"), ident("person"), ident("Employee")]
     );
     assert_eq!(pattern.chains.len(), 1);
     let relationship = &pattern.chains[0].relationship;
     assert_eq!(relationship.direction, Direction::Undirected);
     assert_eq!(relationship.variable, Some(ident("r")));
-    assert_eq!(relationship.labels, vec![ident("KNOWS"), ident("RELATED")]);
+    assert_eq!(
+        relationship.labels,
+        vec![ident("KNOWS"), ident("knows"), ident("RELATED")]
+    );
     assert_eq!(
         relationship
             .properties
@@ -1616,6 +1677,42 @@ fn parses_insert_undirected_edge_pattern() {
     );
     assert_eq!(pattern.chains[0].node.variable, Some(ident("b")));
     assert_eq!(pattern.chains[0].node.labels, vec![ident("Person")]);
+}
+
+#[test]
+fn parses_insert_label_sets_that_differ_only_by_case() {
+    let program = parse("INSERT (A & a & A {name: 'n'})-[A & a]->()").unwrap();
+
+    let Statement::Insert(insert) = &program.statements[0] else {
+        panic!("expected insert statement");
+    };
+    let pattern = &insert.patterns[0];
+    assert_eq!(pattern.start.labels, vec![ident("A"), ident("a")]);
+    assert_eq!(
+        pattern.start.label_expression,
+        Some(LabelExpression::And(
+            Box::new(LabelExpression::Label(ident("A"))),
+            Box::new(LabelExpression::Label(ident("a"))),
+        ))
+    );
+    let relationship = &pattern.chains[0].relationship;
+    assert_eq!(relationship.labels, vec![ident("A"), ident("a")]);
+    assert_eq!(
+        relationship.label_expression,
+        Some(LabelExpression::And(
+            Box::new(LabelExpression::Label(ident("A"))),
+            Box::new(LabelExpression::Label(ident("a"))),
+        ))
+    );
+
+    let colon = parse("INSERT (:A & a {name: 'n'})").unwrap();
+    let Statement::Insert(insert) = &colon.statements[0] else {
+        panic!("expected insert statement");
+    };
+    assert_eq!(
+        insert.patterns[0].start.labels,
+        vec![ident("A"), ident("a")]
+    );
 }
 
 #[test]
@@ -7586,4 +7683,34 @@ fn leading_parenthesized_paths_allow_following_factors_and_alternatives() {
     ] {
         assert!(parse(invalid).is_err(), "{invalid}");
     }
+}
+
+#[test]
+fn simplified_left_undirected_closing_angle_is_any_direction() {
+    let program =
+        parse("MATCH (a)-/<~KNOWS> L/->(b), (a)-/<KNOWS>/-(b), (a)-/~KNOWS>/-(b) RETURN a")
+            .unwrap();
+    let Statement::Query(query) = &program.statements[0] else {
+        panic!("expected query statement");
+    };
+    let patterns = &first_match(query).patterns;
+    assert_eq!(patterns[0].chains.len(), 2);
+    assert_eq!(patterns[0].chains[0].relationship.direction, Direction::Any);
+    assert_eq!(
+        patterns[0].chains[0].relationship.labels,
+        vec![ident("KNOWS")]
+    );
+    assert_eq!(
+        patterns[0].chains[1].relationship.direction,
+        Direction::Right
+    );
+    assert_eq!(patterns[0].chains[1].relationship.labels, vec![ident("L")]);
+    assert_eq!(
+        patterns[1].chains[0].relationship.direction,
+        Direction::LeftOrRight
+    );
+    assert_eq!(
+        patterns[2].chains[0].relationship.direction,
+        Direction::UndirectedOrRight
+    );
 }
