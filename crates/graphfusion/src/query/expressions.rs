@@ -364,13 +364,20 @@ impl<'a> Binder<'a> {
                     }
                 };
                 if matches!(op, B::Add | B::Sub | B::Mul | B::Div) {
-                    let data_type = if left.get_type(self.schema)? == DataType::Float64
-                        || right.get_type(self.schema)? == DataType::Float64
-                    {
-                        DataType::Float64
-                    } else {
-                        DataType::Int64
-                    };
+                    let left_type = left.get_type(self.schema)?;
+                    let right_type = right.get_type(self.schema)?;
+                    let data_type =
+                        if left_type == DataType::Float64 || right_type == DataType::Float64 {
+                            DataType::Float64
+                        } else {
+                            DataType::Int64
+                        };
+                    if data_type == DataType::Float64 && left_type == DataType::Int64 {
+                        left = super::arithmetic::exact_float(left);
+                    }
+                    if data_type == DataType::Float64 && right_type == DataType::Int64 {
+                        right = super::arithmetic::exact_float(right);
+                    }
                     super::arithmetic::checked(left, operator, right, data_type)
                 } else {
                     Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))

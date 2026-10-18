@@ -370,3 +370,99 @@ async fn unsupported_programs_never_publish_catalog_or_session_effects() {
         Err(Error::SessionClosed)
     ));
 }
+
+#[tokio::test]
+async fn mixed_arithmetic_rejects_inexact_integers() {
+    let mut session = Database::new().session();
+    session
+        .set_parameter("min", Value::Integer(i64::MIN))
+        .unwrap();
+    session
+        .set_parameter("max", Value::Integer(i64::MAX))
+        .unwrap();
+
+    let exact = session
+        .query(
+            "RETURN 1 + 0.5 AS small, \
+             9007199254740992 + 0.0 AS boundary, \
+             0.0 + 9007199254740992 AS flipped, \
+             $min - 0.0 AS min, \
+             9007199254740992 * 1.0 AS product, \
+             9007199254740992 / 2.0 AS quotient, \
+             9007199254740993 + 1 AS int_sum",
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(exact.schema.field(6).data_type(), &DataType::Int64);
+    assert_eq!(
+        row(&exact),
+        vec![
+            ScalarValue::Float64(Some(1.5)),
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(Some(i64::MIN as f64)),
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(Some(4503599627370496.0)),
+            ScalarValue::Int64(Some(9007199254740994)),
+        ]
+    );
+
+    for query in [
+        "RETURN 9007199254740993 + 0.0 AS n",
+        "RETURN 0.0 + 9007199254740993 AS n",
+        "RETURN 9007199254740993 - 0.0 AS n",
+        "RETURN 9007199254740993 * 1.0 AS n",
+        "RETURN 9007199254740993 / 1.0 AS n",
+        "RETURN $max + 0.0 AS n",
+        "FOR v IN [1, 9007199254740993] RETURN v + 0.0 AS n",
+    ] {
+        let error = session.query(query).await.unwrap_err();
+        assert!(
+            error.to_string().contains("not exactly representable"),
+            "{query}: {error}"
+        );
+    }
+
+    let rows = session
+        .query("FOR v IN [1, NULL] RETURN v + 0.5 AS n ORDER BY v")
+        .await
+        .unwrap();
+    assert_eq!(
+        column(&rows),
+        vec![ScalarValue::Float64(Some(1.5)), ScalarValue::Float64(None)]
+    );
+
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session.run("INSERT (:N {id: 1})").await.unwrap();
+    let property = session
+        .query("MATCH (n:N) RETURN n.id + 0.5 AS n")
+        .await
+        .unwrap();
+    assert_eq!(row(&property), vec![ScalarValue::Float64(Some(1.5))]);
+    session
+        .run("INSERT (:N {id: 9007199254740993})")
+        .await
+        .unwrap();
+    let error = session
+        .query("MATCH (n:N) RETURN n.id + 0.0 AS n")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not exactly representable"),
+        "{error}"
+    );
+}
+
+fn column(result: &QueryResult) -> Vec<ScalarValue> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .map(|row| ScalarValue::try_from_array(batch.column(0), row).unwrap())
+        })
+        .collect()
+}

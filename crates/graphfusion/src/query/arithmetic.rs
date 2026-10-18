@@ -1,6 +1,10 @@
 //! Checked Arrow arithmetic invoked by DataFusion in both constant folding and execution.
 use datafusion::{
-    arrow::{array::Float64Array, compute::kernels::numeric, datatypes::DataType},
+    arrow::{
+        array::{Array, Float64Array},
+        compute::kernels::numeric,
+        datatypes::DataType,
+    },
     common::ScalarValue,
     error::DataFusionError,
     logical_expr::{create_udf, ColumnarValue, Expr, Operator, Volatility},
@@ -85,6 +89,67 @@ pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType
         }),
     )
     .call(vec![left, right])
+}
+
+/// Convert an integer to float only when every value is exact.
+///
+/// The float arithmetic UDF otherwise casts Int64 to Float64, which rounds
+/// integers past 2^53 before the operation.
+pub(super) fn exact_float(value: Expr) -> Expr {
+    create_udf(
+        "gql_exact_int_to_float",
+        vec![DataType::Int64],
+        DataType::Float64,
+        Volatility::Immutable,
+        Arc::new(|args| {
+            use datafusion::arrow::array::Int64Array;
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let integers = arrays[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("expected Int64 arithmetic operand".into())
+                })?;
+            let mut values = Vec::with_capacity(integers.len());
+            for row in 0..integers.len() {
+                if integers.is_null(row) {
+                    values.push(None);
+                    continue;
+                }
+                let integer = integers.value(row);
+                let Some(float) = exact_i64_f64(integer) else {
+                    return Err(DataFusionError::Execution(format!(
+                        "integer {integer} is not exactly representable as float"
+                    )));
+                };
+                values.push(Some(float));
+            }
+            let output: datafusion::arrow::array::ArrayRef = Arc::new(Float64Array::from(values));
+            if args
+                .iter()
+                .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+            {
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                    &output, 0,
+                )?))
+            } else {
+                Ok(ColumnarValue::Array(output))
+            }
+        }),
+    )
+    .call(vec![value])
+}
+
+/// `Some` only when `integer` is an exact `f64`. `i64::MIN` is exact; `i64::MAX` is not.
+fn exact_i64_f64(integer: i64) -> Option<f64> {
+    let as_float = integer as f64;
+    // Values that round to 2^63 saturate when cast back to i64, so a round trip
+    // alone would accept integers that float cannot store.
+    if as_float < 9223372036854775808.0 && as_float as i64 == integer {
+        Some(as_float)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
