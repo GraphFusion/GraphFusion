@@ -5,6 +5,7 @@ use super::{
     execution::{self, Trace},
     expressions::Binder,
     graph::{self, Bindings, ElementKind},
+    native::{NativeAtom, NativePush},
     paths::{self, Selection, State},
 };
 use crate::{
@@ -18,6 +19,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::{Expr, JoinType, LogicalPlanBuilder},
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 type Plan = LogicalPlanBuilder;
 type Built = (Plan, Bindings, State);
@@ -27,6 +29,7 @@ pub(super) struct Predicate {
     expression: Option<ast::LabelExpression>,
     properties: Option<ast::MapLiteral>,
     predicate: Option<ast::Expr>,
+    native: NativePush,
 }
 pub(super) struct Compiler<'a> {
     pub session: &'a SessionState,
@@ -36,6 +39,10 @@ pub(super) struct Compiler<'a> {
     pub trace: &'a mut Trace,
     pub different: bool,
     pub predicates: Vec<Predicate>,
+    /// Match-level comparisons already safe to apply on each fragment.
+    pub clause_filters: BTreeMap<String, NativeAtom>,
+    pub clause_push: bool,
+    pub clause_hit: BTreeSet<String>,
 }
 fn narrower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -54,7 +61,10 @@ fn empty_node() -> ast::NodePattern {
         quantifier: None,
     }
 }
-fn unconstrained_anonymous(node: &ast::NodePattern) -> bool {
+/// An anonymous node with no label, property, or WHERE constraint adds nothing
+/// the incoming endpoint does not already say. Edge endpoints are stored node
+/// ids, so joining the node tables only copies that id.
+fn reuses_known_endpoint(node: &ast::NodePattern) -> bool {
     node.variable.is_none()
         && !node.temporary
         && node.quantifier.is_none()
@@ -96,18 +106,55 @@ impl Compiler<'_> {
                 p.expression.as_ref(),
                 p.properties.as_ref(),
                 p.predicate.as_ref(),
+                &p.native,
             )?;
         }
         Ok(plan)
     }
-    fn defer_node(&mut self, binding: graph::ElementBinding, node: &ast::NodePattern) {
+    fn defer_node(
+        &mut self,
+        binding: graph::ElementBinding,
+        node: &ast::NodePattern,
+        native: NativePush,
+    ) {
         self.predicates.push(Predicate {
             binding,
             labels: node.labels.clone(),
             expression: node.label_expression.clone(),
             properties: node.properties.clone(),
             predicate: node.where_clause.clone(),
+            native,
         });
+    }
+    /// Build the fragment predicate for a newly scanned element. A reused
+    /// variable keeps the unified predicate: its rows were already cast.
+    fn native_for(
+        &mut self,
+        plan: &Plan,
+        scope: &Bindings,
+        variable: Option<&ast::Identifier>,
+        properties: Option<&ast::MapLiteral>,
+        where_clause: Option<&ast::Expr>,
+    ) -> Result<NativePush> {
+        let fresh = variable.is_none_or(|name| !scope.elements.contains_key(&name.value));
+        if !fresh {
+            return Ok(NativePush::default());
+        }
+        let mut native = NativePush::prepare(
+            self.session,
+            plan.schema(),
+            scope,
+            variable.map(|name| name.value.as_str()),
+            properties,
+            where_clause,
+        )?;
+        if let Some(name) = variable {
+            if let Some(extra) = self.clause_filters.get(&name.value) {
+                native.conjunct(extra.clone());
+                self.clause_hit.insert(name.value.clone());
+            }
+        }
+        Ok(native)
     }
     // For a homogeneous quantified edge, predicates depend only on the edge and
     // the incoming/start bindings. With lower bound m, every shortest walk has
@@ -387,9 +434,8 @@ impl Compiler<'_> {
             Some((ast::PathPatternFactor::Node(node), rest)) => (node, rest),
             _ => (&empty, factors),
         };
-        // ()-[e]->... already knows its start: it is the edge's source. A node
-        // cross join would only rediscover that id.
-        let opened = if endpoint.is_none() && unconstrained_anonymous(first) {
+        // The first edge already carries both anonymous endpoint identities.
+        let opened = if endpoint.is_none() && reuses_known_endpoint(first) {
             match remaining.split_first() {
                 Some((ast::PathPatternFactor::Relationship(edge), rest))
                     if edge.quantifier.is_none() && !edge.temporary =>
@@ -405,24 +451,24 @@ impl Compiler<'_> {
             let (plan, state) = self.open_edge(plan, scope, edge)?;
             (plan.filter(state.valid(mode, self.different))?, state, rest)
         } else {
-            let (plan, start) =
-                graph::node(plan, scope, self.graph_id, self.data, first, endpoint)?;
-            self.defer_node(start.clone(), first);
-            (plan, State::new(start.column(ID)), remaining)
+            let (plan, state) = match endpoint {
+                Some(endpoint) if reuses_known_endpoint(first) => (
+                    plan.filter(endpoint.clone().is_not_null())?,
+                    State::new(endpoint),
+                ),
+                endpoint => self.bind_node(plan, scope, first, endpoint)?,
+            };
+            (plan, state, remaining)
         };
         for factor in rest {
             match factor {
                 ast::PathPatternFactor::Node(node) => {
-                    let (next, binding) = graph::node(
-                        plan,
-                        scope,
-                        self.graph_id,
-                        self.data,
-                        node,
-                        Some(state.end()),
-                    )?;
-                    plan = next;
-                    self.defer_node(binding, node);
+                    if reuses_known_endpoint(node) {
+                        plan = plan.filter(state.end().is_not_null())?;
+                    } else {
+                        let (next, _) = self.bind_node(plan, scope, node, Some(state.end()))?;
+                        plan = next;
+                    }
                 }
                 ast::PathPatternFactor::Relationship(edge) => {
                     if edge.temporary {
@@ -437,6 +483,14 @@ impl Compiler<'_> {
                                 max: finite.map(|bound| bound.max(min).max(1)),
                             });
                         }
+                        let native = NativePush::prepare(
+                            self.session,
+                            plan.schema(),
+                            scope,
+                            edge.variable.as_ref().map(|name| name.value.as_str()),
+                            edge.properties.as_ref(),
+                            edge.where_clause.as_ref(),
+                        )?;
                         (plan, state) = paths::expand(
                             plan,
                             scope,
@@ -447,8 +501,16 @@ impl Compiler<'_> {
                             &state,
                             mode,
                             self.different,
+                            &native,
                         )?;
                     } else {
+                        let native = self.native_for(
+                            &plan,
+                            scope,
+                            edge.variable.as_ref(),
+                            edge.properties.as_ref(),
+                            edge.where_clause.as_ref(),
+                        )?;
                         let (scan, binding) = graph::scan_filtered(
                             scope,
                             self.graph_id,
@@ -456,6 +518,7 @@ impl Compiler<'_> {
                             ElementKind::Edge,
                             Some(edge.direction),
                             graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
+                            &native,
                         )?;
                         let mut predicates = vec![state.end().eq(binding.column(FROM))];
                         if let Some(name) = &edge.variable {
@@ -483,6 +546,7 @@ impl Compiler<'_> {
                             expression: edge.label_expression.clone(),
                             properties: edge.properties.clone(),
                             predicate: edge.where_clause.clone(),
+                            native,
                         });
                         state = state.append(binding.column(ID), binding.column(TO));
                     }
@@ -527,6 +591,13 @@ impl Compiler<'_> {
         scope: &mut Bindings,
         edge: &ast::RelationshipPattern,
     ) -> Result<(Plan, State)> {
+        let native = self.native_for(
+            &plan,
+            scope,
+            edge.variable.as_ref(),
+            edge.properties.as_ref(),
+            edge.where_clause.as_ref(),
+        )?;
         let (scan, binding) = graph::scan_filtered(
             scope,
             self.graph_id,
@@ -534,6 +605,7 @@ impl Compiler<'_> {
             ElementKind::Edge,
             Some(edge.direction),
             graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
+            &native,
         )?;
         let mut predicates = Vec::new();
         if let Some(name) = &edge.variable {
@@ -564,9 +636,36 @@ impl Compiler<'_> {
             expression: edge.label_expression.clone(),
             properties: edge.properties.clone(),
             predicate: edge.where_clause.clone(),
+            native,
         });
         let state = State::new(binding.column(FROM)).append(binding.column(ID), binding.column(TO));
         Ok((plan, state))
+    }
+    fn bind_node(
+        &mut self,
+        plan: Plan,
+        scope: &mut Bindings,
+        node: &ast::NodePattern,
+        endpoint: Option<Expr>,
+    ) -> Result<(Plan, State)> {
+        let native = self.native_for(
+            &plan,
+            scope,
+            node.variable.as_ref(),
+            node.properties.as_ref(),
+            node.where_clause.as_ref(),
+        )?;
+        let (plan, binding) = graph::node(
+            plan,
+            scope,
+            self.graph_id,
+            self.data,
+            node,
+            endpoint,
+            &native,
+        )?;
+        self.defer_node(binding.clone(), node, native);
+        Ok((plan, State::new(binding.column(ID))))
     }
     async fn group_once(
         &mut self,
@@ -620,21 +719,30 @@ impl Compiler<'_> {
         .await?;
         scope.advance(&branch_scope);
         let mut empty_scope = scope.clone();
-        let (absent, node) = graph::node(
-            input.clone(),
-            &mut empty_scope,
-            self.graph_id,
-            self.data,
-            &empty_node(),
-            endpoint,
-        )?;
+        // An anchored optional segment already knows its endpoint. Joining that
+        // id back to a full node scan only copies the same value.
+        let (absent, absent_state) = if let Some(endpoint) = endpoint {
+            let absent = input.clone().filter(endpoint.clone().is_not_null())?;
+            (absent, State::new(endpoint))
+        } else {
+            let (absent, node) = graph::node(
+                input.clone(),
+                &mut empty_scope,
+                self.graph_id,
+                self.data,
+                &empty_node(),
+                None,
+                &NativePush::default(),
+            )?;
+            (absent, State::new(node.column(ID)))
+        };
         scope.advance(&empty_scope);
         self.merge(
             input,
             scope,
             vec![
                 (present, branch_scope, state),
-                (absent, empty_scope, State::new(node.column(ID))),
+                (absent, empty_scope, absent_state),
             ],
             ast::PathPatternAlternation::Multiset,
         )
