@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Reuse an edge endpoint for an anonymous unconstrained node. A pattern such as
+  `()-[]->()` no longer joins every node just to copy an id the edge already
+  carries. Labels, property maps, and named variables still read that node.
 - Keep an anchored optional path segment on its known endpoint. The empty
   alternative no longer scans every node to copy that same id.
 - Widen integer, float, and empty lists in `UNION`, `INTERSECT`, `EXCEPT`, and

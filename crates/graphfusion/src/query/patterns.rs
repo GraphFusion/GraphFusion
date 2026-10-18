@@ -61,6 +61,18 @@ fn empty_node() -> ast::NodePattern {
         quantifier: None,
     }
 }
+/// An anonymous node with no label, property, or WHERE constraint adds nothing
+/// the incoming endpoint does not already say. Edge endpoints are stored node
+/// ids, so joining the node tables only copies that id.
+fn reuses_known_endpoint(node: &ast::NodePattern) -> bool {
+    node.variable.is_none()
+        && !node.temporary
+        && node.quantifier.is_none()
+        && node.labels.is_empty()
+        && node.label_expression.is_none()
+        && node.properties.is_none()
+        && node.where_clause.is_none()
+}
 fn raw_bounds(q: &ast::PathPatternQuantifier) -> Result<(u64, Option<u64>)> {
     use ast::PathPatternQuantifier as Q;
     let bounds = match q {
@@ -422,45 +434,27 @@ impl Compiler<'_> {
             Some((ast::PathPatternFactor::Node(node), rest)) => (node, rest),
             _ => (&empty, factors),
         };
-        let native = self.native_for(
-            &plan,
-            scope,
-            first.variable.as_ref(),
-            first.properties.as_ref(),
-            first.where_clause.as_ref(),
-        )?;
-        let (mut plan, start) = graph::node(
-            plan,
-            scope,
-            self.graph_id,
-            self.data,
-            first,
-            endpoint,
-            &native,
-        )?;
-        self.defer_node(start.clone(), first, native);
-        let mut state = State::new(start.column(ID));
+        let (mut plan, mut state) = if reuses_known_endpoint(first) {
+            if let Some(endpoint) = endpoint {
+                (
+                    plan.filter(endpoint.clone().is_not_null())?,
+                    State::new(endpoint),
+                )
+            } else {
+                self.bind_node(plan, scope, first, None)?
+            }
+        } else {
+            self.bind_node(plan, scope, first, endpoint)?
+        };
         for factor in remaining {
             match factor {
                 ast::PathPatternFactor::Node(node) => {
-                    let native = self.native_for(
-                        &plan,
-                        scope,
-                        node.variable.as_ref(),
-                        node.properties.as_ref(),
-                        node.where_clause.as_ref(),
-                    )?;
-                    let (next, binding) = graph::node(
-                        plan,
-                        scope,
-                        self.graph_id,
-                        self.data,
-                        node,
-                        Some(state.end()),
-                        &native,
-                    )?;
-                    plan = next;
-                    self.defer_node(binding, node, native);
+                    if reuses_known_endpoint(node) {
+                        plan = plan.filter(state.end().is_not_null())?;
+                    } else {
+                        let (next, _) = self.bind_node(plan, scope, node, Some(state.end()))?;
+                        plan = next;
+                    }
                 }
                 ast::PathPatternFactor::Relationship(edge) => {
                     if edge.temporary {
@@ -576,6 +570,32 @@ impl Compiler<'_> {
             plan = plan.filter(state.valid(mode, self.different))?;
         }
         Ok((plan, state))
+    }
+    fn bind_node(
+        &mut self,
+        plan: Plan,
+        scope: &mut Bindings,
+        node: &ast::NodePattern,
+        endpoint: Option<Expr>,
+    ) -> Result<(Plan, State)> {
+        let native = self.native_for(
+            &plan,
+            scope,
+            node.variable.as_ref(),
+            node.properties.as_ref(),
+            node.where_clause.as_ref(),
+        )?;
+        let (plan, binding) = graph::node(
+            plan,
+            scope,
+            self.graph_id,
+            self.data,
+            node,
+            endpoint,
+            &native,
+        )?;
+        self.defer_node(binding.clone(), node, native);
+        Ok((plan, State::new(binding.column(ID))))
     }
     async fn group_once(
         &mut self,
