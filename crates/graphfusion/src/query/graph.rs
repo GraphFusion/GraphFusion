@@ -540,7 +540,9 @@ fn scan_tables(
     // an empty aggregate does not invent a group from a constant null. The
     // columns stay untyped: copying another label's type makes `n.id = 1` fail
     // when some unrelated fragment stores that name as a string.
-    let properties = if scanned.is_empty() && inserted.is_none() && refresh_of.is_none() {
+    let properties = if let Some(before) = refresh_of {
+        before.properties.clone()
+    } else if scanned.is_empty() && inserted.is_none() {
         let mut properties = BTreeMap::new();
         for (table, _) in &all_tables {
             for field in table.schema.fields() {
@@ -558,11 +560,42 @@ fn scan_tables(
     if let Some(atom) = &native.filter {
         super::native::validate(atom, scanned.iter().map(|(table, _)| *table))?;
     }
-    let source_labels: Vec<_> = scanned
-        .iter()
-        .map(|(table, _)| table.labels.clone())
-        .collect();
-    let labels: BTreeSet<_> = source_labels.iter().flatten().cloned().collect();
+    // A refresh also reads a one-label-apart fragment so a label edit can find
+    // the moved row. That neighbor must not contribute property names or types:
+    // unifying it would stringify a value the pattern had already excluded.
+    let (properties, source_labels, labels) = if let Some(before) = refresh_of {
+        let exact = scanned.iter().filter(|(table, _)| {
+            before
+                .source_labels
+                .iter()
+                .any(|labels| labels == &table.labels)
+        });
+        let mut properties = before.properties.clone();
+        for (name, data_type) in graph::property_types(exact.map(|(table, _)| *table))? {
+            properties.entry(name).or_insert(data_type);
+        }
+        let labels = if scanned.is_empty() {
+            before
+                .source_labels
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        } else {
+            scanned
+                .iter()
+                .flat_map(|(table, _)| table.labels.iter().cloned())
+                .collect::<BTreeSet<_>>()
+        };
+        (properties, before.source_labels.clone(), labels)
+    } else {
+        let source_labels: Vec<_> = scanned
+            .iter()
+            .map(|(table, _)| table.labels.clone())
+            .collect();
+        let labels = source_labels.iter().flatten().cloned().collect();
+        (properties, source_labels, labels)
+    };
     let binding = ElementBinding {
         alias: format!("__gf_element_{}", scope.next),
         graph: graph_id,
@@ -651,13 +684,24 @@ fn scan_tables(
                 ]);
             }
             for (name, data_type) in &binding.properties {
-                let present = table.schema.field_with_name(name).ok();
-                projections.push(match present {
-                    Some(field) if field.data_type() == data_type => col(name),
-                    Some(_) => cast(col(name), data_type.clone()).alias(name),
-                    None => lit(ScalarValue::try_from(data_type)?).alias(name),
+                let field = table.schema.field_with_name(name).ok();
+                // A neighbor fragment can store the same name differently. Cast
+                // only a widening that fits; an incompatible value stays null
+                // instead of failing the rows this fragment does not describe.
+                let compatible = field.is_some_and(|field| {
+                    field.data_type() == data_type
+                        || graph::property_fits(field.data_type(), data_type)
                 });
-                projections.push(lit(present.is_some()).alias(&binding.present[name]));
+                projections.push(if compatible {
+                    if field.is_some_and(|field| field.data_type() == data_type) {
+                        col(name)
+                    } else {
+                        cast(col(name), data_type.clone()).alias(name)
+                    }
+                } else {
+                    lit(ScalarValue::try_from(data_type)?).alias(name)
+                });
+                projections.push(lit(compatible).alias(&binding.present[name]));
             }
             for (label, column) in &binding.labels {
                 projections.push(lit(table.labels.contains(label)).alias(column));
@@ -698,6 +742,8 @@ fn scan_tables(
         binding,
     ))
 }
+/// Exact label sets define the binding schema. A one-label-apart fragment is
+/// included only so a label edit can find the moved row.
 fn refreshes(table: &Table, before: &ElementBinding) -> bool {
     if before
         .source_labels
