@@ -14,6 +14,8 @@ RETURN [1, 2, 3] AS numbers, [] AS empty,
 
 Lists can contain nulls and compatible numeric values. Nested lists find a common supported element type, including empty and all-null sublists. General heterogeneous union-valued lists are not executable.
 
+Comparisons widen integer and float lists to one element type, and they accept an empty list beside a typed list. `[1, 2] = [1.0, 2.0]` is true and `[1] = []` is false. `COALESCE` and `NULLIF` use the same list type.
+
 [FOR](/query/for/) expands lists. Paths and quantified groups produce lists of graph references; COLLECT_LIST can collect supported values. Explicit list/array type declarations, including maximum lengths, are described under [value types](/catalog/value-types/).
 
 `TRIM(list, count)` is parsed but not implemented by the query engine. See [list trimming](/expressions/list-trim/).

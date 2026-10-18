@@ -162,12 +162,23 @@ pub(super) fn derived(
     Ok(input.cross_join(LogicalPlanBuilder::from(nested).project(output)?.build()?)?)
 }
 
+/// `from` can be cast to `to` by null or numeric widening, including lists.
+fn widens_to(
+    from: &datafusion::arrow::datatypes::DataType,
+    to: &datafusion::arrow::datatypes::DataType,
+) -> bool {
+    from == to
+        || super::expressions::common_value_type(from, to)
+            .ok()
+            .is_some_and(|unified| &unified == to)
+}
+
 /// Validate GQL result names before DataFusion's positional type coercion.
 pub(super) fn coerce(
     plan: datafusion::logical_expr::LogicalPlan,
     target: &datafusion::common::DFSchema,
 ) -> Result<datafusion::logical_expr::LogicalPlan> {
-    use datafusion::{arrow::datatypes::DataType, logical_expr::cast};
+    use datafusion::logical_expr::cast;
     if plan.schema().fields().len() != target.fields().len() {
         return Err(Error::InvalidQuery(
             "composite result column counts differ".into(),
@@ -182,10 +193,7 @@ pub(super) fn coerce(
         }
         let from = field.data_type();
         let to = expected.data_type();
-        if from != to
-            && *from != DataType::Null
-            && !(*from == DataType::Int64 && *to == DataType::Float64)
-        {
+        if from != to && !widens_to(from, to) {
             return Err(Error::InvalidQuery(format!(
                 "incompatible composite column types {from} and {to}"
             )));
@@ -206,7 +214,7 @@ pub(super) fn set_operation(
     all: bool,
 ) -> Result<datafusion::logical_expr::LogicalPlan> {
     use datafusion::{
-        arrow::datatypes::{DataType, Field, Schema},
+        arrow::datatypes::{Field, Schema},
         common::{DFSchema, NullEquality},
         logical_expr::ExprFunctionExt,
     };
@@ -215,20 +223,22 @@ pub(super) fn set_operation(
             "composite result column counts differ".into(),
         ));
     }
-    let fields = left
-        .schema()
-        .fields()
-        .iter()
-        .zip(right.schema().fields())
-        .map(|(a, b)| {
-            let data_type = match (a.data_type(), b.data_type()) {
-                (DataType::Null, b) => b.clone(),
-                (DataType::Int64, DataType::Float64) => DataType::Float64,
-                (a, _) => a.clone(),
-            };
-            Field::new(a.name(), data_type, a.is_nullable() || b.is_nullable())
-        })
-        .collect::<Vec<_>>();
+    let mut fields = Vec::new();
+    for (a, b) in left.schema().fields().iter().zip(right.schema().fields()) {
+        let data_type = super::expressions::common_value_type(a.data_type(), b.data_type())
+            .map_err(|_| {
+                Error::InvalidQuery(format!(
+                    "incompatible composite column types {} and {}",
+                    a.data_type(),
+                    b.data_type()
+                ))
+            })?;
+        fields.push(Field::new(
+            a.name(),
+            data_type,
+            a.is_nullable() || b.is_nullable(),
+        ));
+    }
     let target = DFSchema::try_from(Schema::new(fields))?;
     let left = coerce(left, &target)?;
     let right = coerce(right, &target)?;
