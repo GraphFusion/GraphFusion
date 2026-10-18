@@ -7648,3 +7648,33 @@ fn leading_parenthesized_paths_allow_following_factors_and_alternatives() {
         assert!(parse(invalid).is_err(), "{invalid}");
     }
 }
+
+#[test]
+fn simplified_left_undirected_closing_angle_is_any_direction() {
+    let program =
+        parse("MATCH (a)-/<~KNOWS> L/->(b), (a)-/<KNOWS>/-(b), (a)-/~KNOWS>/-(b) RETURN a")
+            .unwrap();
+    let Statement::Query(query) = &program.statements[0] else {
+        panic!("expected query statement");
+    };
+    let patterns = &first_match(query).patterns;
+    assert_eq!(patterns[0].chains.len(), 2);
+    assert_eq!(patterns[0].chains[0].relationship.direction, Direction::Any);
+    assert_eq!(
+        patterns[0].chains[0].relationship.labels,
+        vec![ident("KNOWS")]
+    );
+    assert_eq!(
+        patterns[0].chains[1].relationship.direction,
+        Direction::Right
+    );
+    assert_eq!(patterns[0].chains[1].relationship.labels, vec![ident("L")]);
+    assert_eq!(
+        patterns[1].chains[0].relationship.direction,
+        Direction::LeftOrRight
+    );
+    assert_eq!(
+        patterns[2].chains[0].relationship.direction,
+        Direction::UndirectedOrRight
+    );
+}

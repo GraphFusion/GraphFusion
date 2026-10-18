@@ -678,9 +678,7 @@ async fn fragment_comparison_rejects_deleted_elements_and_rolls_back() {
     let result = s
         .run("MATCH (n),(m:I {k:1}) DELETE m FILTER n.v = 1 RETURN 1 AS v")
         .await;
-    let error = result
-        .err()
-        .expect("deleted element comparison unexpectedly succeeded");
+    let error = result.expect_err("deleted element comparison unexpectedly succeeded");
     assert!(
         error.to_string().contains("deleted or unavailable"),
         "{error}"
@@ -695,8 +693,7 @@ async fn stored_reference_comparison_rejects_deleted_aliases() {
     let error = s
         .run("MATCH (n) LET r=n MATCH (m:P {k:1}) DELETE m FILTER r.v = '1' RETURN 1 AS value")
         .await
-        .err()
-        .expect("deleted alias comparison committed");
+        .expect_err("deleted alias comparison committed");
     assert!(
         error.to_string().contains("deleted or unavailable"),
         "{error}"

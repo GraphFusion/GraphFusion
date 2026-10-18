@@ -23,3 +23,5 @@ Common pattern forms include:
 | `-[]-` | Any supported orientation |
 
 Mixed directed/undirected pattern forms are also parsed and executed. Reversing an orientation does not produce a second copy of a self-loop; parallel edges still produce separate matches. Use [IS DIRECTED](/expressions/directed/) to inspect an edge value.
+
+Inside a simplified pattern, `<label>` is either directed orientation, `~label>` is undirected or rightward, and `<~label>` is any orientation: the closing `>` includes rightward directed edges as well as leftward and undirected ones.

@@ -512,6 +512,43 @@ async fn path_bags_match_exhaustive_walks_on_mixed_cyclic_graph() {
 }
 
 #[tokio::test]
+async fn simplified_left_undirected_closing_angle_matches_rightward_edges() {
+    let db = Database::new();
+    let mut s = db.session();
+    s.execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+        .unwrap();
+    s.run("INSERT (a:N {name:'A'}), (b:N {name:'B'}), (c:N {name:'C'}), (d:N {name:'D'}), (a)-[:K]->(b), (a)~[:K]~(c), (d)-[:K]->(a)").await.unwrap();
+    let any = s
+        .query("MATCH (a {name:'A'})-/<~K>/- (x) RETURN x.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&any),
+        vec![
+            vec!["B".to_string()],
+            vec!["C".to_string()],
+            vec!["D".to_string()]
+        ]
+    );
+    let directed = s
+        .query("MATCH (a {name:'A'})-/<K>/- (x) RETURN x.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&directed),
+        vec![vec!["B".to_string()], vec!["D".to_string()]]
+    );
+    let undirected_or_right = s
+        .query("MATCH (a {name:'A'})-/~K>/- (x) RETURN x.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&undirected_or_right),
+        vec![vec!["B".to_string()], vec!["C".to_string()]]
+    );
+}
+
+#[tokio::test]
 async fn simplified_path_quantifier_repeats_the_whole_pattern() {
     let db = Database::new();
     let mut s = db.session();
