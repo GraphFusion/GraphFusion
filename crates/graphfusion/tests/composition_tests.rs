@@ -959,3 +959,199 @@ async fn optional_misses_and_reference_aliases_keep_stored_boolean_semantics() {
         );
     }
 }
+
+async fn column(session: &mut graphfusion::Session, query: &str) -> Vec<String> {
+    strings(&session.query(query).await.expect(query))
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn coalesce_and_nullif_use_stored_types() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:P {name:'ten', v:10}),
+                    (:P {name:'nine', v:9}),
+                    (:P {name:'blank'}),
+                    (:D {name:'text', v:'10'}),
+                    (:Q {name:'empty'})",
+        )
+        .await
+        .unwrap();
+    session
+        .execute("SESSION SET VALUE $digits STRING = '10'")
+        .unwrap();
+
+    let text_only = [
+        "MATCH (n) WHERE COALESCE(n.v = '10', FALSE) RETURN n.name AS name ORDER BY name",
+        "MATCH (n) WHERE NULLIF(n.v = '10', FALSE) RETURN n.name AS name ORDER BY name",
+        "MATCH (n WHERE COALESCE(n.v = '10', FALSE)) RETURN n.name AS name ORDER BY name",
+        "MATCH (n) WHERE COALESCE(n.v = $digits, FALSE) RETURN n.name AS name ORDER BY name",
+        "MATCH (n) WHERE COALESCE(n.v, 'zz') = '10' RETURN n.name AS name ORDER BY name",
+        "MATCH (n) WHERE '10' = COALESCE(n.v, 'zz') RETURN n.name AS name ORDER BY name",
+    ];
+    for query in text_only {
+        let names = column(&mut session, query).await;
+        assert_eq!(names, vec!["text".to_string()], "{query}");
+    }
+    for query in [
+        "MATCH (n) WHERE COALESCE(NOT n.v = '10', FALSE) RETURN n.name AS name ORDER BY name",
+        "MATCH (n) WHERE NULLIF(n.v, '10') IS NOT NULL RETURN n.name AS name ORDER BY name",
+    ] {
+        let names = column(&mut session, query).await;
+        assert!(names.is_empty(), "{query}: {names:?}");
+    }
+    assert_eq!(
+        column(
+            &mut session,
+            "MATCH (n) WHERE COALESCE(n.v = '10', n.name = 'nine') RETURN n.name AS name ORDER BY name",
+        )
+        .await,
+        vec!["nine".to_string(), "text".to_string()]
+    );
+    assert_eq!(
+        column(
+            &mut session,
+            "MATCH (n) WHERE COALESCE(n.v, '10') = '10' RETURN n.name AS name ORDER BY name",
+        )
+        .await,
+        vec!["blank".to_string(), "empty".to_string(), "text".to_string()]
+    );
+    assert_eq!(
+        column(
+            &mut session,
+            "MATCH (n) WHERE NULLIF(n.v, '10') IS NULL RETURN n.name AS name ORDER BY name",
+        )
+        .await,
+        vec!["blank".to_string(), "empty".to_string(), "text".to_string()]
+    );
+    assert_eq!(
+        column(
+            &mut session,
+            "MATCH (n) WHERE NULLIF(n.v, 10) IS NULL RETURN n.name AS name ORDER BY name",
+        )
+        .await,
+        vec!["blank".to_string(), "empty".to_string(), "ten".to_string()]
+    );
+    assert_eq!(
+        column(
+            &mut session,
+            "MATCH (n) WHERE NULLIF(n.v, 10) IS NOT NULL RETURN n.name AS name ORDER BY name",
+        )
+        .await,
+        vec!["nine".to_string()]
+    );
+    assert_eq!(
+        column(
+            &mut session,
+            "MATCH (n:P) WHERE NULLIF(n.v, 10) IS NULL RETURN n.name AS name ORDER BY name",
+        )
+        .await,
+        vec!["blank".to_string(), "ten".to_string()]
+    );
+
+    let text_literal = session
+        .query("MATCH (n:D) WHERE NULLIF(n.v, 10) IS NULL RETURN n.name AS name")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        text_literal.contains("incomparable types Utf8 and Int64"),
+        "{text_literal}"
+    );
+    session.run("INSERT (:R {name:'only', v:3})").await.unwrap();
+    let int_fallback = session
+        .query("MATCH (n:R) WHERE COALESCE(n.v, 'zz') = '10' RETURN n.name AS name")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        int_fallback.contains("incomparable types Int64 and Utf8"),
+        "{int_fallback}"
+    );
+
+    session
+        .run(
+            "INSERT (:P {name:'low', score:1}),
+                    (:P {name:'high', score:10}),
+                    (:M {name:'mid', score:9.5})",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        column(
+            &mut session,
+            "MATCH (n:P|M) WHERE COALESCE(n.score, 0) > 9 RETURN n.name AS name ORDER BY name",
+        )
+        .await,
+        vec!["high".to_string(), "mid".to_string()]
+    );
+
+    let mut widened = social().await;
+    assert_eq!(
+        column(
+            &mut widened,
+            "MATCH (n:Person|Metric) WHERE COALESCE(n.score > 1, FALSE) RETURN n.name AS name ORDER BY name",
+        )
+        .await,
+        vec!["Bea".to_string(), "load".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn stored_value_wrappers_keep_filters_aliases_and_optional_nulls() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {name:'ten',v:10}),(:P {name:'blank'}),(:D {name:'text',v:'10'})").await.unwrap();
+    for q in [
+        "MATCH (n) FILTER COALESCE(n.v, 'zz') = '10' RETURN n.name AS name",
+        "MATCH (n) LET ok = COALESCE(n.v = '10', FALSE) FILTER ok RETURN n.name AS name",
+    ] {
+        assert_eq!(
+            strings(&s.query(q).await.unwrap()),
+            vec![vec!["text".to_string()]],
+            "{q}"
+        );
+    }
+    let r=s.query("MATCH (n) LET r=n FILTER NULLIF(r.v, '10') IS NULL RETURN r.name AS name ORDER BY name").await.unwrap();
+    assert_eq!(
+        strings(&r),
+        vec![vec!["blank".to_string()], vec!["text".to_string()]]
+    );
+    let r = s
+        .query("OPTIONAL MATCH (n) WHERE FALSE LET ok = COALESCE(n.v = '10', TRUE) RETURN ok")
+        .await
+        .unwrap();
+    assert_eq!(strings(&r), vec![vec!["true".to_string()]]);
+}
+
+#[tokio::test]
+async fn stored_wrappers_handle_absent_properties_and_nested_boolean_nulls() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {name:'number',v:1}),(:Q {name:'missing'})").await.unwrap();
+    for predicate in ["NULLIF(n.v, '1') IS NULL", "COALESCE(n.v, '1') = '1'"] {
+        for q in [
+            format!("MATCH (n) WHERE {predicate} RETURN n.name AS name"),
+            format!("MATCH (n) FILTER {predicate} RETURN n.name AS name"),
+            format!("MATCH (n) LET ok={predicate} FILTER ok RETURN n.name AS name"),
+        ] {
+            assert_eq!(
+                strings(&s.query(&q).await.unwrap()),
+                vec![vec!["missing".to_string()]],
+                "{q}"
+            );
+        }
+    }
+    s.run("INSERT (:D {name:'text',v:'10'})").await.unwrap();
+    let r = s
+        .query(
+            "MATCH (n) WHERE COALESCE(NULLIF(NULL, NULL), n.v = '10', FALSE) RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&r), vec![vec!["text".to_string()]]);
+}

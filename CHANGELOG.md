@@ -83,6 +83,11 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Evaluate `COALESCE` and `NULLIF` of a property on each fragment's stored
+  type. A comparison wrapped in either function is unknown on a fragment that
+  cannot compare, `NULLIF(property, value) IS NULL` does not stringify the
+  property, and `COALESCE(property, fallback)` compared with a closed value
+  uses that fragment's type.
 - Classify that per-fragment result with `IS [NOT] TRUE`, `IS [NOT] FALSE` and
   `IS [NOT] UNKNOWN`. An integer is unknown against the same digits stored as
   text, so `IS TRUE` does not keep it and `IS UNKNOWN` does.

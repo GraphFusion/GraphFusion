@@ -18,7 +18,7 @@ use datafusion::{
     arrow::datatypes::{DataType, Schema},
     common::{Column, DFSchema, ScalarValue, TableReference},
     datasource::provider_as_source,
-    functions::core::expr_fn::coalesce,
+    functions::core::expr_fn::{coalesce, nullif},
     logical_expr::{
         cast, expr::BinaryExpr, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator,
     },
@@ -53,6 +53,27 @@ pub(super) enum NativeAtom {
         op: Operator,
         value: Expr,
         value_type: DataType,
+    },
+    /// Boolean `COALESCE` of per-fragment predicates and closed booleans.
+    Coalesce(Vec<NativeAtom>),
+    /// Boolean `NULLIF` of per-fragment predicates and closed booleans.
+    NullIf(Box<NativeAtom>, Box<NativeAtom>),
+    /// Closed boolean. Null is unknown.
+    Literal(Expr),
+    /// `NULLIF(property, value) IS [NOT] NULL` on the stored type.
+    NullIfNull {
+        property: String,
+        value: Expr,
+        value_type: DataType,
+        negated: bool,
+    },
+    /// `COALESCE(property, fallback, ...) <op> value` on the stored type.
+    ValueCoalesce {
+        property: String,
+        fallbacks: Vec<(Expr, DataType)>,
+        op: Operator,
+        right: Expr,
+        right_type: DataType,
     },
 }
 
@@ -166,25 +187,50 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
         NativeAtom::Not(inner)
         | NativeAtom::Truth { inner, .. }
         | NativeAtom::Unknown { inner, .. } => validate_atom(inner, tables),
-        NativeAtom::Closed(_) => Ok(()),
         NativeAtom::Compare {
             property,
             value_type,
             ..
+        } => validate_comparison(property, value_type, tables, false),
+        NativeAtom::Coalesce(args) => {
+            for arg in args {
+                validate_atom(arg, tables)?;
+            }
+            Ok(())
+        }
+        NativeAtom::NullIf(left, right) => {
+            validate_atom(left, tables)?;
+            validate_atom(right, tables)
+        }
+        NativeAtom::Literal(_) | NativeAtom::Closed(_) => Ok(()),
+        NativeAtom::NullIfNull {
+            property,
+            value_type,
+            ..
+        } => validate_comparison(property, value_type, tables, true),
+        NativeAtom::ValueCoalesce {
+            property,
+            fallbacks,
+            right_type,
+            ..
         } => {
-            let mut stored = None;
+            let mut conflict = None;
             for table in tables {
-                let Some(field) = table.schema.field_with_name(property).ok() else {
-                    continue;
-                };
-                if comparable(field.data_type(), value_type) {
+                let stored = table
+                    .schema
+                    .field_with_name(property)
+                    .ok()
+                    .map(|field| field.data_type().clone());
+                if unify_coalesce(stored.as_ref(), fallbacks, right_type).is_some() {
                     return Ok(());
                 }
-                stored.get_or_insert_with(|| field.data_type().clone());
+                if conflict.is_none() {
+                    conflict = type_conflict(stored.as_ref(), fallbacks, right_type);
+                }
             }
-            match stored {
-                Some(stored) => Err(Error::InvalidQuery(format!(
-                    "incomparable types {stored} and {value_type}"
+            match conflict {
+                Some((left, right)) => Err(Error::InvalidQuery(format!(
+                    "incomparable types {left} and {right}"
                 ))),
                 None => Ok(()),
             }
@@ -192,18 +238,67 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     }
 }
 
+/// A fragment that does not store `property` can still evaluate `NULLIF` of
+/// that null. A comparison cannot: a missing property is unknown, and the
+/// caller reports a type error only when some stored type is incomparable.
+fn validate_comparison(
+    property: &str,
+    value_type: &DataType,
+    tables: &[&Table],
+    absent_is_value: bool,
+) -> Result<()> {
+    let mut stored = None;
+    let mut absent = false;
+    for table in tables {
+        let Some(field) = table.schema.field_with_name(property).ok() else {
+            absent = true;
+            continue;
+        };
+        if comparable(field.data_type(), value_type) {
+            return Ok(());
+        }
+        stored.get_or_insert_with(|| field.data_type().clone());
+    }
+    if absent && absent_is_value {
+        return Ok(());
+    }
+    match stored {
+        Some(stored) => Err(Error::InvalidQuery(format!(
+            "incomparable types {stored} and {value_type}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
+    compile_in(atom, schema, None)
+}
+
+fn qualified_column(qualifier: Option<&str>, property: &str) -> Expr {
+    match qualifier {
+        Some(alias) => Expr::Column(Column::new(Some(TableReference::bare(alias)), property)),
+        None => column(property),
+    }
+}
+
+fn compile_in(atom: &NativeAtom, schema: &Schema, qualifier: Option<&str>) -> Result<Expr> {
     Ok(match atom {
-        NativeAtom::And(left, right) => compile(left, schema)?.and(compile(right, schema)?),
-        NativeAtom::Or(left, right) => compile(left, schema)?.or(compile(right, schema)?),
-        NativeAtom::Xor(left, right) => xor(compile(left, schema)?, compile(right, schema)?),
-        NativeAtom::Not(inner) => Expr::Not(Box::new(compile(inner, schema)?)),
+        NativeAtom::And(left, right) => {
+            compile_in(left, schema, qualifier)?.and(compile_in(right, schema, qualifier)?)
+        }
+        NativeAtom::Or(left, right) => {
+            compile_in(left, schema, qualifier)?.or(compile_in(right, schema, qualifier)?)
+        }
+        NativeAtom::Xor(left, right) => xor(
+            compile_in(left, schema, qualifier)?,
+            compile_in(right, schema, qualifier)?,
+        ),
         NativeAtom::Truth {
             inner,
             negated,
             value,
         } => {
-            let expr = compile(inner, schema)?;
+            let expr = compile_in(inner, schema, qualifier)?;
             let truth = if *value {
                 expr.is_true()
             } else {
@@ -216,14 +311,15 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
             }
         }
         NativeAtom::Unknown { inner, negated } => {
-            let expr = compile(inner, schema)?;
+            let expr = compile_in(inner, schema, qualifier)?;
             if *negated {
                 expr.is_not_null()
             } else {
                 expr.is_null()
             }
         }
-        NativeAtom::Closed(expr) => expr.clone(),
+        NativeAtom::Closed(value) => value.clone(),
+        NativeAtom::Not(inner) => Expr::Not(Box::new(compile_in(inner, schema, qualifier)?)),
         NativeAtom::Compare {
             property,
             op,
@@ -231,11 +327,55 @@ pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
             value_type,
         } => compare_property(
             schema,
-            &column(property),
+            &qualified_column(qualifier, property),
             property,
             *op,
             value.clone(),
             value_type,
+        )?,
+        NativeAtom::Coalesce(args) => {
+            let exprs = args
+                .iter()
+                .map(|arg| compile_in(arg, schema, qualifier))
+                .collect::<Result<Vec<_>>>()?;
+            if exprs.is_empty() {
+                unknown()
+            } else {
+                coalesce(exprs)
+            }
+        }
+        NativeAtom::NullIf(left, right) => nullif(
+            compile_in(left, schema, qualifier)?,
+            compile_in(right, schema, qualifier)?,
+        ),
+        NativeAtom::Literal(expr) => expr.clone(),
+        NativeAtom::NullIfNull {
+            property,
+            value,
+            value_type,
+            negated,
+        } => nullif_is_null(
+            schema,
+            property,
+            value.clone(),
+            value_type,
+            *negated,
+            qualifier,
+        )?,
+        NativeAtom::ValueCoalesce {
+            property,
+            fallbacks,
+            op,
+            right,
+            right_type,
+        } => value_coalesce(
+            schema,
+            property,
+            fallbacks,
+            *op,
+            right.clone(),
+            right_type,
+            qualifier,
         )?,
     })
 }
@@ -322,6 +462,20 @@ enum Local {
     Closed(ast::Expr),
     Atom {
         property: String,
+        op: Operator,
+        value: ast::Expr,
+    },
+    Coalesce(Vec<Local>),
+    NullIf(Box<Local>, Box<Local>),
+    Literal(ast::Expr),
+    NullIfNull {
+        property: String,
+        value: ast::Expr,
+        negated: bool,
+    },
+    ValueCoalesce {
+        property: String,
+        fallbacks: Vec<ast::Expr>,
         op: Operator,
         value: ast::Expr,
     },
@@ -412,6 +566,10 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             Box::new(local_tree(left, variable)?),
             Box::new(local_tree(right, variable)?),
         )),
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
         ast::Expr::Binary {
             left,
             op: ast::BinaryOp::Xor,
@@ -420,10 +578,6 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             Box::new(local_tree(left, variable)?),
             Box::new(local_tree(right, variable)?),
         )),
-        ast::Expr::Unary {
-            op: ast::UnaryOp::Not,
-            expr,
-        } => Some(Local::Not(Box::new(local_tree(expr, variable)?))),
         ast::Expr::IsTruth {
             expr,
             negated,
@@ -437,22 +591,47 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             inner: Box::new(local_tree(expr, variable)?),
             negated: *negated,
         }),
-        other => {
-            if let Some((property, op, value)) = comparison(other, variable) {
-                Some(Local::Atom {
+        ast::Expr::Coalesce(args) => {
+            if args.is_empty() {
+                return None;
+            }
+            Some(Local::Coalesce(
+                args.iter()
+                    .map(|arg| predicate_or_literal(arg, variable))
+                    .collect::<Option<Vec<_>>>()?,
+            ))
+        }
+        ast::Expr::NullIf { left, right } => Some(Local::NullIf(
+            Box::new(predicate_or_literal(left, variable)?),
+            Box::new(predicate_or_literal(right, variable)?),
+        )),
+        ast::Expr::IsNull { expr, negated } => {
+            let ast::Expr::NullIf { left, right } = expr.as_ref() else {
+                return None;
+            };
+            let property = property_of(left, variable)?;
+            if mentions(right, variable) {
+                return None;
+            }
+            Some(Local::NullIfNull {
+                property,
+                value: right.as_ref().clone(),
+                negated: *negated,
+            })
+        }
+        other => value_coalesce_comparison(other, variable)
+            .or_else(|| {
+                comparison(other, variable).map(|(property, op, value)| Local::Atom {
                     property,
                     op,
                     value,
                 })
-            } else if mentions(other, variable) {
-                None
-            } else {
-                Some(Local::Closed(other.clone()))
-            }
-        }
+            })
+            .or_else(|| (!mentions(other, variable)).then(|| Local::Closed(other.clone()))),
     }
 }
 
+/// A per-fragment predicate, or a closed literal standing in for one.
 fn comparison(expr: &ast::Expr, variable: &str) -> Option<(String, Operator, ast::Expr)> {
     let ast::Expr::Binary { left, op, right } = expr else {
         return None;
@@ -554,7 +733,11 @@ fn bind_local(
             if !matches!(data_type, DataType::Boolean | DataType::Null) {
                 return Ok(None);
             }
-            Some(NativeAtom::Closed(bound))
+            Some(NativeAtom::Closed(if data_type == DataType::Null {
+                unknown()
+            } else {
+                bound
+            }))
         }
         Local::Atom {
             property,
@@ -568,6 +751,71 @@ fn bind_local(
                 value_type,
             }
         }),
+        Local::Coalesce(args) => {
+            let mut bound = Vec::with_capacity(args.len());
+            for arg in args {
+                let Some(atom) = bind_local(session, schema, scope, arg)? else {
+                    return Ok(None);
+                };
+                bound.push(atom);
+            }
+            Some(NativeAtom::Coalesce(bound))
+        }
+        Local::NullIf(left, right) => match (
+            bind_local(session, schema, scope, left)?,
+            bind_local(session, schema, scope, right)?,
+        ) {
+            (Some(left), Some(right)) => Some(NativeAtom::NullIf(Box::new(left), Box::new(right))),
+            _ => None,
+        },
+        Local::Literal(value) => {
+            let Some((expr, value_type)) = bind_closed(session, schema, scope, value)? else {
+                return Ok(None);
+            };
+            if value_type == DataType::Null {
+                Some(NativeAtom::Literal(unknown()))
+            } else if value_type == DataType::Boolean {
+                Some(NativeAtom::Literal(expr))
+            } else {
+                return Ok(None);
+            }
+        }
+        Local::NullIfNull {
+            property,
+            value,
+            negated,
+        } => bind_closed(session, schema, scope, value)?.map(|(expr, value_type)| {
+            NativeAtom::NullIfNull {
+                property: property.clone(),
+                value: expr,
+                value_type,
+                negated: *negated,
+            }
+        }),
+        Local::ValueCoalesce {
+            property,
+            fallbacks,
+            op,
+            value,
+        } => {
+            let mut bound = Vec::with_capacity(fallbacks.len());
+            for fallback in fallbacks {
+                let Some((expr, data_type)) = bind_closed(session, schema, scope, fallback)? else {
+                    return Ok(None);
+                };
+                bound.push((expr, data_type));
+            }
+            let Some((right, right_type)) = bind_closed(session, schema, scope, value)? else {
+                return Ok(None);
+            };
+            Some(NativeAtom::ValueCoalesce {
+                property: property.clone(),
+                fallbacks: bound,
+                op: *op,
+                right,
+                right_type,
+            })
+        }
     })
 }
 
@@ -834,8 +1082,19 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
         NativeAtom::Not(inner)
         | NativeAtom::Truth { inner, .. }
         | NativeAtom::Unknown { inner, .. } => atom_mixes(inner, tables),
-        NativeAtom::Closed(_) => false,
-        NativeAtom::Compare { property, .. } => {
+        NativeAtom::Closed(_) | NativeAtom::Literal(_) => false,
+        NativeAtom::Coalesce(args) => args.iter().any(|atom| atom_mixes(atom, tables)),
+        NativeAtom::NullIf(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
+        NativeAtom::NullIfNull { property, .. } | NativeAtom::ValueCoalesce { property, .. }
+            if tables
+                .iter()
+                .any(|table| table.schema.field_with_name(property).is_err()) =>
+        {
+            true
+        }
+        NativeAtom::Compare { property, .. }
+        | NativeAtom::NullIfNull { property, .. }
+        | NativeAtom::ValueCoalesce { property, .. } => {
             let mut seen: Vec<&DataType> = Vec::new();
             for table in tables {
                 let Some(field) = table.schema.field_with_name(property).ok() else {
@@ -910,7 +1169,7 @@ fn compile_on_fragments(
             None,
             vec![(
                 Box::new(id.is_not_null()),
-                Box::new(compile_qualified(atom, &alias, schema.as_ref())?),
+                Box::new(compile_in(atom, schema.as_ref(), Some(&alias))?),
             )],
             Some(Box::new(unknown())),
         )));
@@ -931,53 +1190,201 @@ fn compile_on_fragments(
     Ok((plan, binding.ensure_live(expr, DataType::Boolean)))
 }
 
-fn compile_qualified(atom: &NativeAtom, alias: &str, schema: &Schema) -> Result<Expr> {
-    Ok(match atom {
-        NativeAtom::And(left, right) => {
-            compile_qualified(left, alias, schema)?.and(compile_qualified(right, alias, schema)?)
+fn nullif_is_null(
+    schema: &Schema,
+    property: &str,
+    value: Expr,
+    value_type: &DataType,
+    negated: bool,
+    qualifier: Option<&str>,
+) -> Result<Expr> {
+    let Some(stored) = schema
+        .field_with_name(property)
+        .ok()
+        .map(|field| field.data_type().clone())
+    else {
+        // The property is absent, so it is null. NULLIF of null is null.
+        return Ok(lit(!negated));
+    };
+    if !comparable(&stored, value_type) {
+        return Ok(unknown());
+    }
+    let mut left = qualified_column(qualifier, property);
+    let mut right = value;
+    if *value_type == DataType::Null {
+        right = cast(right, stored);
+    } else if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
+        left = cast(left, DataType::Float64);
+        right = cast(right, DataType::Float64);
+    }
+    let compared = nullif(left, right);
+    Ok(if negated {
+        compared.is_not_null()
+    } else {
+        compared.is_null()
+    })
+}
+
+fn value_coalesce(
+    schema: &Schema,
+    property: &str,
+    fallbacks: &[(Expr, DataType)],
+    op: Operator,
+    right: Expr,
+    right_type: &DataType,
+    qualifier: Option<&str>,
+) -> Result<Expr> {
+    let stored = schema
+        .field_with_name(property)
+        .ok()
+        .map(|field| field.data_type().clone());
+    let Some(unified) = unify_coalesce(stored.as_ref(), fallbacks, right_type) else {
+        return Ok(unknown());
+    };
+    let mut args = Vec::new();
+    if let Some(stored) = &stored {
+        args.push(cast_to(
+            qualified_column(qualifier, property),
+            stored,
+            &unified,
+        ));
+    }
+    for (expr, data_type) in fallbacks {
+        args.push(cast_to(expr.clone(), data_type, &unified));
+    }
+    if args.is_empty() {
+        return Ok(unknown());
+    }
+    Ok(apply_compare(
+        coalesce(args),
+        cast_to(right, right_type, &unified),
+        op,
+    ))
+}
+
+fn apply_compare(left: Expr, right: Expr, op: Operator) -> Expr {
+    match op {
+        Operator::Eq => left.eq(right),
+        Operator::NotEq => left.not_eq(right),
+        Operator::Lt => left.lt(right),
+        Operator::LtEq => left.lt_eq(right),
+        Operator::Gt => left.gt(right),
+        Operator::GtEq => left.gt_eq(right),
+        _ => unknown(),
+    }
+}
+
+fn cast_to(expr: Expr, from: &DataType, to: &DataType) -> Expr {
+    if from == to {
+        expr
+    } else {
+        cast(expr, to.clone())
+    }
+}
+
+fn unify_coalesce(
+    stored: Option<&DataType>,
+    fallbacks: &[(Expr, DataType)],
+    right: &DataType,
+) -> Option<DataType> {
+    let mut types = Vec::new();
+    if let Some(stored) = stored {
+        types.push(stored.clone());
+    }
+    types.extend(fallbacks.iter().map(|(_, data_type)| data_type.clone()));
+    types.push(right.clone());
+    let concrete: Vec<&DataType> = types
+        .iter()
+        .filter(|data_type| **data_type != DataType::Null)
+        .collect();
+    if concrete.is_empty() {
+        return Some(DataType::Null);
+    }
+    if concrete.iter().all(|data_type| *data_type == concrete[0]) {
+        return Some(concrete[0].clone());
+    }
+    if concrete.iter().all(|data_type| data_type.is_numeric()) {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
+}
+
+fn type_conflict(
+    stored: Option<&DataType>,
+    fallbacks: &[(Expr, DataType)],
+    right: &DataType,
+) -> Option<(DataType, DataType)> {
+    let mut concrete = Vec::new();
+    if let Some(stored) = stored {
+        if *stored != DataType::Null {
+            concrete.push(stored.clone());
         }
-        NativeAtom::Or(left, right) => {
-            compile_qualified(left, alias, schema)?.or(compile_qualified(right, alias, schema)?)
+    }
+    for (_, data_type) in fallbacks {
+        if *data_type != DataType::Null {
+            concrete.push(data_type.clone());
         }
-        NativeAtom::Xor(left, right) => xor(
-            compile_qualified(left, alias, schema)?,
-            compile_qualified(right, alias, schema)?,
-        ),
-        NativeAtom::Not(inner) => Expr::Not(Box::new(compile_qualified(inner, alias, schema)?)),
-        NativeAtom::Truth {
-            inner,
-            negated,
-            value,
-        } => {
-            let expr = compile_qualified(inner, alias, schema)?;
-            let truth = if *value {
-                expr.is_true()
-            } else {
-                expr.is_false()
-            };
-            if *negated {
-                Expr::Not(Box::new(truth))
-            } else {
-                truth
-            }
-        }
-        NativeAtom::Unknown { inner, negated } => {
-            let expr = compile_qualified(inner, alias, schema)?;
-            if *negated {
-                expr.is_not_null()
-            } else {
-                expr.is_null()
-            }
-        }
-        NativeAtom::Closed(expr) => expr.clone(),
-        NativeAtom::Compare {
-            property,
-            op,
-            value,
-            value_type,
-        } => {
-            let left = Expr::Column(Column::new(Some(TableReference::bare(alias)), property));
-            compare_property(schema, &left, property, *op, value.clone(), value_type)?
-        }
+    }
+    if *right != DataType::Null {
+        concrete.push(right.clone());
+    }
+    let first = concrete.first()?.clone();
+    concrete
+        .into_iter()
+        .find(|data_type| data_type != &first && !(first.is_numeric() && data_type.is_numeric()))
+        .map(|data_type| (first, data_type))
+}
+
+fn predicate_or_literal(expr: &ast::Expr, variable: &str) -> Option<Local> {
+    if let Some(local) = local_tree(expr, variable) {
+        return Some(local);
+    }
+    if mentions(expr, variable) {
+        return None;
+    }
+    Some(Local::Literal(expr.clone()))
+}
+
+fn value_coalesce_comparison(expr: &ast::Expr, variable: &str) -> Option<Local> {
+    let ast::Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    let op = comparison_op(op)?;
+    coalesce_comparison(left, op, right, variable)
+        .or_else(|| coalesce_comparison(right, flip(op), left, variable))
+}
+
+fn coalesce_comparison(
+    coalesced: &ast::Expr,
+    op: Operator,
+    value: &ast::Expr,
+    variable: &str,
+) -> Option<Local> {
+    let ast::Expr::Coalesce(args) = coalesced else {
+        return None;
+    };
+    let (first, fallbacks) = args.split_first()?;
+    let property = property_of(first, variable)?;
+    if mentions(value, variable) || fallbacks.iter().any(|arg| mentions(arg, variable)) {
+        return None;
+    }
+    Some(Local::ValueCoalesce {
+        property,
+        fallbacks: fallbacks.to_vec(),
+        op,
+        value: value.clone(),
+    })
+}
+
+fn comparison_op(op: &ast::BinaryOp) -> Option<Operator> {
+    Some(match op {
+        ast::BinaryOp::Eq => Operator::Eq,
+        ast::BinaryOp::Neq => Operator::NotEq,
+        ast::BinaryOp::Lt => Operator::Lt,
+        ast::BinaryOp::Le => Operator::LtEq,
+        ast::BinaryOp::Gt => Operator::Gt,
+        ast::BinaryOp::Ge => Operator::GtEq,
+        _ => return None,
     })
 }
