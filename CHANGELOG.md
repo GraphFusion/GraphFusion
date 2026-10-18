@@ -83,6 +83,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Compare a parenthesized path predicate on each fragment's stored type. A
+  mixed property no longer makes `WHERE n.v > 9` reject the whole pattern, and
+  an integer is not equal to those same digits stored as text.
 - Keep that per-fragment comparison when `AND`, `OR`, `XOR`, or `NOT` combines
   it with another boolean, and when `FILTER` or `LET` evaluates it. `id = '1' OR
   FALSE` does not match an integer `1` just because another label stores `id`
