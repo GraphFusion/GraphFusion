@@ -670,3 +670,20 @@ async fn deleted_elements_fail_in_null_writes_and_direction_tests() {
         );
     }
 }
+
+#[tokio::test]
+async fn fragment_comparison_rejects_deleted_elements_and_rolls_back() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:I {v:1,k:1}),(:I {v:2,k:2}),(:T {v:'text',k:3})").await.unwrap();
+    let result = s
+        .run("MATCH (n),(m:I {k:1}) DELETE m FILTER n.v = 1 RETURN 1 AS v")
+        .await;
+    let error = result
+        .err()
+        .expect("deleted element comparison unexpectedly succeeded");
+    assert!(
+        error.to_string().contains("deleted or unavailable"),
+        "{error}"
+    );
+    assert_eq!(s.query("MATCH (n) RETURN n").await.unwrap().row_count(), 3);
+}

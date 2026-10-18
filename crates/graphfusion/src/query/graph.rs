@@ -309,8 +309,17 @@ pub(super) async fn matches(
             .all(|name| compiler.clause_hit.contains(name));
     if let Some(predicate) = &clause.where_clause {
         if !pushed {
-            let expr = Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
-            plan = plan.filter(expr)?;
+            // A selective path applies WHERE after ranking. Re-read mixed
+            // fragments so the stringified column cannot satisfy the comparison.
+            if let Some(filtered) =
+                super::native::fragment_predicate(plan.clone(), scope, session, predicate)?
+            {
+                plan = filtered;
+            } else {
+                let expr =
+                    Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
+                plan = plan.filter(expr)?;
+            }
         }
     }
     Ok(plan)

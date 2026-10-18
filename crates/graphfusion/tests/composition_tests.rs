@@ -493,6 +493,17 @@ async fn mixed_label_filters_compare_stored_types() {
         strings(&widened),
         vec![vec!["1.5".to_string()], vec!["2".to_string()]]
     );
+    let widened_or = session
+        .query(
+            "MATCH (n:Person|Metric) WHERE n.score > 1 OR FALSE
+             RETURN n.score AS score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&widened_or),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
 
     let both = session
         .query(
@@ -506,6 +517,126 @@ async fn mixed_label_filters_compare_stored_types() {
         strings(&both),
         vec![vec!["Ada".to_string(), "1.5".to_string()]]
     );
+}
+
+#[tokio::test]
+async fn mixed_label_boolean_filters_do_not_stringify() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:Person {name: 'Ada', id: 1}),
+                    (:Person {name: 'Bea', id: 2}),
+                    (:Document {title: 'Spec', id: '1'})",
+        )
+        .await
+        .unwrap();
+
+    let string_or_false = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = '1' OR FALSE
+             RETURN n.name AS name, n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&string_or_false),
+        vec![vec!["NULL".to_string(), "Spec".to_string()]]
+    );
+
+    let number_or_false = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 OR FALSE RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&number_or_false), vec![vec!["Ada".to_string()]]);
+
+    let or_true = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR TRUE
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&or_true),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let and_true = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 AND TRUE RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&and_true), vec![vec!["Ada".to_string()]]);
+
+    let xor_false = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 XOR FALSE RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&xor_false), vec![vec!["Ada".to_string()]]);
+
+    let xor_true = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 XOR TRUE RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&xor_true), vec![vec!["Bea".to_string()]]);
+
+    let negated = session
+        .query("MATCH (n:Person|Document) WHERE NOT (n.id = 1 OR FALSE) RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Bea".to_string()]]);
+
+    let filtered = session
+        .query("MATCH (n:Person|Document) FILTER n.id = '1' RETURN n.title AS title")
+        .await
+        .unwrap();
+    assert_eq!(strings(&filtered), vec![vec!["Spec".to_string()]]);
+
+    let filtered_number = session
+        .query("MATCH (n:Person|Document) FILTER n.id = 1 OR FALSE RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&filtered_number), vec![vec!["Ada".to_string()]]);
+
+    let defined = session
+        .query(
+            "MATCH (n:Person|Document) LET eq = n.id = '1'
+             RETURN n.name AS name, eq AS eq ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&defined),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string()],
+            vec!["NULL".to_string(), "true".to_string()]
+        ]
+    );
+
+    let inline = session
+        .query("MATCH (n:Person|Document WHERE n.id = '1' OR FALSE) RETURN n.title AS title")
+        .await
+        .unwrap();
+    assert_eq!(strings(&inline), vec![vec!["Spec".to_string()]]);
+
+    let selective = session
+        .query("MATCH p = SHORTEST (n:Person|Document) WHERE n.id = '1' RETURN n.title AS title")
+        .await
+        .unwrap();
+    assert_eq!(strings(&selective), vec![vec!["Spec".to_string()]]);
+
+    let single = session
+        .query("MATCH (n:Person) WHERE n.id = 1 AND TRUE RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&single), vec![vec!["Ada".to_string()]]);
 }
 
 #[tokio::test]

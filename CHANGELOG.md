@@ -83,6 +83,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Keep that per-fragment comparison when `AND`, `OR`, `XOR`, or `NOT` combines
+  it with another boolean, and when `FILTER` or `LET` evaluates it. `id = '1' OR
+  FALSE` does not match an integer `1` just because another label stores `id`
+  as text.
 - Keep every distinct spelling in a bare `INSERT` label set. `(A & a)` stores
   both labels, the same as `(:A & a)`. An exact repeat still collapses.
 - Repeat a quantifier after a simplified path across the whole slash pattern.

@@ -550,20 +550,22 @@ async fn plan_body(
                     if item.typed || item.value_type.is_some() {
                         return Err(unsupported("typed LET definitions"));
                     }
-                    let binder = Binder::with_bindings(session, plan.schema(), &scope);
                     if scope.contains(&item.name.value) {
                         return Err(Error::InvalidQuery(format!(
                             "variable {} is already bound",
                             item.name.value
                         )));
                     }
-                    let mut expressions: Vec<_> = plan
-                        .schema()
-                        .columns()
-                        .into_iter()
-                        .map(Expr::Column)
-                        .collect();
-                    let expression = binder.bind(&item.value)?;
+                    let columns = plan.schema().columns();
+                    let (next, mixed) =
+                        native::fragment_boolean(plan, &mut scope, session, &item.value)?;
+                    plan = next;
+                    let expression = if let Some(expr) = mixed {
+                        expr
+                    } else {
+                        Binder::with_bindings(session, plan.schema(), &scope).bind(&item.value)?
+                    };
+                    let mut expressions: Vec<_> = columns.into_iter().map(Expr::Column).collect();
                     if let ast::Expr::Identifier(source) = &item.value {
                         if let Some(element) = scope
                             .elements
@@ -586,9 +588,18 @@ async fn plan_body(
                 }
             }
             ast::QueryClause::Filter(clause) => {
-                let expr = Binder::with_bindings(session, plan.schema(), &scope)
-                    .predicate(&clause.predicate)?;
-                plan = plan.filter(expr)?;
+                if let Some(filtered) = native::fragment_predicate(
+                    plan.clone(),
+                    &mut scope,
+                    session,
+                    &clause.predicate,
+                )? {
+                    plan = filtered;
+                } else {
+                    let expr = Binder::with_bindings(session, plan.schema(), &scope)
+                        .predicate(&clause.predicate)?;
+                    plan = plan.filter(expr)?;
+                }
             }
             ast::QueryClause::OrderByPage(clause) => {
                 plan = order_and_page(
