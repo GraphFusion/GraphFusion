@@ -812,7 +812,7 @@ fn compile_on_fragments(
         1 => parts.pop().expect("fragment comparison"),
         _ => coalesce(parts),
     };
-    Ok((plan, expr))
+    Ok((plan, binding.ensure_live(expr, DataType::Boolean)))
 }
 
 fn compile_qualified(atom: &NativeAtom, alias: &str, schema: &Schema) -> Result<Expr> {
