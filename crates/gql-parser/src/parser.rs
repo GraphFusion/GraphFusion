@@ -88,15 +88,6 @@ struct SimplifiedRelationshipBody {
     quantifier: Option<PathPatternQuantifier>,
 }
 
-#[derive(Clone, Debug)]
-enum SimplifiedPathPatternExpression {
-    Linear(Vec<RelationshipPattern>),
-    Alternation {
-        alternation: PathPatternAlternation,
-        alternatives: Vec<Vec<RelationshipPattern>>,
-    },
-}
-
 impl Parser {
     pub fn new(input: &str) -> Self {
         let mut tokens = Vec::new();
@@ -3825,27 +3816,7 @@ impl Parser {
             ))]);
         }
         if self.starts_simplified_path_pattern_expression() {
-            return Ok(match self.parse_simplified_path_pattern_expression()? {
-                SimplifiedPathPatternExpression::Linear(relationships) => relationships
-                    .into_iter()
-                    .map(PathPatternFactor::Relationship)
-                    .collect(),
-                SimplifiedPathPatternExpression::Alternation {
-                    alternation,
-                    alternatives,
-                } => vec![PathPatternFactor::Alternation {
-                    alternation,
-                    alternatives: alternatives
-                        .into_iter()
-                        .map(|relationships| {
-                            relationships
-                                .into_iter()
-                                .map(PathPatternFactor::Relationship)
-                                .collect()
-                        })
-                        .collect(),
-                }],
-            });
+            return self.parse_simplified_path_pattern_expression();
         }
         if self.at(TokenKind::LParen) {
             return Ok(vec![PathPatternFactor::Node(self.parse_node_pattern()?)]);
@@ -3873,9 +3844,7 @@ impl Parser {
         )
     }
 
-    fn parse_simplified_path_pattern_expression(
-        &mut self,
-    ) -> Result<SimplifiedPathPatternExpression> {
+    fn parse_simplified_path_pattern_expression(&mut self) -> Result<Vec<PathPatternFactor>> {
         let prefix = self.parse_simplified_delimiter_prefix()?;
         let mut branches = vec![self.parse_simplified_relationship_body_sequence()?];
         let alternation = self.peek_path_pattern_alternation_operator();
@@ -3889,22 +3858,49 @@ impl Parser {
         }
         let direction = self.parse_simplified_delimiter_suffix(prefix)?;
         let quantifier = self.parse_optional_path_quantifier()?;
-
-        let alternatives = branches
+        let mut branches: Vec<Vec<RelationshipPattern>> = branches
             .into_iter()
-            .map(|bodies| self.simplified_relationships_from_bodies(bodies, direction, &quantifier))
-            .collect::<Vec<_>>();
-
-        if let Some(alternation) = alternation {
-            Ok(SimplifiedPathPatternExpression::Alternation {
-                alternation,
-                alternatives,
+            .map(|bodies| {
+                bodies
+                    .into_iter()
+                    .map(|body| relationship_from_simplified_body(body, direction))
+                    .collect()
             })
-        } else {
-            Ok(SimplifiedPathPatternExpression::Linear(
-                alternatives.into_iter().next().unwrap_or_default(),
-            ))
+            .collect();
+
+        // One bare edge is already a quantified relationship. Every other outer
+        // quantifier repeats the whole slash pattern: a sequence, an alternation,
+        // or edges that already carry their own quantifiers.
+        if alternation.is_none()
+            && branches.len() == 1
+            && branches[0].len() == 1
+            && branches[0][0].quantifier.is_none()
+        {
+            let mut relationship = branches.remove(0).remove(0);
+            relationship.quantifier = quantifier;
+            return Ok(vec![PathPatternFactor::Relationship(relationship)]);
         }
+        if let Some(quantifier) = quantifier {
+            let pattern = if let Some(alternation) = alternation {
+                alternation_path(alternation, branches)
+            } else {
+                path_pattern_from_relationships(branches.into_iter().next().unwrap_or_default())
+            };
+            return Ok(vec![quantified_simplified_pattern(pattern, quantifier)]);
+        }
+        if let Some(alternation) = alternation {
+            return Ok(vec![PathPatternFactor::Alternation {
+                alternation,
+                alternatives: relationship_factors(branches),
+            }]);
+        }
+        Ok(branches
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathPatternFactor::Relationship)
+            .collect())
     }
 
     fn parse_simplified_relationship_body_sequence(
@@ -3915,35 +3911,6 @@ impl Parser {
             bodies.push(self.parse_simplified_relationship_body()?);
         }
         Ok(bodies)
-    }
-
-    fn simplified_relationships_from_bodies(
-        &self,
-        bodies: Vec<SimplifiedRelationshipBody>,
-        direction: Direction,
-        quantifier: &Option<PathPatternQuantifier>,
-    ) -> Vec<RelationshipPattern> {
-        let last = bodies.len().saturating_sub(1);
-        bodies
-            .into_iter()
-            .enumerate()
-            .map(|(index, body)| RelationshipPattern {
-                direction: body.direction_override.unwrap_or(direction),
-                variable: None,
-                temporary: false,
-                labels: body.labels,
-                label_expression: Some(body.label_expression),
-                properties: None,
-                where_clause: None,
-                quantifier: body.quantifier.or_else(|| {
-                    if index == last {
-                        quantifier.clone()
-                    } else {
-                        None
-                    }
-                }),
-            })
-            .collect()
     }
 
     fn parse_simplified_relationship_body(&mut self) -> Result<SimplifiedRelationshipBody> {
@@ -4649,10 +4616,11 @@ impl Parser {
     fn parse_insert_label_set(&mut self) -> Result<(Vec<Identifier>, Option<LabelExpression>)> {
         let mut labels = Vec::new();
         let label = self.parse_identifier()?;
-        push_identifier_if_absent(&mut labels, Some(&label));
+        // Labels stay case-sensitive. `A & a` is two labels; only an exact repeat collapses.
+        push_exact_label(&mut labels, label);
         while self.eat(TokenKind::Ampersand).is_some() {
             let label = self.parse_identifier()?;
-            push_identifier_if_absent(&mut labels, Some(&label));
+            push_exact_label(&mut labels, label);
         }
 
         let mut iter = labels.iter().cloned();
@@ -5329,6 +5297,14 @@ impl Parser {
                     offset: token.offset,
                     token_text: token.text.clone(),
                 })?;
+                // f64 overflow is `Ok(inf)`, not a parse error. Infinity is not a
+                // query value: arithmetic already rejects non-finite results.
+                if !value.is_finite() {
+                    return Err(Error::BadNumber {
+                        offset: token.offset,
+                        token_text: token.text,
+                    });
+                }
                 Ok(Expr::Literal(Literal::Decimal(value)))
             }
             TokenKind::Null => Ok(Expr::Literal(Literal::Null)),
@@ -6553,6 +6529,90 @@ fn apply_path_pattern_node_to_term(
     }
 }
 
+fn relationship_from_simplified_body(
+    body: SimplifiedRelationshipBody,
+    direction: Direction,
+) -> RelationshipPattern {
+    RelationshipPattern {
+        direction: body.direction_override.unwrap_or(direction),
+        variable: None,
+        temporary: false,
+        labels: body.labels,
+        label_expression: Some(body.label_expression),
+        properties: None,
+        where_clause: None,
+        quantifier: body.quantifier,
+    }
+}
+
+fn relationship_factors(branches: Vec<Vec<RelationshipPattern>>) -> Vec<Vec<PathPatternFactor>> {
+    branches
+        .into_iter()
+        .map(|relationships| {
+            relationships
+                .into_iter()
+                .map(PathPatternFactor::Relationship)
+                .collect()
+        })
+        .collect()
+}
+
+fn path_pattern_from_relationships(relationships: Vec<RelationshipPattern>) -> PathPattern {
+    let start = empty_node_pattern();
+    let chains = relationships
+        .into_iter()
+        .map(|relationship| PathPatternChain {
+            relationship,
+            node: empty_node_pattern(),
+        })
+        .collect::<Vec<_>>();
+    let factors = path_pattern_factors_from_flat_path(&start, &chains);
+    PathPattern {
+        variable: None,
+        prefix: None,
+        parenthesized: None,
+        start,
+        chains,
+        factors,
+        alternation: None,
+        alternatives: Vec::new(),
+    }
+}
+
+fn alternation_path(
+    alternation: PathPatternAlternation,
+    branches: Vec<Vec<RelationshipPattern>>,
+) -> PathPattern {
+    let start = empty_node_pattern();
+    PathPattern {
+        variable: None,
+        prefix: None,
+        parenthesized: None,
+        start,
+        chains: Vec::new(),
+        factors: vec![PathPatternFactor::Alternation {
+            alternation,
+            alternatives: relationship_factors(branches),
+        }],
+        alternation: None,
+        alternatives: Vec::new(),
+    }
+}
+
+fn quantified_simplified_pattern(
+    pattern: PathPattern,
+    quantifier: PathPatternQuantifier,
+) -> PathPatternFactor {
+    PathPatternFactor::Parenthesized(Box::new(ParenthesizedPathPatternExpression {
+        variable: None,
+        prefix: None,
+        pattern: Box::new(pattern),
+        where_clause: None,
+        quantifier: Some(quantifier),
+        questioned: false,
+    }))
+}
+
 fn path_pattern_factors_from_flat_path(
     start: &NodePattern,
     chains: &[PathPatternChain],
@@ -7031,6 +7091,12 @@ fn push_identifier_if_absent(variables: &mut Vec<Identifier>, candidate: Option<
         .any(|variable| variable.value.eq_ignore_ascii_case(&candidate.value))
     {
         variables.push(candidate.clone());
+    }
+}
+
+fn push_exact_label(labels: &mut Vec<Identifier>, label: Identifier) {
+    if !labels.iter().any(|existing| existing.value == label.value) {
+        labels.push(label);
     }
 }
 
