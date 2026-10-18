@@ -25,6 +25,8 @@ This returns Alice/0, Bob/1 and Cara/2. A zero-hop match applies both endpoint c
 
 An explicit upper bound must be positive. Unbounded forms require the planner to prove a finite complete search for the chosen mode/selector; unsupported cases return an error. [Search limits](/storage/limits/) are checked against the required bound, rather than silently truncating paths.
 
+A selective search (`ANY`, `SHORTEST`, or a shortest-length group) of one homogeneous unbounded edge stops at a complete hop bound derived from the node count and the number of paths requested. That search does not enumerate every trail out to the edge count. `ALL` keeps the match mode's own limit.
+
 An anonymous unconstrained start of a quantifier whose lower bound is at least one, such as `()-[:Knows]->+()`, reads that edge directly. It does not first cross-join every node to recover a source the edge already stores. Naming, labeling, or otherwise constraining the start still reads the node tables. A quantifier that allows zero repetitions, including `*` and `{0,n}`, still anchors on every node so a node with no matching edge can produce the empty walk.
 
 The `edges` variable above is an ordered list outside the repeated segment. Within an edge predicate it denotes the current edge. Zero repetitions expose an empty list. Group declarations must be fresh.

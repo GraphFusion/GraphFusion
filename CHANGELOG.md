@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Cap a selective search of one unbounded edge at the complete node-derived hop
+  bound. `ANY SHORTEST` and the other selectors no longer expand every trail out
+  to the edge count when a shorter bound is complete. `ALL` still follows the
+  match mode's own limit.
 - Read a positive-length quantified edge from the edge itself when the path
   start is anonymous and unconstrained. `()-[:E]->+()` no longer cross-joins
   every node before the first hop. A named, labeled, or constrained start still
