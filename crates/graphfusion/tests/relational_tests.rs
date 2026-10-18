@@ -663,7 +663,20 @@ async fn list_comparisons_widen_numbers_and_accept_empty_lists() {
         panic!("expected a list");
     };
     assert_eq!(item.data_type(), &DataType::Float64);
-    assert_eq!(rows(&kept), vec![vec!["[1.0, NULL]"]]);
+    let lists = kept.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::ListArray>()
+        .unwrap();
+    let values = lists.value(0);
+    let values = values
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(
+        values,
+        &datafusion::arrow::array::Float64Array::from(vec![Some(1.0), None])
+    );
 
     for query in ["RETURN [1] = ['a'] AS bad", "RETURN [TRUE] < [1] AS bad"] {
         assert!(s.query(query).await.is_err(), "{query}");
