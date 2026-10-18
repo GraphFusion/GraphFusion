@@ -592,3 +592,39 @@ async fn detach_indexes_handle_parallel_edges_loops_directions_and_separate_id_s
         }
     }
 }
+
+#[tokio::test]
+async fn deleted_elements_fail_in_null_writes_and_direction_tests() {
+    for query in [
+        "MATCH (n:N), (m:M) DETACH DELETE n SET m.flag = n.missing",
+        "MATCH (n:N) DETACH DELETE n INSERT (:Made {flag: n.missing})",
+        "MATCH ()-[e:E]->() DELETE e RETURN e IS DIRECTED AS directed",
+    ] {
+        let db = Database::new();
+        let mut s = session(&db);
+        s.run("INSERT (n:N {name:'n'}), (m:M {name:'m', flag:true}), (n)-[:E]->(m)")
+            .await
+            .unwrap();
+        let error = s
+            .run(query)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("deleted access committed: {query}"));
+        assert!(
+            error.to_string().contains("deleted or unavailable"),
+            "{query}: {error}"
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH (n) RETURN COUNT(*) AS c").await),
+            vec![vec!["2"]]
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH ()-[e:E]->() RETURN COUNT(*) AS c").await),
+            vec![vec!["1"]]
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH (m:M) RETURN m.flag AS flag").await),
+            vec![vec!["true"]]
+        );
+    }
+}

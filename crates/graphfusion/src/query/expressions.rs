@@ -245,7 +245,7 @@ impl<'a> Binder<'a> {
                     if element.kind != super::graph::ElementKind::Edge {
                         return Err(Error::InvalidQuery("IS DIRECTED requires an edge".into()));
                     }
-                    element.column("__gf_directed")
+                    element.ensure_live(element.column("__gf_directed"), DataType::Boolean)
                 } else if let Some(reference) = self
                     .bindings
                     .and_then(|b| b.references.get(&variable.value))

@@ -510,6 +510,7 @@ pub(crate) fn unify_property_type(left: &DataType, right: &DataType) -> Option<D
         return Some(left.clone());
     }
     match (left, right) {
+        (DataType::Null, other) | (other, DataType::Null) => Some(other.clone()),
         (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64) => {
             Some(DataType::Float64)
         }
