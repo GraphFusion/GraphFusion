@@ -2,6 +2,8 @@
 
 ## 0.3.0 — Unreleased
 
+- Reject a grouped result that still refers to an ungrouped input, including in
+  `ORDER BY` and `HAVING`, as an invalid query.
 - Keep a variable readable after `DELETE` when only some of its rows were
   removed. Property access still fails for a deleted identity, including
   through an alias, and that failure rolls the statement back.
