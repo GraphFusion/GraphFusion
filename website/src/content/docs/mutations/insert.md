@@ -15,6 +15,6 @@ RETURN dana.name AS name;
 
 A bound node appears as a bare reference, such as `(alice)`. New nodes can have labels and properties; edge variables must be new. Incoming/outgoing edges, undirected connections, self-loops and parallel edges are supported.
 
-Creation requires concrete labels: names joined by `&` are accepted, while `!`, `|` and `%` are rejected. Every input row creates its new elements; repeated input rows can therefore insert duplicates. Empty input inserts nothing. A null optional endpoint is an error.
+Creation requires concrete labels: names joined by `&` are accepted, while `!`, `|` and `%` are rejected. Labels are case-sensitive, so a bare conjunction such as `(A & a)` stores both spellings, the same as `(:A & a)`. Every input row creates its new elements; repeated input rows can therefore insert duplicates. Empty input inserts nothing. A null optional endpoint is an invalid query, and that statement inserts nothing.
 
 A complete statement publishes atomically after its result pipeline succeeds. A later expression error rolls back that statement's inserts. Multiple semicolon-separated statements auto-commit independently unless enclosed in an [explicit transaction](/storage/transactions/).

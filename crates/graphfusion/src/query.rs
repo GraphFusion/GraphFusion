@@ -5,6 +5,7 @@ mod binding;
 mod execution;
 mod expressions;
 mod graph;
+mod lists;
 mod mutations;
 mod native;
 mod path_values;
@@ -565,6 +566,17 @@ async fn plan_body(
                         Binder::with_bindings(session, plan.schema(), &scope).bind(&item.value)?
                     };
                     let mut expressions: Vec<_> = columns.into_iter().map(Expr::Column).collect();
+                    if let ast::Expr::Identifier(source) = &item.value {
+                        if let Some(element) = scope
+                            .elements
+                            .get(&source.value)
+                            .or_else(|| scope.reference_sources.get(&source.value))
+                        {
+                            scope
+                                .reference_sources
+                                .insert(item.name.value.clone(), element.clone());
+                        }
+                    }
                     let domain = references::domain(&item.value, &scope);
                     let column = scope.scalar(&item.name.value);
                     if let Some(domain) = domain {

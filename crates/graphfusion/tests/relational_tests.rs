@@ -280,6 +280,36 @@ async fn empty_groups_and_collect_have_consistent_null_behavior() {
 }
 
 #[tokio::test]
+async fn ungrouped_references_are_invalid_queries() {
+    let mut s = fixture().await;
+    for sql in [
+        "FOR n IN [1, 2, 3] RETURN COLLECT_LIST(n) AS xs ORDER BY n DESC",
+        "MATCH (n:N) RETURN COUNT(*) AS c ORDER BY n.k",
+        "SELECT COUNT(*) AS c FROM g MATCH (n:N) HAVING n.v > 0",
+        "FOR x IN [1, 2] RETURN x, COUNT(*) AS c GROUP BY ()",
+    ] {
+        let error = s.query(sql).await.unwrap_err().to_string();
+        assert!(
+            error.contains("invalid query: expression is not grouped or aggregated"),
+            "{sql}: {error}"
+        );
+        assert!(!error.contains("__gf_"), "{sql}: {error}");
+    }
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 2] RETURN n AS n, COUNT(*) AS c ORDER BY n",
+        &[&["1", "1"], &["2", "2"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3] RETURN COLLECT_LIST(n) AS xs ORDER BY COUNT(*)",
+        &[&["[1, 2, 3]"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn aggregate_errors_are_checked_and_never_publish_writes() {
     let mut s = fixture().await;
     for sql in [
@@ -370,6 +400,87 @@ async fn composite_schema_names_types_and_scopes_are_checked() {
         "LET x = 1 RETURN x UNION RETURN x",
         "RETURN 1 AS x OTHERWISE RETURN 1 AS y",
         "RETURN 1 AS x OTHERWISE RETURN missing AS x",
+    ] {
+        assert!(s.query(sql).await.is_err(), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn composite_lists_widen_numbers_and_accept_empty_lists() {
+    let mut s = Database::new().session();
+    let result = query(
+        &mut s,
+        "RETURN [1, 2] AS x UNION ALL RETURN [1.0, 2.0] AS x UNION ALL RETURN [] AS x",
+    )
+    .await;
+    let DataType::List(field) = result.schema.field(0).data_type() else {
+        panic!("list column");
+    };
+    assert_eq!(field.data_type(), &DataType::Float64);
+    let mut actual: Vec<_> = rows(&result).into_iter().map(|r| r[0].clone()).collect();
+    actual.sort();
+    assert_eq!(actual, ["[1.0, 2.0]", "[1.0, 2.0]", "[]"]);
+    check(
+        &mut s,
+        "RETURN [1] AS x UNION RETURN [1.0] AS x",
+        &[&["[1.0]"]],
+    )
+    .await;
+    check(&mut s, "RETURN [1] AS x EXCEPT RETURN [1.0] AS x", &[]).await;
+    check(&mut s, "RETURN [1] AS x EXCEPT RETURN [] AS x", &[&["[1]"]]).await;
+    check(
+        &mut s,
+        "RETURN [1] AS x INTERSECT RETURN [1.0] AS x",
+        &[&["[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [[1], [1]] RETURN x INTERSECT ALL FOR x IN [[1.0]] RETURN x",
+        &[&["[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN [[1], []] AS x UNION RETURN [[1.0], []] AS x",
+        &[&["[[1.0], []]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN [1] AS x OTHERWISE RETURN [1.0] AS x",
+        &[&["[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FILTER FALSE RETURN [] AS x OTHERWISE RETURN [2] AS x",
+        &[&["[2]"]],
+    )
+    .await;
+    let result = query(
+        &mut s,
+        "RETURN 1 AS n, [1] AS xs UNION ALL RETURN 1.5 AS n, [] AS xs",
+    )
+    .await;
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+    let DataType::List(field) = result.schema.field(1).data_type() else {
+        panic!("list column");
+    };
+    assert_eq!(field.data_type(), &DataType::Int64);
+    let mut actual: Vec<_> = rows(&result)
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect();
+    actual.sort();
+    assert_eq!(
+        actual,
+        vec![("1".into(), "[1]".into()), ("1.5".into(), "[]".into())]
+    );
+    for sql in [
+        "RETURN [1] AS x UNION RETURN ['a'] AS x",
+        "RETURN [TRUE] AS x UNION ALL RETURN [1] AS x",
+        "RETURN [[1]] AS x OTHERWISE RETURN [['a']] AS x",
     ] {
         assert!(s.query(sql).await.is_err(), "{sql}");
     }
@@ -468,11 +579,36 @@ async fn optional_mutation_null_targets_are_noops_without_losing_rows() {
     };
     assert_eq!(result.affected_elements, 0);
     assert_eq!(rows(result), &[vec!["1"], vec!["3"], vec!["20"]]);
-    assert!(s
+    let err = s
         .run("OPTIONAL MATCH (b:Absent) INSERT (:N {v: 9})-[:E]->(b)")
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(err.to_string().contains("null INSERT endpoint"), "{err}");
     check(&mut s, "MATCH (n:N) RETURN COUNT(*) AS c", &[&["3"]]).await;
+    let mut t = fixture().await;
+    let err = t
+        .run("MATCH (a:N) OPTIONAL MATCH (a)-[:E]->(b) INSERT (a)-[:F]->(b)")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("null INSERT endpoint"), "{err}");
+    check(&mut t, "MATCH ()-[e:F]->() RETURN COUNT(*) AS c", &[&["0"]]).await;
+    let err = t
+        .run("OPTIONAL MATCH (a:Absent) INSERT (a)-[:E]->(:N {v: 8})")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("null INSERT endpoint"), "{err}");
+    check(&mut t, "MATCH (n:N {v: 8}) RETURN COUNT(*) AS c", &[&["0"]]).await;
+    let err = t
+        .run("MATCH (a:N {v: 1}) OPTIONAL MATCH (a)-[:Missing]->(b) INSERT (a)-[:G]->(:N {v: 9})-[:G]->(b)")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("null INSERT endpoint"), "{err}");
+    check(&mut t, "MATCH (n:N {v: 9}) RETURN COUNT(*) AS c", &[&["0"]]).await;
+    check(&mut t, "MATCH ()-[e:G]->() RETURN COUNT(*) AS c", &[&["0"]]).await;
+    t.run("MATCH (a:N {v: 1})-[:E]->(b) INSERT (a)-[:F]->(b)")
+        .await
+        .unwrap();
+    check(&mut t, "MATCH ()-[e:F]->() RETURN COUNT(*) AS c", &[&["1"]]).await;
 }
 
 #[tokio::test]
@@ -599,6 +735,116 @@ async fn composite_null_only_rows_strings_and_graph_focus() {
     values.sort();
     assert_eq!(values, &[vec!["1"], vec!["2"], vec!["3"], vec!["9"]]);
     check(&mut s, "MATCH (n) RETURN COUNT(*) AS c", &[&["3"]]).await;
+}
+
+#[tokio::test]
+async fn list_comparisons_widen_numbers_and_accept_empty_lists() {
+    let mut s = Database::new().session();
+    check(
+        &mut s,
+        "RETURN [1, 2] = [1.0, 2.0] AS same, [1] < [1.5] AS less, \
+         [3] >= [2.5] AS greater, [1] <> [1.0] AS different, \
+         [1] = [] AS empty_eq, [] < [1] AS empty_lt, [] = [] AS both_empty, \
+         [[1], []] = [[1.0], []] AS nested",
+        &[&[
+            "true", "true", "true", "false", "false", "true", "true", "true",
+        ]],
+    )
+    .await;
+    check(
+        &mut s,
+        "RETURN NULLIF([1, 2], [1.0, 2.0]) AS removed, NULLIF([1], []) AS kept, \
+         COALESCE([1], [2.0]) AS first",
+        &[&["NULL", "[1]", "[1.0]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [[1], [1.0], [], [2]] FILTER x = [1] OR x < [] RETURN x ORDER BY x",
+        &[&["[1.0]"], &["[1.0]"]],
+    )
+    .await;
+    let kept = query(&mut s, "RETURN NULLIF([1, NULL], [1.0, NULL]) AS kept").await;
+    let DataType::List(item) = kept.schema.field(0).data_type() else {
+        panic!("expected a list");
+    };
+    assert_eq!(item.data_type(), &DataType::Float64);
+    let lists = kept.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::ListArray>()
+        .unwrap();
+    let values = lists.value(0);
+    let values = values
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(
+        values,
+        &datafusion::arrow::array::Float64Array::from(vec![Some(1.0), None])
+    );
+
+    for query in ["RETURN [1] = ['a'] AS bad", "RETURN [TRUE] < [1] AS bad"] {
+        assert!(s.query(query).await.is_err(), "{query}");
+    }
+}
+
+#[tokio::test]
+async fn list_comparisons_keep_null_elements_unknown() {
+    let mut s = fixture().await;
+    check(
+        &mut s,
+        "RETURN ([1, NULL] = [1, NULL]) IS NULL AS same,
+                ([1, NULL] = [1, 2]) IS NULL AS maybe,
+                ([1, NULL] <> [1, 2]) IS NULL AS maybe_not,
+                [1, 3, NULL] = [1, 2, NULL] AS earlier,
+                [1] = [1, NULL] AS length,
+                [1] < [1, NULL] AS prefix,
+                ([1, NULL] < [1, 2]) IS NULL AS order_unknown,
+                [1, 2] < [1, 3] AS order,
+                [1, 2] = [1, 2] AS equal,
+                [1, 2] <= [1, 2] AS le,
+                [1, 3] <= [1, 2] AS not_le,
+                ([1, NULL] <= [1, 2]) IS NULL AS le_unknown,
+                [] = [] AS empty,
+                [] < [NULL] AS empty_prefix,
+                ([NULL] = [NULL]) IS NULL AS nulls,
+                ([[1, NULL]] = [[1, NULL]]) IS NULL AS nested,
+                ([true, NULL] = [true, false]) IS NULL AS flags,
+                (['a', NULL] = ['a', NULL]) IS NULL AS names,
+                [2, NULL] > [1, 9] AS decided,
+                true OR [1, NULL] = [1, NULL] AS either,
+                NULLIF([1, 2], [1, 2]) IS NULL AS removed,
+                NULLIF([1, NULL], [1, NULL]) IS NULL AS kept,
+                [X'01', X'02'] < [X'01', X'03'] AS bytes,
+                [X'01'] = [X'01'] AS same_bytes",
+        &[&[
+            "true", "true", "true", "false", "false", "true", "true", "true", "true", "true",
+            "false", "true", "true", "true", "true", "true", "true", "true", "true", "true",
+            "true", "false", "true", "true",
+        ]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [[1, NULL], [1, 2], [1, 3]] FILTER x = [1, 2] OR x = [1, NULL] RETURN x",
+        &[&["[1, 2]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN NULLIF([1, NULL], [1, NULL]) WITH ORDINALITY i RETURN i, x ORDER BY i",
+        &[&["1", "1"], &["2", "NULL"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (a:N {v: 1}), (b:N {v: 2})
+         RETURN [a] = [a] AS same, [a] = [b] AS different,
+                ([a, NULL] = [a, NULL]) IS NULL AS unknown",
+        &[&["true", "false", "true"]],
+    )
+    .await;
 }
 
 #[tokio::test]

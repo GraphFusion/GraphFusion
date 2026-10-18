@@ -154,6 +154,55 @@ async fn label_filters_scan_only_compatible_fragments() {
     );
 }
 
+#[tokio::test]
+async fn missing_label_does_not_inherit_other_property_types() {
+    let mut session = social().await;
+    let missing = session
+        .query("MATCH (n:Missing) WHERE n.id = 1 RETURN n.id AS id")
+        .await
+        .unwrap();
+    assert_eq!(missing.row_count(), 0);
+    let grouped = session
+        .query("MATCH (n:Missing) RETURN n.id AS id, COUNT(*) AS c")
+        .await
+        .unwrap();
+    assert_eq!(grouped.row_count(), 0);
+}
+
+#[tokio::test]
+async fn integer_values_widen_into_existing_float_properties() {
+    let mut session = social().await;
+    let inserted = statement(
+        &mut session,
+        "INSERT (m:Metric {name: 'qps', score: 2}) RETURN m.score AS score",
+    )
+    .await;
+    assert_eq!(inserted.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&inserted), vec![vec!["2".to_string()]]);
+
+    let updated = statement(
+        &mut session,
+        "MATCH (m:Metric WHERE m.name = 'load') SET m.score = 4 RETURN m.score AS score",
+    )
+    .await;
+    assert_eq!(updated.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&updated), vec![vec!["4".to_string()]]);
+
+    assert!(session
+        .run("INSERT (:Metric {name: 'bad', score: 'nope'})")
+        .await
+        .is_err());
+    let scores = session
+        .query("MATCH (m:Metric) RETURN m.score AS score ORDER BY score")
+        .await
+        .unwrap();
+    assert_eq!(scores.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&scores),
+        vec![vec!["2".to_string()], vec!["4".to_string()]]
+    );
+}
+
 async fn statement(session: &mut graphfusion::Session, query: &str) -> graphfusion::QueryResult {
     let output = session.run(query).await.unwrap().pop().unwrap();
     match output {
@@ -240,6 +289,22 @@ async fn binding_table_inputs_join_graph_matches() {
     let none = session.query("TABLE $empty RETURN 1 AS n").await.unwrap();
     assert_eq!(none.row_count(), 0);
 
+    session
+        .set_parameter(
+            "blank",
+            Value::BindingTable(vec![BTreeMap::from([("id".to_string(), Value::Null)])]),
+        )
+        .unwrap();
+    let blank = session
+        .query(
+            "TABLE $blank
+             MATCH (p:Person WHERE p.id = id)
+             RETURN p.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank.row_count(), 0);
+
     let piped = session
         .query(
             "TABLE { RETURN 'Ada' AS name }
@@ -250,6 +315,118 @@ async fn binding_table_inputs_join_graph_matches() {
         .await
         .unwrap();
     assert_eq!(strings(&piped), vec![vec!["1".to_string()]]);
+}
+
+#[tokio::test]
+async fn refresh_keeps_the_bound_label_set_schema() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:Person {name: 'Ada', score: 1}),
+                    (:Person&Extra {name: 'Bea', score: 2, note: 'hi'})",
+        )
+        .await
+        .unwrap();
+    let updated = session
+        .run(
+            "MATCH (p:Person&!Extra)
+             SET p.flag = true
+             SET p.note = 1
+             RETURN p.name AS name, p.note = 1 AS same, p IS LABELED Extra AS extra",
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let graphfusion::StatementOutput::Query(updated) = updated else {
+        panic!("query result expected");
+    };
+    assert_eq!(updated.schema.field(1).data_type(), &DataType::Boolean);
+    assert_eq!(
+        strings(&updated),
+        vec![vec![
+            "Ada".to_string(),
+            "true".to_string(),
+            "false".to_string()
+        ]]
+    );
+    let stored = session
+        .query("MATCH (p:Person&!Extra) RETURN p.note AS note, p.flag AS flag")
+        .await
+        .unwrap();
+    assert_eq!(stored.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(stored.schema.field(1).data_type(), &DataType::Boolean);
+    assert_eq!(
+        strings(&stored),
+        vec![vec!["1".to_string(), "true".to_string()]]
+    );
+    let labeled = session
+        .run(
+            "MATCH (p:Person&!Extra WHERE p.name = 'Ada')
+             SET p IS Retired
+             RETURN p IS LABELED Retired AS retired, p.note = 1 AS same, p.name AS name",
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let graphfusion::StatementOutput::Query(labeled) = labeled else {
+        panic!("query result expected");
+    };
+    assert_eq!(
+        strings(&labeled),
+        vec![vec![
+            "true".to_string(),
+            "true".to_string(),
+            "Ada".to_string()
+        ]]
+    );
+}
+
+#[tokio::test]
+async fn binding_table_rejects_non_numeric_mixed_columns() {
+    let mut session = Database::new().session();
+    session
+        .set_parameter(
+            "mixed",
+            Value::BindingTable(vec![
+                BTreeMap::from([("v".to_string(), Value::Boolean(true))]),
+                BTreeMap::from([("v".to_string(), Value::Integer(1))]),
+            ]),
+        )
+        .unwrap();
+    let error = session
+        .query("TABLE $mixed RETURN v AS v")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("mixed types for binding-table column v"),
+        "{error}"
+    );
+
+    session
+        .set_parameter(
+            "nums",
+            Value::BindingTable(vec![
+                BTreeMap::from([("v".to_string(), Value::Integer(1))]),
+                BTreeMap::from([("v".to_string(), Value::Float(1.5))]),
+            ]),
+        )
+        .unwrap();
+    let nums = session
+        .query("TABLE $nums RETURN v AS v ORDER BY v")
+        .await
+        .unwrap();
+    assert_eq!(nums.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&nums),
+        vec![vec!["1".to_string()], vec!["1.5".to_string()]]
+    );
 }
 
 #[tokio::test]
@@ -460,4 +637,90 @@ async fn mixed_label_boolean_filters_do_not_stringify() {
         .await
         .unwrap();
     assert_eq!(strings(&single), vec![vec!["Ada".to_string()]]);
+}
+
+#[tokio::test]
+async fn element_reference_keeps_the_matched_property_type() {
+    let mut session = social().await;
+    let typed = session
+        .query(
+            "MATCH (p:Person WHERE p.name = 'Ada')
+             LET r = p
+             RETURN r.id AS id, r.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(typed.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(typed.schema.field(1).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&typed),
+        vec![vec!["1".to_string(), "1".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn chained_element_copies_keep_stored_property_types() {
+    let mut session = social().await;
+    let result = session
+        .query("MATCH (p:Person) LET r = p, s = r RETURN r.id AS rid, s.id AS sid, s.score AS score ORDER BY rid")
+        .await
+        .unwrap();
+    for field in result.schema.fields() {
+        assert_eq!(field.data_type(), &DataType::Int64);
+    }
+    assert_eq!(
+        strings(&result),
+        vec![
+            vec!["1".to_string(), "1".to_string(), "1".to_string()],
+            vec!["2".to_string(), "2".to_string(), "2".to_string()]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn successive_label_edits_keep_elements_and_copies_live() {
+    let mut session = social().await;
+    let result = statement(
+        &mut session,
+        "MATCH (p:Person WHERE p.name = 'Ada') LET r = p, s = r SET p:Extra SET p:Other RETURN p.id AS pid, r.id AS rid, s.id AS sid, s IS LABELED Other AS labeled",
+    ).await;
+    assert_eq!(
+        strings(&result),
+        vec![vec![
+            "1".to_string(),
+            "1".to_string(),
+            "1".to_string(),
+            "true".to_string()
+        ]]
+    );
+    for field in result.schema.fields().iter().take(3) {
+        assert_eq!(field.data_type(), &DataType::Int64);
+    }
+}
+
+#[tokio::test]
+async fn refresh_reads_properties_added_after_a_label_move() {
+    let mut session = social().await;
+    let result = statement(&mut session,
+        "MATCH (p:Person WHERE p.name = 'Ada') LET r = p SET p:Retired SET p.flag = true RETURN p.flag AS flag, r.flag AS copied"
+    ).await;
+    assert_eq!(
+        strings(&result),
+        vec![vec!["true".to_string(), "true".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn refresh_adopts_recreated_property_types() {
+    let mut session = social().await;
+    let result = statement(&mut session,
+        "MATCH (p:Person) LET r = p REMOVE p.score SET p.score = 'new' RETURN p.score AS score, r.score AS copied ORDER BY p.id"
+    ).await;
+    assert_eq!(
+        strings(&result),
+        vec![vec!["new".to_string(), "new".to_string()]; 2]
+    );
+    for field in result.schema.fields() {
+        assert_eq!(field.data_type(), &DataType::Utf8);
+    }
 }
