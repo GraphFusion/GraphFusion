@@ -533,22 +533,27 @@ fn scan_tables(
         Some(table) => vec![table],
         None => matched,
     };
-    // A label that matches nothing still names the element kind's properties.
-    // A bare null literal has no column and makes an empty aggregate emit a group.
-    let schema_source = if scanned.is_empty() && inserted.is_none() && refresh_of.is_none() {
-        all_tables
+    // A label that matches nothing still names the element kind's properties, so
+    // an empty aggregate does not invent a group from a constant null. The
+    // columns stay untyped: copying another label's type makes `n.id = 1` fail
+    // when some unrelated fragment stores that name as a string.
+    let properties = if scanned.is_empty() && inserted.is_none() && refresh_of.is_none() {
+        let mut properties = BTreeMap::new();
+        for (table, _) in &all_tables {
+            for field in table.schema.fields() {
+                if !field.name().starts_with("__gf_") {
+                    properties
+                        .entry(field.name().clone())
+                        .or_insert(DataType::Null);
+                }
+            }
+        }
+        properties
     } else {
-        scanned.clone()
+        graph::property_types(scanned.iter().map(|(table, _)| *table))?
     };
-    let properties = graph::property_types(schema_source.iter().map(|(table, _)| *table))?;
     if let Some(atom) = &native.filter {
-        // An empty label scan still exposes the element kind's property types.
-        let typed = if scanned.is_empty() {
-            &schema_source
-        } else {
-            &scanned
-        };
-        super::native::validate(atom, typed.iter().map(|(table, _)| *table))?;
+        super::native::validate(atom, scanned.iter().map(|(table, _)| *table))?;
     }
     let source_labels: Vec<_> = scanned
         .iter()
