@@ -52,6 +52,30 @@ fn decimal_exponents_parse() {
 }
 
 #[test]
+fn non_finite_decimal_literals_are_bad_numbers() {
+    for input in [
+        "RETURN 1e999 AS x",
+        "RETURN 1e309 AS x",
+        "RETURN -1e999 AS x",
+        "RETURN 1e999F AS x",
+    ] {
+        let err = parse(input).unwrap_err();
+        assert!(
+            matches!(err, gql_parser::Error::BadNumber { .. }),
+            "{input}: {err}"
+        );
+    }
+    assert_eq!(
+        returned("RETURN 1e308 AS x"),
+        Expr::Literal(Literal::Decimal(1e308))
+    );
+    assert_eq!(
+        returned("RETURN 1e-999 AS x"),
+        Expr::Literal(Literal::Decimal(0.0))
+    );
+}
+
+#[test]
 fn quoted_parameter_keeps_a_leading_dollar() {
     assert_eq!(
         returned(r#"RETURN $"$a" AS x"#),
