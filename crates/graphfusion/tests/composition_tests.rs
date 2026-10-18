@@ -274,6 +274,22 @@ async fn binding_table_inputs_join_graph_matches() {
     let none = session.query("TABLE $empty RETURN 1 AS n").await.unwrap();
     assert_eq!(none.row_count(), 0);
 
+    session
+        .set_parameter(
+            "blank",
+            Value::BindingTable(vec![BTreeMap::from([("id".to_string(), Value::Null)])]),
+        )
+        .unwrap();
+    let blank = session
+        .query(
+            "TABLE $blank
+             MATCH (p:Person WHERE p.id = id)
+             RETURN p.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank.row_count(), 0);
+
     let piped = session
         .query(
             "TABLE { RETURN 'Ada' AS name }
@@ -284,4 +300,83 @@ async fn binding_table_inputs_join_graph_matches() {
         .await
         .unwrap();
     assert_eq!(strings(&piped), vec![vec!["1".to_string()]]);
+}
+
+#[tokio::test]
+async fn mixed_label_filters_compare_stored_types() {
+    let mut session = social().await;
+    let equal = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&equal), vec![vec!["Ada".to_string()]]);
+
+    let mapped = session
+        .query("MATCH (n:Person|Document {id: 1}) RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&mapped), vec![vec!["Ada".to_string()]]);
+
+    let greater = session
+        .query("MATCH (n:Person|Document) WHERE n.id > 1 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&greater), vec![vec!["Bea".to_string()]]);
+
+    let above_digit = session
+        .query("MATCH (n:Person|Document) WHERE n.id > 9 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(above_digit.row_count(), 0);
+
+    let document = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 'doc' RETURN n.title AS title")
+        .await
+        .unwrap();
+    assert_eq!(strings(&document), vec![vec!["Spec".to_string()]]);
+
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR n.title = 'Spec'
+             RETURN n.id AS id, n.title AS title ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(either.schema.field(0).data_type(), &DataType::Utf8);
+    assert_eq!(
+        strings(&either),
+        vec![
+            vec!["1".to_string(), "NULL".to_string()],
+            vec!["doc".to_string(), "Spec".to_string()]
+        ]
+    );
+
+    let negated = session
+        .query("MATCH (n:Person|Document) WHERE NOT n.id = 1 RETURN n.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Bea".to_string()]]);
+
+    let widened = session
+        .query("MATCH (n:Person|Metric) WHERE n.score > 1 RETURN n.score AS score ORDER BY score")
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
+
+    let both = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id = 1 AND m.name = 'load'
+             RETURN n.name AS name, m.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&both),
+        vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
 }
