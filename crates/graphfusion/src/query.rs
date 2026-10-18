@@ -564,7 +564,11 @@ async fn plan_body(
                         .collect();
                     let expression = binder.bind(&item.value)?;
                     if let ast::Expr::Identifier(source) = &item.value {
-                        if let Some(element) = scope.elements.get(&source.value) {
+                        if let Some(element) = scope
+                            .elements
+                            .get(&source.value)
+                            .or_else(|| scope.reference_sources.get(&source.value))
+                        {
                             scope
                                 .reference_sources
                                 .insert(item.name.value.clone(), element.clone());

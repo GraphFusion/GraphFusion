@@ -526,3 +526,70 @@ async fn element_reference_keeps_the_matched_property_type() {
         vec![vec!["1".to_string(), "1".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn chained_element_copies_keep_stored_property_types() {
+    let mut session = social().await;
+    let result = session
+        .query("MATCH (p:Person) LET r = p, s = r RETURN r.id AS rid, s.id AS sid, s.score AS score ORDER BY rid")
+        .await
+        .unwrap();
+    for field in result.schema.fields() {
+        assert_eq!(field.data_type(), &DataType::Int64);
+    }
+    assert_eq!(
+        strings(&result),
+        vec![
+            vec!["1".to_string(), "1".to_string(), "1".to_string()],
+            vec!["2".to_string(), "2".to_string(), "2".to_string()]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn successive_label_edits_keep_elements_and_copies_live() {
+    let mut session = social().await;
+    let result = statement(
+        &mut session,
+        "MATCH (p:Person WHERE p.name = 'Ada') LET r = p, s = r SET p:Extra SET p:Other RETURN p.id AS pid, r.id AS rid, s.id AS sid, s IS LABELED Other AS labeled",
+    ).await;
+    assert_eq!(
+        strings(&result),
+        vec![vec![
+            "1".to_string(),
+            "1".to_string(),
+            "1".to_string(),
+            "true".to_string()
+        ]]
+    );
+    for field in result.schema.fields().iter().take(3) {
+        assert_eq!(field.data_type(), &DataType::Int64);
+    }
+}
+
+#[tokio::test]
+async fn refresh_reads_properties_added_after_a_label_move() {
+    let mut session = social().await;
+    let result = statement(&mut session,
+        "MATCH (p:Person WHERE p.name = 'Ada') LET r = p SET p:Retired SET p.flag = true RETURN p.flag AS flag, r.flag AS copied"
+    ).await;
+    assert_eq!(
+        strings(&result),
+        vec![vec!["true".to_string(), "true".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn refresh_adopts_recreated_property_types() {
+    let mut session = social().await;
+    let result = statement(&mut session,
+        "MATCH (p:Person) LET r = p REMOVE p.score SET p.score = 'new' RETURN p.score AS score, r.score AS copied ORDER BY p.id"
+    ).await;
+    assert_eq!(
+        strings(&result),
+        vec![vec!["new".to_string(), "new".to_string()]; 2]
+    );
+    for field in result.schema.fields() {
+        assert_eq!(field.data_type(), &DataType::Utf8);
+    }
+}
