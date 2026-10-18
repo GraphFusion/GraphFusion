@@ -1,4 +1,4 @@
-use datafusion::common::ScalarValue;
+use datafusion::{arrow::datatypes::DataType, common::ScalarValue};
 use graphfusion::{Database, QueryResult, Session};
 async fn graph() -> Session {
     let db = Database::new();
@@ -189,6 +189,102 @@ async fn alternatives_expose_nulls_and_reject_incompatible_bindings() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn alternation_unifies_divergent_property_schemas() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {name:'a', v:1}), (:B {name:'b', v:1.5})").await.unwrap();
+    let widened = query(
+        &mut s,
+        "MATCH (n:A) | (n:B) RETURN n.name AS name, n.v AS v, n IS LABELED A AS a, n IS LABELED B AS b ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        widened.schema.field_with_name("v").unwrap().data_type(),
+        &DataType::Float64
+    );
+    assert_eq!(
+        rows(&widened),
+        vec![
+            vec!["a", "1", "true", "false"],
+            vec!["b", "1.5", "false", "true"]
+        ]
+    );
+    let reversed = query(
+        &mut s,
+        "MATCH (n:B) | (n:A) WHERE n.v > 1.2 RETURN n.name AS name",
+    )
+    .await;
+    assert_eq!(
+        reversed.schema.field_with_name("name").unwrap().data_type(),
+        &DataType::Utf8
+    );
+    assert_eq!(rows(&reversed), vec![vec!["b"]]);
+
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {name:'a', v:1}), (:B {name:'b'})")
+        .await
+        .unwrap();
+    // The extra property exists on only one branch. Projecting the shared name
+    // used to fail while resolving the other branch's missing column.
+    assert_eq!(
+        rows(
+            &query(
+                &mut s,
+                "MATCH (n:A) | (n:B) RETURN n.name AS name, n.v AS v ORDER BY name"
+            )
+            .await
+        ),
+        vec![vec!["a", "1"], vec!["b", "NULL"]]
+    );
+
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {v:1}), (:B {v:true})")
+        .await
+        .unwrap();
+    let alternation = query(&mut s, "MATCH (n:A) | (n:B) RETURN n.v AS v ORDER BY v").await;
+    let disjunction = query(&mut s, "MATCH (n:A|B) RETURN n.v AS v ORDER BY v").await;
+    assert_eq!(
+        alternation.schema.field_with_name("v").unwrap().data_type(),
+        disjunction.schema.field_with_name("v").unwrap().data_type()
+    );
+    assert_eq!(rows(&alternation), rows(&disjunction));
+
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {name:'a'}), (:B {name:'b'})")
+        .await
+        .unwrap();
+    s.run("MATCH (n:A) | (n:B) SET n.flag = true RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(
+            &query(
+                &mut s,
+                "MATCH (n:A|B) RETURN n.name AS name, n.flag AS flag ORDER BY name"
+            )
+            .await
+        ),
+        vec![vec!["a", "true"], vec!["b", "true"]]
+    );
+
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:N)-[:E {v:1}]->(:N), (:N)-[:F {v:1.5, w:true}]->(:N)").await.unwrap();
+    let edges = query(
+        &mut s,
+        "MATCH ()-[e:E]->() | ()-[e:F]->() RETURN e.v AS v, e.w AS w ORDER BY v",
+    )
+    .await;
+    assert_eq!(
+        edges.schema.field_with_name("v").unwrap().data_type(),
+        &DataType::Float64
+    );
+    assert_eq!(
+        edges.schema.field_with_name("w").unwrap().data_type(),
+        &DataType::Boolean
+    );
+    assert_eq!(rows(&edges), vec![vec!["1", "NULL"], vec!["1.5", "true"]]);
+}
 #[tokio::test]
 async fn alternation_and_nested_quantifiers_compose_inside_recursion() {
     let mut s = graph().await;
@@ -327,4 +423,20 @@ async fn unbounded_homogeneous_selection_uses_complete_finite_bounds() {
         .contains("unbounded"));
     let q = q.replace("->*(b", "->{0,8}(b");
     assert_eq!(rows(&query(&mut s, &q).await), vec![vec!["8"]]);
+}
+
+#[tokio::test]
+async fn shared_elements_accept_an_empty_alternative_in_either_order() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {v:1})")
+        .await
+        .unwrap();
+    for q in [
+        "MATCH (n:A) | (n:Missing) RETURN n.v AS v",
+        "MATCH (n:Missing) | (n:A) RETURN n.v AS v",
+    ] {
+        let result = query(&mut s, q).await;
+        assert_eq!(rows(&result), vec![vec!["1"]]);
+        assert_eq!(result.schema.field(0).data_type(), &DataType::Int64);
+    }
 }
