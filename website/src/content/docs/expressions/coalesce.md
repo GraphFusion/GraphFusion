@@ -14,4 +14,8 @@ RETURN COALESCE(NULL, 'fallback') AS value,
        NULLIF('deleted', 'deleted') AS missing;
 ```
 
-Both functions execute through DataFusion. Null-only inputs retain a null type until context supplies a concrete family. Unlike these case abbreviations, general [CASE expressions](/expressions/case/) are currently syntax only.
+Both functions execute through DataFusion. Null-only inputs retain a null type until context supplies a concrete family. A null argument beside a byte string uses that byte-string type, just as a null beside a number or character string uses that family. Unlike these case abbreviations, general [CASE expressions](/expressions/case/) are currently syntax only.
+
+```gql test
+RETURN COALESCE(NULL, X'0A') AS value, COALESCE(X'0B', NULL) AS first;
+```

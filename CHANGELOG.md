@@ -83,6 +83,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- `COALESCE` a null with a byte string. The null takes the byte-string type
+  instead of failing while the call is planned.
 - Construct a list of byte strings that includes null. The null stays a null
   element instead of failing while the list is built.
 - Treat a simplified `<~label>` direction override as any orientation, so the
