@@ -396,6 +396,41 @@ async fn deleting_edges_keeps_surviving_node_bindings_and_rejects_stale_aliases(
 }
 
 #[tokio::test]
+async fn partial_delete_keeps_live_rows_of_the_same_variable() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (:N {name: 'Ada'}), (:N {name: 'Bea'})").await;
+    assert!(s
+        .run(
+            "MATCH (n:N)
+             MATCH (d:N WHERE d.name = 'Ada')
+             DETACH DELETE d
+             RETURN n.name AS name",
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:N) RETURN n.name AS name ORDER BY name").await),
+        vec![vec!["Ada"], vec!["Bea"]]
+    );
+    let result = run(
+        &mut s,
+        "MATCH (n:N)
+         LET label = n.name
+         MATCH (d:N WHERE d.name = 'Ada')
+         DETACH DELETE d
+         FILTER label = 'Bea'
+         RETURN n.name AS name, n IS LABELED N AS labeled",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["Bea", "true"]]);
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:N) RETURN n.name AS name").await),
+        vec![vec!["Bea"]]
+    );
+}
+
+#[tokio::test]
 async fn repeated_inserts_do_not_rewrite_one_file_per_previous_row() {
     let dir = Durable::new();
     let db = dir.open();
@@ -555,5 +590,41 @@ async fn detach_indexes_handle_parallel_edges_loops_directions_and_separate_id_s
                 2
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn deleted_elements_fail_in_null_writes_and_direction_tests() {
+    for query in [
+        "MATCH (n:N), (m:M) DETACH DELETE n SET m.flag = n.missing",
+        "MATCH (n:N) DETACH DELETE n INSERT (:Made {flag: n.missing})",
+        "MATCH ()-[e:E]->() DELETE e RETURN e IS DIRECTED AS directed",
+    ] {
+        let db = Database::new();
+        let mut s = session(&db);
+        s.run("INSERT (n:N {name:'n'}), (m:M {name:'m', flag:true}), (n)-[:E]->(m)")
+            .await
+            .unwrap();
+        let error = s
+            .run(query)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("deleted access committed: {query}"));
+        assert!(
+            error.to_string().contains("deleted or unavailable"),
+            "{query}: {error}"
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH (n) RETURN COUNT(*) AS c").await),
+            vec![vec!["2"]]
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH ()-[e:E]->() RETURN COUNT(*) AS c").await),
+            vec![vec!["1"]]
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH (m:M) RETURN m.flag AS flag").await),
+            vec![vec!["true"]]
+        );
     }
 }
