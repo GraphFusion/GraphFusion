@@ -605,7 +605,7 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             Box::new(predicate_or_literal(left, variable)?),
             Box::new(predicate_or_literal(right, variable)?),
         )),
-        ast::Expr::IsNull { expr, negated } => {
+        ast::Expr::IsNull { expr, negated } if mentions(expr, variable) => {
             let ast::Expr::NullIf { left, right } = expr.as_ref() else {
                 return None;
             };

@@ -1155,3 +1155,26 @@ async fn stored_wrappers_handle_absent_properties_and_nested_boolean_nulls() {
         .unwrap();
     assert_eq!(strings(&r), vec![vec!["text".to_string()]]);
 }
+
+#[tokio::test]
+async fn closed_null_predicates_keep_stored_comparisons() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {name:'number',v:10}),(:D {name:'text',v:'10'})").await.unwrap();
+    for predicate in [
+        "n.v = '10' OR 1 IS NULL",
+        "n.v = '10' OR NULL IS NOT NULL",
+        "n.v = '10' AND 1 IS NOT NULL",
+    ] {
+        for q in [
+            format!("MATCH (n) WHERE {predicate} RETURN n.name AS name"),
+            format!("MATCH (n) FILTER {predicate} RETURN n.name AS name"),
+            format!("MATCH (n) LET keep = {predicate} FILTER keep RETURN n.name AS name"),
+        ] {
+            assert_eq!(
+                strings(&s.query(&q).await.unwrap()),
+                vec![vec!["text".to_string()]],
+                "{q}"
+            );
+        }
+    }
+}
