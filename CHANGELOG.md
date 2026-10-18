@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Print null cells and null list elements as `NULL`. An empty list stays `[]`,
+  and an empty string stays blank, so those values are no longer identical in
+  CLI output.
 - Reuse an edge endpoint for an anonymous unconstrained node. A pattern such as
   `()-[]->()` no longer joins every node just to copy an id the edge already
   carries. Labels, property maps, and named variables still read that node.
