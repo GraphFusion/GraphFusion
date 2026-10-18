@@ -435,16 +435,27 @@ pub(super) fn result(
 }
 
 fn rebase(expr: Expr, mapping: &[(Expr, Column)]) -> Result<Expr> {
-    let transformed = expr.transform_down(|expr| {
-        if let Some((_, column)) = mapping.iter().find(|(source, _)| source == &expr) {
-            return Ok(Transformed::yes(Expr::Column(column.clone())));
-        }
-        if matches!(expr, Expr::Column(_)) {
-            return Err(datafusion::error::DataFusionError::Plan(format!(
-                "expression is not grouped: {expr}"
-            )));
-        }
-        Ok(Transformed::no(expr))
-    })?;
+    // An ungrouped column is an invalid query. Reporting it as a DataFusion
+    // planning error would surface internal `__gf_*` names as an execution failure.
+    let transformed = expr
+        .transform_down(|expr| {
+            if let Some((_, column)) = mapping.iter().find(|(source, _)| source == &expr) {
+                return Ok(Transformed::yes(Expr::Column(column.clone())));
+            }
+            if matches!(expr, Expr::Column(_)) {
+                return Err(datafusion::error::DataFusionError::Plan(
+                    "expression is not grouped or aggregated".into(),
+                ));
+            }
+            Ok(Transformed::no(expr))
+        })
+        .map_err(|error| match error {
+            datafusion::error::DataFusionError::Plan(message)
+                if message == "expression is not grouped or aggregated" =>
+            {
+                Error::InvalidQuery(message)
+            }
+            other => other.into(),
+        })?;
     Ok(transformed.data)
 }
