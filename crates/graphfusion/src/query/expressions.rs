@@ -153,7 +153,7 @@ impl<'a> Binder<'a> {
                             } else {
                                 "e"
                             },
-                            element.column(crate::graph::ID),
+                            element.ensure_live(element.column(crate::graph::ID), DataType::UInt64),
                         ));
                     }
                     return Err(Error::InvalidQuery(format!(
@@ -245,7 +245,7 @@ impl<'a> Binder<'a> {
                     if element.kind != super::graph::ElementKind::Edge {
                         return Err(Error::InvalidQuery("IS DIRECTED requires an edge".into()));
                     }
-                    element.column("__gf_directed")
+                    element.ensure_live(element.column("__gf_directed"), DataType::Boolean)
                 } else if let Some(reference) = self
                     .bindings
                     .and_then(|b| b.references.get(&variable.value))
@@ -384,6 +384,16 @@ impl<'a> Binder<'a> {
                         DataType::Int64
                     };
                     super::arithmetic::checked(left, operator, right, data_type)
+                } else if matches!(op, B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge) {
+                    let left_type = left.get_type(self.schema)?;
+                    let right_type = right.get_type(self.schema)?;
+                    if super::lists::is_list(&left_type) && super::lists::is_list(&right_type) {
+                        // DataFusion treats null list elements as equal and a null
+                        // element beside a value as unequal. GQL comparisons stay unknown.
+                        super::lists::compare(left, right, &left_type, &right_type, operator)?
+                    } else {
+                        Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
+                    }
                 } else {
                     Expr::BinaryExpr(BinaryExpr::new(Box::new(left), operator, Box::new(right)))
                 }
@@ -448,13 +458,29 @@ impl<'a> Binder<'a> {
                 let left = self.bind(left)?;
                 let right = self.bind(right)?;
                 self.compatible(&[left.clone(), right.clone()])?;
-                if left.get_type(self.schema)? == DataType::Null
-                    && right.get_type(self.schema)? == DataType::Null
-                {
+                let (left, right) = self.align_list_pair(left, right)?;
+                let left_type = left.get_type(self.schema)?;
+                let right_type = right.get_type(self.schema)?;
+                if left_type == DataType::Null && right_type == DataType::Null {
                     // Both values are null; avoid DataFusion's fallback to a string type.
                     left
+                } else if super::lists::is_list(&left_type) && super::lists::is_list(&right_type) {
+                    // NULLIF is CASE WHEN equal THEN NULL ELSE left. Unknown equality
+                    // keeps the left list; only a true comparison removes it.
+                    let equal = super::lists::compare(
+                        left.clone(),
+                        right,
+                        &left_type,
+                        &right_type,
+                        Operator::Eq,
+                    )?;
+                    let null = datafusion::logical_expr::lit(ScalarValue::try_from(&left_type)?);
+                    Expr::Case(datafusion::logical_expr::expr::Case::new(
+                        None,
+                        vec![(Box::new(equal), Box::new(null))],
+                        Some(Box::new(left)),
+                    ))
                 } else {
-                    let (left, right) = self.align_list_pair(left, right)?;
                     datafusion::functions::core::expr_fn::nullif(left, right)
                 }
             }

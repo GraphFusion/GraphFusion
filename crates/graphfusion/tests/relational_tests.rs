@@ -280,6 +280,36 @@ async fn empty_groups_and_collect_have_consistent_null_behavior() {
 }
 
 #[tokio::test]
+async fn ungrouped_references_are_invalid_queries() {
+    let mut s = fixture().await;
+    for sql in [
+        "FOR n IN [1, 2, 3] RETURN COLLECT_LIST(n) AS xs ORDER BY n DESC",
+        "MATCH (n:N) RETURN COUNT(*) AS c ORDER BY n.k",
+        "SELECT COUNT(*) AS c FROM g MATCH (n:N) HAVING n.v > 0",
+        "FOR x IN [1, 2] RETURN x, COUNT(*) AS c GROUP BY ()",
+    ] {
+        let error = s.query(sql).await.unwrap_err().to_string();
+        assert!(
+            error.contains("invalid query: expression is not grouped or aggregated"),
+            "{sql}: {error}"
+        );
+        assert!(!error.contains("__gf_"), "{sql}: {error}");
+    }
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 2] RETURN n AS n, COUNT(*) AS c ORDER BY n",
+        &[&["1", "1"], &["2", "2"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3] RETURN COLLECT_LIST(n) AS xs ORDER BY COUNT(*)",
+        &[&["[1, 2, 3]"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn aggregate_errors_are_checked_and_never_publish_writes() {
     let mut s = fixture().await;
     for sql in [
@@ -628,9 +658,74 @@ async fn list_comparisons_widen_numbers_and_accept_empty_lists() {
         &[&["[1.0]"], &["[1.0]"]],
     )
     .await;
+    let kept = query(&mut s, "RETURN NULLIF([1, NULL], [1.0, NULL]) AS kept").await;
+    let DataType::List(item) = kept.schema.field(0).data_type() else {
+        panic!("expected a list");
+    };
+    assert_eq!(item.data_type(), &DataType::Float64);
+    assert_eq!(rows(&kept), vec![vec!["[1.0, NULL]"]]);
+
     for query in ["RETURN [1] = ['a'] AS bad", "RETURN [TRUE] < [1] AS bad"] {
         assert!(s.query(query).await.is_err(), "{query}");
     }
+}
+
+#[tokio::test]
+async fn list_comparisons_keep_null_elements_unknown() {
+    let mut s = fixture().await;
+    check(
+        &mut s,
+        "RETURN ([1, NULL] = [1, NULL]) IS NULL AS same,
+                ([1, NULL] = [1, 2]) IS NULL AS maybe,
+                ([1, NULL] <> [1, 2]) IS NULL AS maybe_not,
+                [1, 3, NULL] = [1, 2, NULL] AS earlier,
+                [1] = [1, NULL] AS length,
+                [1] < [1, NULL] AS prefix,
+                ([1, NULL] < [1, 2]) IS NULL AS order_unknown,
+                [1, 2] < [1, 3] AS order,
+                [1, 2] = [1, 2] AS equal,
+                [1, 2] <= [1, 2] AS le,
+                [1, 3] <= [1, 2] AS not_le,
+                ([1, NULL] <= [1, 2]) IS NULL AS le_unknown,
+                [] = [] AS empty,
+                [] < [NULL] AS empty_prefix,
+                ([NULL] = [NULL]) IS NULL AS nulls,
+                ([[1, NULL]] = [[1, NULL]]) IS NULL AS nested,
+                ([true, NULL] = [true, false]) IS NULL AS flags,
+                (['a', NULL] = ['a', NULL]) IS NULL AS names,
+                [2, NULL] > [1, 9] AS decided,
+                true OR [1, NULL] = [1, NULL] AS either,
+                NULLIF([1, 2], [1, 2]) IS NULL AS removed,
+                NULLIF([1, NULL], [1, NULL]) IS NULL AS kept,
+                [X'01', X'02'] < [X'01', X'03'] AS bytes,
+                [X'01'] = [X'01'] AS same_bytes",
+        &[&[
+            "true", "true", "true", "false", "false", "true", "true", "true", "true", "true",
+            "false", "true", "true", "true", "true", "true", "true", "true", "true", "true",
+            "true", "false", "true", "true",
+        ]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [[1, NULL], [1, 2], [1, 3]] FILTER x = [1, 2] OR x = [1, NULL] RETURN x",
+        &[&["[1, 2]"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN NULLIF([1, NULL], [1, NULL]) WITH ORDINALITY i RETURN i, x ORDER BY i",
+        &[&["1", "1"], &["2", "NULL"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (a:N {v: 1}), (b:N {v: 2})
+         RETURN [a] = [a] AS same, [a] = [b] AS different,
+                ([a, NULL] = [a, NULL]) IS NULL AS unknown",
+        &[&["true", "false", "true"]],
+    )
+    .await;
 }
 
 #[tokio::test]

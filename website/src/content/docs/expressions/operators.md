@@ -18,4 +18,12 @@ Comparisons require compatible families, with supported numeric widening. Null o
 
 List comparisons use that same numeric widening. An empty list is comparable with a typed list: `[1] = [1.0]` is true, `[1] = []` is false, and `[] < [1]` is true. A list of strings is not comparable with a list of numbers.
 
+List comparisons walk elements from the start. After an equal prefix, the shorter list is less than the longer one. A null element makes the result unknown when that element has to be compared. An earlier decisive element, or a length difference after an equal prefix, still yields true or false. `[1, NULL] = [1, NULL]` and `[1, NULL] = [1, 2]` are unknown; `[1, 3] = [1, 2]` is false, and `[1] < [1, NULL]` is true.
+
+```gql test
+RETURN [1, NULL] = [1, NULL] IS UNKNOWN AS unknown_element,
+       [1, 3] = [1, 2] AS different,
+       [1] < [1, 2] AS prefix;
+```
+
 The numeric function `MOD(a, b)` has parser support only; there is no executable remainder operator. Other named numeric functions have their own syntax-only pages.
