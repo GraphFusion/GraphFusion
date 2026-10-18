@@ -434,19 +434,33 @@ impl Compiler<'_> {
             Some((ast::PathPatternFactor::Node(node), rest)) => (node, rest),
             _ => (&empty, factors),
         };
-        let (mut plan, mut state) = if reuses_known_endpoint(first) {
-            if let Some(endpoint) = endpoint {
-                (
-                    plan.filter(endpoint.clone().is_not_null())?,
-                    State::new(endpoint),
-                )
-            } else {
-                self.bind_node(plan, scope, first, None)?
+        // The first edge already carries both anonymous endpoint identities.
+        let opened = if endpoint.is_none() && reuses_known_endpoint(first) {
+            match remaining.split_first() {
+                Some((ast::PathPatternFactor::Relationship(edge), rest))
+                    if edge.quantifier.is_none() && !edge.temporary =>
+                {
+                    Some((edge, rest))
+                }
+                _ => None,
             }
         } else {
-            self.bind_node(plan, scope, first, endpoint)?
+            None
         };
-        for factor in remaining {
+        let (mut plan, mut state, rest) = if let Some((edge, rest)) = opened {
+            let (plan, state) = self.open_edge(plan, scope, edge)?;
+            (plan.filter(state.valid(mode, self.different))?, state, rest)
+        } else {
+            let (plan, state) = match endpoint {
+                Some(endpoint) if reuses_known_endpoint(first) => (
+                    plan.filter(endpoint.clone().is_not_null())?,
+                    State::new(endpoint),
+                ),
+                endpoint => self.bind_node(plan, scope, first, endpoint)?,
+            };
+            (plan, state, remaining)
+        };
+        for factor in rest {
             match factor {
                 ast::PathPatternFactor::Node(node) => {
                     if reuses_known_endpoint(node) {
@@ -569,6 +583,62 @@ impl Compiler<'_> {
             }
             plan = plan.filter(state.valid(mode, self.different))?;
         }
+        Ok((plan, state))
+    }
+    fn open_edge(
+        &mut self,
+        mut plan: Plan,
+        scope: &mut Bindings,
+        edge: &ast::RelationshipPattern,
+    ) -> Result<(Plan, State)> {
+        let native = self.native_for(
+            &plan,
+            scope,
+            edge.variable.as_ref(),
+            edge.properties.as_ref(),
+            edge.where_clause.as_ref(),
+        )?;
+        let (scan, binding) = graph::scan_filtered(
+            scope,
+            self.graph_id,
+            self.data,
+            ElementKind::Edge,
+            Some(edge.direction),
+            graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
+            &native,
+        )?;
+        let mut predicates = Vec::new();
+        if let Some(name) = &edge.variable {
+            if scope.conditional.contains(&name.value) {
+                return Err(Error::InvalidQuery(
+                    "implicit reuse of a conditional path variable".into(),
+                ));
+            }
+            if let Some(previous) = scope.elements.get(&name.value) {
+                graph::check_binding(previous, self.graph_id, ElementKind::Edge)?;
+                predicates.push(previous.column(ID).eq(binding.column(ID)));
+            } else if let Some(reference) =
+                super::references::scalar(scope, &name.value, plan.schema())?
+            {
+                predicates.push(super::references::constraint(reference, &binding));
+                scope.elements.insert(name.value.clone(), binding.clone());
+            } else {
+                graph::declare(scope, &name.value, &binding)?;
+            }
+        }
+        plan = plan.cross_join(scan)?;
+        for predicate in predicates {
+            plan = plan.filter(predicate)?;
+        }
+        self.predicates.push(Predicate {
+            binding: binding.clone(),
+            labels: edge.labels.clone(),
+            expression: edge.label_expression.clone(),
+            properties: edge.properties.clone(),
+            predicate: edge.where_clause.clone(),
+            native,
+        });
+        let state = State::new(binding.column(FROM)).append(binding.column(ID), binding.column(TO));
         Ok((plan, state))
     }
     fn bind_node(

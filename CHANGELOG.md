@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Start an anonymous path at its first edge. `()-[]->()` no longer cross-joins
+  every node to recover a source id the edge already stores. A named, labeled,
+  or constrained start node still reads the node tables.
 - Print null cells and null list elements as `NULL`. An empty list stays `[]`,
   and an empty string stays blank, so those values are no longer identical in
   CLI output.
