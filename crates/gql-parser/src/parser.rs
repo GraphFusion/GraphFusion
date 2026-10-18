@@ -35,6 +35,9 @@ pub struct Parser {
     lexer_error: Option<Error>,
     stop_in_as_delimiter: bool,
     depth: u32,
+    /// The statement currently being parsed is a `NEXT` continuation, so its
+    /// top-level query already has the previous result as a working table.
+    linear_input: bool,
 }
 
 // Test threads use a 2MB stack. Each nested construct keeps the descent
@@ -117,6 +120,7 @@ impl Parser {
             lexer_error,
             stop_in_as_delimiter: false,
             depth: 0,
+            linear_input: false,
         }
     }
 
@@ -346,9 +350,12 @@ impl Parser {
         } else {
             None
         };
+        self.linear_input = true;
+        let statement = self.parse_statement();
+        self.linear_input = false;
         Ok(NextStatement {
             yield_clause,
-            statement: Box::new(self.parse_statement()?),
+            statement: Box::new(statement?),
         })
     }
 
@@ -476,13 +483,16 @@ impl Parser {
     }
 
     fn parse_query_statement(&mut self) -> Result<QueryStatement> {
+        // Nested queries parsed from this statement do not receive the linear
+        // working table. Capture the flag before descending into them.
+        let incoming = std::mem::replace(&mut self.linear_input, false);
         let at_schema = self.parse_optional_at_schema_clause()?;
         let use_graph = if self.at(TokenKind::Use) {
             Some(self.parse_use_graph_clause()?)
         } else {
             None
         };
-        let body = self.parse_query_body()?;
+        let body = self.parse_query_body(incoming)?;
         let mut set_operations = Vec::new();
         let mut query_conjunction = None;
         while matches!(
@@ -501,7 +511,7 @@ impl Parser {
             } else {
                 query_conjunction = Some(operator);
             }
-            let body = self.parse_query_body()?;
+            let body = self.parse_query_body(incoming)?;
             set_operations.push(QuerySetOperation {
                 operator,
                 quantifier,
@@ -627,7 +637,7 @@ impl Parser {
         self.parse_binding_table_expression()
     }
 
-    fn parse_query_body(&mut self) -> Result<QueryBody> {
+    fn parse_query_body(&mut self, incoming: bool) -> Result<QueryBody> {
         let mut clauses = Vec::new();
         while matches!(
             self.peek_kind(),
@@ -797,6 +807,7 @@ impl Parser {
         }
         if result_clause.kind == ResultKind::Return
             && result_clause_has_wildcard(&result_clause)
+            && !incoming
             && !query_clauses_have_non_unit_working_table(&clauses)
         {
             return Err(Error::Message {

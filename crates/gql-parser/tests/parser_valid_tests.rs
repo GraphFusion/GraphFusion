@@ -652,4 +652,9 @@ valid_cases! {
         input: "MATCH (n) FINISH",
         statement_count: 1,
     }
+
+    next_return_star_uses_the_incoming_working_table {
+        input: "FOR n IN [1, 2] RETURN n NEXT FILTER n > 1 RETURN *",
+        statement_count: 2,
+    }
 }

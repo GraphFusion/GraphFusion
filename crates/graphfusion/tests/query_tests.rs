@@ -253,6 +253,66 @@ async fn let_scope_delimited_identifiers_filter_and_result_aliases() {
         vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2))]
     );
     assert!(session.query("RETURN *").await.is_err());
+    assert!(session.query("FILTER true RETURN *").await.is_err());
+}
+
+#[tokio::test]
+async fn next_return_star_projects_the_incoming_working_table() {
+    let mut session = Database::new().session();
+    let filtered = session
+        .query("FOR n IN [1, 2] RETURN n NEXT FILTER n > 1 RETURN *")
+        .await
+        .unwrap();
+    assert_eq!(filtered.schema.field(0).name(), "n");
+    assert_eq!(
+        filtered
+            .batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows())
+                .map(move |i| { ScalarValue::try_from_array(batch.column(0), i).unwrap() }))
+            .collect::<Vec<_>>(),
+        vec![ScalarValue::Int64(Some(2))]
+    );
+    let passed = session
+        .query("FOR n IN [1, 2] RETURN n AS a, n + 10 AS b NEXT RETURN *")
+        .await
+        .unwrap();
+    assert_eq!(
+        passed
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    let rows = passed
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(move |i| {
+                (0..batch.num_columns())
+                    .map(|column| ScalarValue::try_from_array(batch.column(column), i).unwrap())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(11))],
+            vec![ScalarValue::Int64(Some(2)), ScalarValue::Int64(Some(12))],
+        ]
+    );
+    let yielded = session
+        .query("FOR n IN [1, 2] RETURN n AS a, n + 10 AS b NEXT YIELD b AS kept RETURN *")
+        .await
+        .unwrap();
+    assert_eq!(yielded.schema.field(0).name(), "kept");
+    assert!(session
+        .query("FOR n IN [1] RETURN n NEXT RETURN { RETURN * } AS q")
+        .await
+        .is_err());
 }
 
 #[tokio::test]

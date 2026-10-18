@@ -1115,6 +1115,11 @@ invalid_cases! {
         error_contains: "non-unit incoming working table",
     }
 
+    next_nested_return_star_is_not_the_incoming_table {
+        input: "FOR n IN [1] RETURN n NEXT { RETURN * }",
+        error_contains: "non-unit incoming working table",
+    }
+
     return_star_rejects_use_graph_only_input {
         input: "USE GRAPH social RETURN *",
         error_contains: "non-unit incoming working table",

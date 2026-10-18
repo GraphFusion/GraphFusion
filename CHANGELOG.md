@@ -12,6 +12,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Allow `RETURN *` in a `NEXT` continuation to project the incoming working
+  table. A nested query in that continuation still needs its own bindings.
 
 ## 0.2.0 — 2026-10-05
 
