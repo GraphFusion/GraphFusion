@@ -424,3 +424,19 @@ async fn unbounded_homogeneous_selection_uses_complete_finite_bounds() {
     let q = q.replace("->*(b", "->{0,8}(b");
     assert_eq!(rows(&query(&mut s, &q).await), vec![vec!["8"]]);
 }
+
+#[tokio::test]
+async fn shared_elements_accept_an_empty_alternative_in_either_order() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {v:1})")
+        .await
+        .unwrap();
+    for q in [
+        "MATCH (n:A) | (n:Missing) RETURN n.v AS v",
+        "MATCH (n:Missing) | (n:A) RETURN n.v AS v",
+    ] {
+        let result = query(&mut s, q).await;
+        assert_eq!(rows(&result), vec![vec!["1"]]);
+        assert_eq!(result.schema.field(0).data_type(), &DataType::Int64);
+    }
+}

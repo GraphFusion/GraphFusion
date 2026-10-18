@@ -433,6 +433,7 @@ async fn insert_element(
     for (name, mut value) in values {
         let ty = value.get_type(plan.schema())?;
         if ty == DataType::Null {
+            evaluate_null_value(&plan, &value, ctx, trace).await?;
             continue;
         }
         // An integer literal is not a different property type from an existing float.
@@ -602,6 +603,28 @@ struct Edit {
     add_label: Option<String>,
     remove_label: Option<String>,
 }
+/// A null result may still validate a graph dereference. Execute that check
+/// before omitting the property from a write, while literal NULL stays free.
+async fn evaluate_null_value(
+    plan: &LogicalPlanBuilder,
+    value: &Expr,
+    ctx: &SessionContext,
+    trace: &mut Trace,
+) -> Result<()> {
+    if !value.column_refs().is_empty() {
+        trace
+            .collect(
+                ctx,
+                &plan
+                    .clone()
+                    .project([value.clone().alias("__gf_null_check")])?
+                    .build()?,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn patch(
     plan: &LogicalPlanBuilder,
     binding: &ElementBinding,
@@ -611,9 +634,11 @@ async fn patch(
     trace: &mut Trace,
 ) -> Result<Option<(LogicalPlan, BTreeSet<u64>)>> {
     use datafusion::logical_expr::ExprSchemable;
+    let target = plan.clone().filter(binding.column(ID).is_not_null())?;
     let mut expressions = vec![binding.column(ID).alias(ID)];
     for (i, (name, value)) in values.into_iter().enumerate() {
         if value.get_type(plan.schema())? == DataType::Null {
+            evaluate_null_value(&target, &value, ctx, trace).await?;
             edit.values.insert(name, None);
         } else {
             let column = format!("__gf_value_{i}");
@@ -621,12 +646,7 @@ async fn patch(
             edit.values.insert(name, Some(column));
         }
     }
-    let patch = plan
-        .clone()
-        .filter(binding.column(ID).is_not_null())?
-        .project(expressions)?
-        .distinct()?
-        .build()?;
+    let patch = target.project(expressions)?.distinct()?.build()?;
     let (schema, batches) = trace.collect(ctx, &patch).await?;
     let mut ids = BTreeSet::new();
     for batch in &batches {
