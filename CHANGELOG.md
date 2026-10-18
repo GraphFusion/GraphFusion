@@ -83,6 +83,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Interpolate an integer PERCENTILE_CONT from the exact endpoints and round
+  once to Float64, so large integers keep low bits through the blend.
 - Evaluate `COALESCE` and `NULLIF` of a property on each fragment's stored
   type. A comparison wrapped in either function is unknown on a fragment that
   cannot compare, `NULLIF(property, value) IS NULL` does not stringify the

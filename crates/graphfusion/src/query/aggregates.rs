@@ -98,7 +98,13 @@ pub(super) fn call(
                     "percentile requires a numeric fraction".into(),
                 ));
             }
-            percentile(value, fraction, distinct, name == "PERCENTILE_CONT")?
+            percentile(
+                value,
+                fraction,
+                distinct,
+                name == "PERCENTILE_CONT",
+                data_type == DataType::Int64,
+            )?
         }
 
         _ => return Err(super::unsupported(&format!("aggregate function {name}"))),
@@ -121,7 +127,14 @@ pub(super) fn call(
 
 /// Percentiles use DataFusion's array aggregate/sort/extract kernels, including
 /// DISTINCT before interpolation and exact input values for the discrete case.
-fn percentile(value: Expr, fraction: Expr, distinct: bool, continuous: bool) -> Result<Expr> {
+/// Integer continuous percentiles interpolate those exact endpoints.
+fn percentile(
+    value: Expr,
+    fraction: Expr,
+    distinct: bool,
+    continuous: bool,
+    integer: bool,
+) -> Result<Expr> {
     use datafusion::{
         functions::math::expr_fn::{ceil, floor},
         functions_nested::expr_fn::{array_element, array_length, array_sort},
@@ -139,15 +152,15 @@ fn percentile(value: Expr, fraction: Expr, distinct: bool, continuous: bool) -> 
         let low = floor(position.clone());
         let high = ceil(position.clone());
         let weight = position - low.clone();
-        let a = cast(
-            array_element(values.clone(), cast(low + lit(1.0_f64), DataType::Int64)),
-            DataType::Float64,
-        );
-        let b = cast(
-            array_element(values, cast(high + lit(1.0_f64), DataType::Int64)),
-            DataType::Float64,
-        );
-        (lit(1.0_f64) - weight.clone()) * a + weight * b
+        let a = array_element(values.clone(), cast(low + lit(1.0_f64), DataType::Int64));
+        let b = array_element(values, cast(high + lit(1.0_f64), DataType::Int64));
+        if integer {
+            super::arithmetic::exact_lerp(a, b, weight)
+        } else {
+            let a = cast(a, DataType::Float64);
+            let b = cast(b, DataType::Float64);
+            (lit(1.0_f64) - weight.clone()) * a + weight * b
+        }
     } else {
         let rank = datafusion::functions::core::expr_fn::greatest(vec![
             ceil(fraction.clone() * count),
