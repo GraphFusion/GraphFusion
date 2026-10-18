@@ -331,6 +331,20 @@ async fn gql_type_checks_reject_implicit_string_and_boolean_numeric_coercion() {
     ] {
         assert!(session.query(query).await.is_err(), "{query}");
     }
+    for query in ["RETURN 1e999 AS n", "RETURN -1e309 AS n"] {
+        assert!(
+            matches!(session.query(query).await, Err(Error::Parse(_))),
+            "{query}"
+        );
+    }
+    assert!(matches!(
+        session.run("SESSION SET VALUE $x = 1e999").await,
+        Err(Error::Parse(_))
+    ));
+    assert_eq!(
+        row(&session.query("RETURN 1e308 AS n").await.unwrap()),
+        vec![ScalarValue::Float64(Some(1e308))]
+    );
     assert_eq!(
         row(&session.query("RETURN $max - 1 AS n").await.unwrap()),
         vec![ScalarValue::Int64(Some(i64::MAX - 1))]

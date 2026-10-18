@@ -5294,6 +5294,14 @@ impl Parser {
                     offset: token.offset,
                     token_text: token.text.clone(),
                 })?;
+                // f64 overflow is `Ok(inf)`, not a parse error. Infinity is not a
+                // query value: arithmetic already rejects non-finite results.
+                if !value.is_finite() {
+                    return Err(Error::BadNumber {
+                        offset: token.offset,
+                        token_text: token.text,
+                    });
+                }
                 Ok(Expr::Literal(Literal::Decimal(value)))
             }
             TokenKind::Null => Ok(Expr::Literal(Literal::Null)),

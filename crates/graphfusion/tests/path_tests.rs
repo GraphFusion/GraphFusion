@@ -59,6 +59,54 @@ async fn recursive_edges_and_zero_repetitions_execute_in_datafusion() {
 }
 
 #[tokio::test]
+async fn local_start_predicate_runs_before_variable_length_expansion() {
+    let mut s = graph().await;
+    let result = s.query("MATCH p = (a {name:'A'})-[:E]->{0,2}(b) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY hops, name").await.unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec!["A", "0"],
+            vec!["B", "1"],
+            vec!["C", "1"],
+            vec!["D", "2"],
+            vec!["D", "2"]
+        ]
+    );
+    let plan = &result.logical_plan;
+    let recursive = plan.find("RecursiveQuery").expect(plan);
+    let filter = plan.find(".name = Utf8(\"A\")").expect(plan);
+    assert!(
+        recursive < filter,
+        "start filter must sit inside the recursive anchor:\n{plan}"
+    );
+    let where_form = s.query("MATCH p = (a WHERE a.name = 'A')-[:E]->{0,2}(b) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY hops, name").await.unwrap();
+    assert_eq!(rows(&where_form), rows(&result));
+    let forward = s
+        .query("MATCH (a WHERE a.name < b.name)-[:E]->(b {name:'B'}) RETURN a.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(rows(&forward), vec![vec!["A"]]);
+    let across = s
+        .query("MATCH (a {name: c.name})-[:E]->(b), (c {name:'A'}) RETURN b.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(rows(&across), vec![vec!["B"], vec!["C"]]);
+    let optional = s
+        .query("MATCH (a) OPTIONAL MATCH (a {name:'Nope'})-[:E]->(b) RETURN a.name AS name, b.name AS other ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&optional),
+        vec![
+            vec!["A", "NULL"],
+            vec!["B", "NULL"],
+            vec!["C", "NULL"],
+            vec!["D", "NULL"]
+        ]
+    );
+}
+
+#[tokio::test]
 async fn fixed_path_modes_and_values() {
     let mut s = graph().await;
     for (mode, n) in [("WALK", 1), ("TRAIL", 0), ("SIMPLE", 0), ("ACYCLIC", 0)] {
