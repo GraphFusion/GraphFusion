@@ -20,7 +20,7 @@ use datafusion::{
     common::{Column, TableReference},
     datasource::provider_as_source,
     execution::context::SessionContext,
-    logical_expr::{lit, Expr, JoinType, LogicalPlan, LogicalPlanBuilder},
+    logical_expr::{cast, lit, Expr, JoinType, LogicalPlan, LogicalPlanBuilder},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -431,10 +431,18 @@ async fn insert_element(
         expressions.extend([from.alias(SOURCE), to.alias(DESTINATION)]);
     }
     use datafusion::logical_expr::ExprSchemable;
-    for (name, value) in values {
-        if value.get_type(plan.schema())? != DataType::Null {
-            expressions.push(value.alias(name));
+    for (name, mut value) in values {
+        let ty = value.get_type(plan.schema())?;
+        if ty == DataType::Null {
+            continue;
         }
+        // An integer literal is not a different property type from an existing float.
+        if ty == DataType::Int64
+            && stored_property_type(data, kind, &labels, &name) == Some(DataType::Float64)
+        {
+            value = cast(value, DataType::Float64);
+        }
+        expressions.push(value.alias(name));
     }
     let mut next = data.clone();
     let inserted = table_with_empty(
@@ -530,6 +538,34 @@ async fn target(
     }
     Ok(binding)
 }
+fn stored_property_type(
+    data: &GraphData,
+    kind: ElementKind,
+    labels: &BTreeSet<String>,
+    name: &str,
+) -> Option<DataType> {
+    let tables: Vec<&Table> = if kind == ElementKind::Node {
+        data.nodes
+            .iter()
+            .filter(|table| &table.0.labels == labels)
+            .map(|table| &table.0)
+            .collect()
+    } else {
+        data.edges
+            .iter()
+            .filter(|table| &table.table.labels == labels)
+            .map(|table| &table.table)
+            .collect()
+    };
+    tables.iter().find_map(|table| {
+        table
+            .schema
+            .field_with_name(name)
+            .ok()
+            .map(|field| field.data_type().clone())
+    })
+}
+
 fn property_target(expr: &ast::Expr) -> Result<(String, String)> {
     if let ast::Expr::Property { base, key } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
@@ -659,18 +695,23 @@ async fn edit_graph(
         }
         for (name, value) in &edit.values {
             if let Some(column) = value {
+                let mut source = col("__gf_patch", column);
                 if let Ok(existing) = old.schema.field_with_name(name) {
                     let incoming = patch
                         .schema()
                         .field_with_name(None, column)
                         .map_err(|_| Error::Corrupt(format!("missing patch column {column}")))?;
-                    if incoming.data_type() != existing.data_type() {
+                    if incoming.data_type() == &DataType::Int64
+                        && existing.data_type() == &DataType::Float64
+                    {
+                        source = cast(source, DataType::Float64);
+                    } else if incoming.data_type() != existing.data_type() {
                         return Err(Error::UnsupportedFeature(format!(
                             "mixed types for graph property {name}"
                         )));
                     }
                 }
-                projections.push(col("__gf_patch", column).alias(name));
+                projections.push(source.alias(name));
             }
         }
         let mut labels = old.labels.clone();

@@ -154,6 +154,40 @@ async fn label_filters_scan_only_compatible_fragments() {
     );
 }
 
+#[tokio::test]
+async fn integer_values_widen_into_existing_float_properties() {
+    let mut session = social().await;
+    let inserted = statement(
+        &mut session,
+        "INSERT (m:Metric {name: 'qps', score: 2}) RETURN m.score AS score",
+    )
+    .await;
+    assert_eq!(inserted.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&inserted), vec![vec!["2".to_string()]]);
+
+    let updated = statement(
+        &mut session,
+        "MATCH (m:Metric WHERE m.name = 'load') SET m.score = 4 RETURN m.score AS score",
+    )
+    .await;
+    assert_eq!(updated.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&updated), vec![vec!["4".to_string()]]);
+
+    assert!(session
+        .run("INSERT (:Metric {name: 'bad', score: 'nope'})")
+        .await
+        .is_err());
+    let scores = session
+        .query("MATCH (m:Metric) RETURN m.score AS score ORDER BY score")
+        .await
+        .unwrap();
+    assert_eq!(scores.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&scores),
+        vec![vec!["2".to_string()], vec!["4".to_string()]]
+    );
+}
+
 async fn statement(session: &mut graphfusion::Session, query: &str) -> graphfusion::QueryResult {
     let output = session.run(query).await.unwrap().pop().unwrap();
     match output {
