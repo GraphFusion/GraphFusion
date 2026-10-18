@@ -59,6 +59,54 @@ async fn recursive_edges_and_zero_repetitions_execute_in_datafusion() {
 }
 
 #[tokio::test]
+async fn local_start_predicate_runs_before_variable_length_expansion() {
+    let mut s = graph().await;
+    let result = s.query("MATCH p = (a {name:'A'})-[:E]->{0,2}(b) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY hops, name").await.unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec!["A", "0"],
+            vec!["B", "1"],
+            vec!["C", "1"],
+            vec!["D", "2"],
+            vec!["D", "2"]
+        ]
+    );
+    let plan = &result.logical_plan;
+    let recursive = plan.find("RecursiveQuery").expect(plan);
+    let filter = plan.find(".name = Utf8(\"A\")").expect(plan);
+    assert!(
+        recursive < filter,
+        "start filter must sit inside the recursive anchor:\n{plan}"
+    );
+    let where_form = s.query("MATCH p = (a WHERE a.name = 'A')-[:E]->{0,2}(b) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY hops, name").await.unwrap();
+    assert_eq!(rows(&where_form), rows(&result));
+    let forward = s
+        .query("MATCH (a WHERE a.name < b.name)-[:E]->(b {name:'B'}) RETURN a.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(rows(&forward), vec![vec!["A"]]);
+    let across = s
+        .query("MATCH (a {name: c.name})-[:E]->(b), (c {name:'A'}) RETURN b.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(rows(&across), vec![vec!["B"], vec!["C"]]);
+    let optional = s
+        .query("MATCH (a) OPTIONAL MATCH (a {name:'Nope'})-[:E]->(b) RETURN a.name AS name, b.name AS other ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&optional),
+        vec![
+            vec!["A", "NULL"],
+            vec!["B", "NULL"],
+            vec!["C", "NULL"],
+            vec!["D", "NULL"]
+        ]
+    );
+}
+
+#[tokio::test]
 async fn fixed_path_modes_and_values() {
     let mut s = graph().await;
     for (mode, n) in [("WALK", 1), ("TRAIL", 0), ("SIMPLE", 0), ("ACYCLIC", 0)] {
@@ -461,4 +509,58 @@ async fn path_bags_match_exhaustive_walks_on_mixed_cyclic_graph() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn simplified_path_quantifier_repeats_the_whole_pattern() {
+    let db = Database::new();
+    let mut s = db.session();
+    s.execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+        .unwrap();
+    s.run(
+        "INSERT (a:N {name:'A'})-[:E]->(b:N {name:'B'})-[:F]->(c:N {name:'C'})-[:E]->(d:N {name:'D'})-[:F]->(e:N {name:'E'}), \
+         (p:N {name:'P'})-[:L]->(q:N {name:'Q'})-[:R]->(rn:N {name:'R'}), (q)-[:L]->(s:N {name:'S'}), \
+         (h0:N {name:'H0'})-[:E]->(h1:N {name:'H1'})-[:E]->(h2:N {name:'H2'})-[:E]->(h3:N {name:'H3'})-[:E]->(h4:N {name:'H4'})-[:E]->(h5:N {name:'H5'})-[:E]->(h6:N {name:'H6'}), \
+         (l1:N {name:'L1'})-[:E]->(l0:N {name:'L0'}), (l2:N {name:'L2'})-[:F]->(l1), (l3:N {name:'L3'})-[:E]->(l2), (l4:N {name:'L4'})-[:F]->(l3)",
+    )
+    .await
+    .unwrap();
+    let result = s
+        .query("MATCH (a {name:'A'})-/E F/->{1,2}(z) RETURN z.name AS z ORDER BY z")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec!["C"], vec!["E"]]);
+    let result = s
+        .query("MATCH p = (a {name:'A'})-/E F/->{2}(z) RETURN z.name AS z, PATH_LENGTH(p) AS hops")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec!["E", "4"]]);
+    let result = s
+        .query("MATCH (p {name:'P'})-/L|R/->{1,2}(z) RETURN z.name AS z ORDER BY z")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec!["Q"], vec!["R"], vec!["S"]]);
+    let result = s
+        .query(
+            "MATCH p = (h0 {name:'H0'})-/E{2}/->{3}(z) RETURN z.name AS z, PATH_LENGTH(p) AS hops",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec!["H6", "6"]]);
+    let result = s
+        .query("MATCH (h0 {name:'H0'})-/E/->{1,2}(z) RETURN z.name AS z ORDER BY z")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec!["H1"], vec!["H2"]]);
+    let result = s
+        .query("MATCH (l0 {name:'L0'})<-/E F/-{2}(z) RETURN z.name AS z")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result), vec![vec!["L4"]]);
+    let error = s
+        .query("MATCH (a {name:'A'})-/E*/->{2}(z) RETURN z.name AS z")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("positive minimum length"), "{error}");
 }

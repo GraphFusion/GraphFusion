@@ -18,7 +18,7 @@ DETACH DELETE removes the node and its incident edges:
 MATCH (p:Person {name: 'Bob'}) DETACH DELETE p;
 ```
 
-Null targets are skipped. Deleted non-null identities are invalid for later reference/property access in that statement, including through aliases. If a variable contains both live and deleted identities, the current implementation invalidates the entire variable.
+Null targets are skipped. Deleted non-null identities are invalid for later reference/property access in that statement, including through aliases. A variable that also holds surviving identities can still be read on those rows; only the deleted rows fail.
 
 Published element IDs are not recycled after deletion within the storage generation. Aborted, never-published IDs can be reused. A failure in a later clause or result rolls back the statement's deletes.
 
