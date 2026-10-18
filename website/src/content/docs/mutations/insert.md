@@ -13,7 +13,7 @@ INSERT (alice)-[:Knows]->(dana:Person & Admin {name: 'Dana', age: 28})
 RETURN dana.name AS name;
 ```
 
-A bound node appears as a bare reference, such as `(alice)`. New nodes can have labels and properties; edge variables must be new. Incoming/outgoing edges, undirected connections, self-loops and parallel edges are supported.
+A bound node appears as a bare reference, such as `(alice)`. New nodes can have labels and properties; edge variables must be new. Incoming/outgoing edges, undirected connections, self-loops and parallel edges are supported. A new destination may read the edge that connects it, as in `(a)-[e:Knows {since: 2020}]->(b {met: e.since})`. The edge may still read both endpoints. Properties of the destination that do not mention the edge are visible to that edge.
 
 Creation requires concrete labels: names joined by `&` are accepted, while `!`, `|` and `%` are rejected. Every input row creates its new elements; repeated input rows can therefore insert duplicates. Empty input inserts nothing. A null optional endpoint is an error.
 

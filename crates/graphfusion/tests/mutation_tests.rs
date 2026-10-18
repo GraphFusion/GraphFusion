@@ -557,3 +557,89 @@ async fn detach_indexes_handle_parallel_edges_loops_directions_and_separate_id_s
         }
     }
 }
+
+#[tokio::test]
+async fn insert_destination_can_read_the_connecting_edge() {
+    let db = Database::new();
+    let mut s = session(&db);
+    let result = run(
+        &mut s,
+        "INSERT (a:N {k: 1})-[e:E {w: 2}]->(b:N {k: e.w}) RETURN b.k AS k",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["2"]]);
+    assert_eq!(result.affected_elements, 3);
+    let result = run(
+        &mut s,
+        "INSERT (a:N)-[e:E {w: b.k}]->(b:N {k: 10}) RETURN e.w AS w",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["10"]]);
+    let result = run(
+        &mut s,
+        "INSERT (a:N)-[e:E {w: 2}]->(b:N {k: e.w})-[f:F {w: b.k}]->(c:N {k: f.w}) RETURN b.k AS bk, f.w AS fw, c.k AS ck",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["2", "2", "2"]]);
+    let result = run(
+        &mut s,
+        "INSERT (a:N)-[e:E {w: b.m}]->(b:N {m: 10, k: e.w}) RETURN e.w AS w, b.k AS k, b.m AS m",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["10", "10", "10"]]);
+    let result = run(
+        &mut s,
+        "INSERT (a:N)<-[e:E {w: 4}]-(b:N {k: e.w}) RETURN b.k AS k",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["4"]]);
+    let result = run(
+        &mut s,
+        "INSERT (a:N)~[e:E {w: 7}]~(b:N {k: e.w}) RETURN b.k AS k",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["7"]]);
+    let result = run(
+        &mut s,
+        "INSERT (a:N {k: 1})-[e:E {w: 2}]->(b:N {k: e.w + 1}) RETURN b.k AS k",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["3"]]);
+    let result = run(
+        &mut s,
+        "INSERT (a:N {k: 1})-[e:E {w: a.k + b.k}]->(b:N {k: 10}) RETURN e.w AS w",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["11"]]);
+    run(
+        &mut s,
+        "INSERT (a:N)-[e:E {w: 3}]->(:N {name: 'Z', k: e.w})",
+    )
+    .await;
+    assert_eq!(
+        rows(
+            &s.query("MATCH (n {name: 'Z'}) RETURN n.k AS k")
+                .await
+                .unwrap()
+        ),
+        vec![vec!["3"]]
+    );
+    let result = run(
+        &mut s,
+        "FOR n IN [1, 2] INSERT (a:N {k: n})-[e:E {w: n}]->(b:N {k: e.w}) RETURN b.k AS k ORDER BY k",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["1"], vec!["2"]]);
+    assert_eq!(result.affected_elements, 6);
+    for query in [
+        "INSERT (a:N {k: a.k})",
+        "INSERT (a:N {k: e.w})-[e:E {w: 2}]->(b:N)",
+        "INSERT (b:N {k: e.w})-[e:E {w: 5}]->(c:N)",
+    ] {
+        let err = s.run(query).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unbound variable"),
+            "{query}: {err}"
+        );
+    }
+}

@@ -12,6 +12,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Let a newly inserted destination read the edge that connects it. The edge can
+  still read both endpoints, and the affected-element count stays the number of
+  created elements.
 
 ## 0.2.0 — 2026-10-05
 

@@ -123,6 +123,56 @@ fn properties(
     Ok(result)
 }
 
+fn mentions_identifier(expr: &ast::Expr, name: &str) -> bool {
+    use ast::visit::Visitor;
+    struct Find<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl<'ast> ast::visit::Visitor<'ast> for Find<'_> {
+        type Break = ();
+
+        fn visit_identifier(
+            &mut self,
+            identifier: &'ast ast::Identifier,
+        ) -> std::ops::ControlFlow<()> {
+            if identifier.value == self.name {
+                self.found = true;
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+    }
+    let mut find = Find { name, found: false };
+    let _ = find.visit_expr(expr);
+    find.found
+}
+
+/// Split a new destination's properties into those the connecting edge can see
+/// and those that mention the edge variable being introduced.
+fn partition_edge_properties(
+    map: Option<&ast::MapLiteral>,
+    edge: Option<&str>,
+) -> (Option<ast::MapLiteral>, Option<ast::MapLiteral>) {
+    let (Some(map), Some(edge)) = (map, edge) else {
+        return (map.cloned(), None);
+    };
+    let mut ready = Vec::new();
+    let mut deferred = Vec::new();
+    for (key, value) in &map.entries {
+        if mentions_identifier(value, edge) {
+            deferred.push((key.clone(), value.clone()));
+        } else {
+            ready.push((key.clone(), value.clone()));
+        }
+    }
+    (
+        (!ready.is_empty()).then_some(ast::MapLiteral { entries: ready }),
+        (!deferred.is_empty()).then_some(ast::MapLiteral { entries: deferred }),
+    )
+}
+
 fn validate_insert_labels(expression: Option<&ast::LabelExpression>) -> Result<()> {
     match expression {
         None | Some(ast::LabelExpression::Label(_)) => Ok(()),
@@ -171,12 +221,33 @@ pub(super) async fn apply(
                 .await?;
                 plan = next;
                 for chain in &path.chains {
+                    let edge = &chain.relationship;
+                    // A new destination is stored before the edge that introduces it, so
+                    // properties that name that edge are applied after the edge exists.
+                    // An already-bound node or edge keeps the original pattern: a bound
+                    // node must stay a bare reference, and a bound edge name is not new.
+                    let node_bound = chain
+                        .node
+                        .variable
+                        .as_ref()
+                        .is_some_and(|name| scope.contains(&name.value));
+                    let edge_name = edge.variable.as_ref().map(|name| name.value.as_str());
+                    let edge_bound = edge_name.is_some_and(|name| scope.contains(name));
+                    let (node, deferred) = if node_bound || edge_bound {
+                        (chain.node.clone(), None)
+                    } else {
+                        let (ready, deferred) =
+                            partition_edge_properties(chain.node.properties.as_ref(), edge_name);
+                        let mut node = chain.node.clone();
+                        node.properties = ready;
+                        (node, deferred)
+                    };
                     let (next, right) = insert_node(
                         plan,
                         scope,
                         session,
                         id,
-                        &chain.node,
+                        &node,
                         &mut data,
                         tx,
                         ctx,
@@ -185,7 +256,6 @@ pub(super) async fn apply(
                     )
                     .await?;
                     plan = next;
-                    let edge = &chain.relationship;
                     validate_insert_labels(edge.label_expression.as_ref())?;
                     let (from, to, directed) = match edge.direction {
                         ast::Direction::Right => (left.column(ID), right.column(ID), true),
@@ -211,7 +281,19 @@ pub(super) async fn apply(
                     )
                     .await?;
                     plan = next;
-                    left = right;
+                    if let Some(deferred) = deferred {
+                        plan = assign_inserted_properties(
+                            plan, scope, session, id, &right, &deferred, &mut data, ctx, trace,
+                        )
+                        .await?;
+                    }
+                    // Refresh drops the previous alias of a named node. The next hop
+                    // has to use the binding that now carries the deferred properties.
+                    left = node
+                        .variable
+                        .as_ref()
+                        .and_then(|name| scope.elements.get(&name.value).cloned())
+                        .unwrap_or(right);
                 }
             }
         }
@@ -490,6 +572,32 @@ async fn insert_element(
         graph::declare(scope, &name.value, &binding)?;
     }
     Ok((plan, binding))
+}
+
+/// Write properties that could not be bound until the connecting edge existed.
+/// The node and edge were already counted, so this assignment does not add to
+/// the affected-element total.
+#[allow(clippy::too_many_arguments)]
+async fn assign_inserted_properties(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    graph: ObjectId,
+    binding: &ElementBinding,
+    properties_map: &ast::MapLiteral,
+    data: &mut GraphData,
+    ctx: &SessionContext,
+    trace: &mut Trace,
+) -> Result<LogicalPlanBuilder> {
+    let values = properties(Some(properties_map), session, &plan, scope)?;
+    let mut edit = Edit::default();
+    let Some((patch_plan, ids)) = patch(&plan, binding, values, &mut edit, ctx, trace).await?
+    else {
+        return Ok(plan);
+    };
+    *data = edit_graph(data, binding.kind, &patch_plan, &ids, &edit, ctx, trace).await?;
+    let plan = refresh(plan, scope, graph, data)?;
+    freeze(plan, ctx, trace, None).await
 }
 
 async fn target(
