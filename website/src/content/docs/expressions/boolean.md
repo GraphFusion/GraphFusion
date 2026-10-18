@@ -19,4 +19,11 @@ RETURN UNKNOWN IS UNKNOWN AS unknown,
        UNKNOWN IS NOT FALSE AS not_false;
 ```
 
+A truth predicate is a boolean, so it can be projected and deduplicated. Null is neither true nor false.
+
+```gql test
+FOR n IN [TRUE, FALSE, UNKNOWN]
+RETURN DISTINCT n IS TRUE AS truthy ORDER BY truthy;
+```
+
 WHERE and FILTER retain only true rows. Declared BOOLEAN session initializers also accept `NOT UNKNOWN`; the result is a null value subject to the declaration's nullability constraint.

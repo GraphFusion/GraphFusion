@@ -12,6 +12,8 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Project `IS [NOT] TRUE` and `IS [NOT] FALSE` under `DISTINCT`. A null boolean
+  is not true and not false, and the predicate no longer fails planning.
 
 ## 0.2.0 — 2026-10-05
 

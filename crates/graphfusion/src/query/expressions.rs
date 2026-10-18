@@ -412,16 +412,19 @@ impl<'a> Binder<'a> {
             } => {
                 let expr = self.bind(expr)?;
                 self.require(&expr, boolean, "boolean operand")?;
-                let truth = if *value {
-                    expr.is_true()
+                // `IS TRUE` is planned as a non-nullable boolean, but DataFusion
+                // executes it as a nullable distinctness comparison. Build that
+                // comparison here so DISTINCT sees one nullability.
+                let op = if *negated {
+                    Operator::IsDistinctFrom
                 } else {
-                    expr.is_false()
+                    Operator::IsNotDistinctFrom
                 };
-                if *negated {
-                    Expr::Not(Box::new(truth))
-                } else {
-                    truth
-                }
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(expr),
+                    op,
+                    Box::new(datafusion::logical_expr::lit(*value)),
+                ))
             }
             E::Coalesce(args) => {
                 let args = args
