@@ -124,6 +124,48 @@ async fn insert_rejects_nonconcrete_labels_without_publishing_writes() {
 }
 
 #[tokio::test]
+async fn insert_bare_label_set_keeps_case_distinct_labels() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (A & a {name: 'n'})-[A & a]->()").await;
+    let result = run(
+        &mut s,
+        "MATCH (n:A) \
+         RETURN n.name AS name, n IS LABELED A AS upper, n IS LABELED a AS lower",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["n", "true", "true"]]);
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:A & a) RETURN n.name AS name").await),
+        vec![vec!["n"]]
+    );
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:a) RETURN n.name AS name").await),
+        vec![vec!["n"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
+                "MATCH ()-[e]->() RETURN e IS LABELED A AS upper, e IS LABELED a AS lower",
+            )
+            .await
+        ),
+        vec![vec!["true", "true"]]
+    );
+    assert_eq!(
+        rows(
+            &run(
+                &mut s,
+                "MATCH ()-[e:A & a]->() RETURN e IS LABELED a AS lower"
+            )
+            .await
+        ),
+        vec![vec!["true"]]
+    );
+}
+
+#[tokio::test]
 async fn matched_insert_preserves_bags_and_shared_nodes_and_edge_directions() {
     let db = Database::new();
     let mut s = session(&db);
@@ -396,6 +438,41 @@ async fn deleting_edges_keeps_surviving_node_bindings_and_rejects_stale_aliases(
 }
 
 #[tokio::test]
+async fn partial_delete_keeps_live_rows_of_the_same_variable() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (:N {name: 'Ada'}), (:N {name: 'Bea'})").await;
+    assert!(s
+        .run(
+            "MATCH (n:N)
+             MATCH (d:N WHERE d.name = 'Ada')
+             DETACH DELETE d
+             RETURN n.name AS name",
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:N) RETURN n.name AS name ORDER BY name").await),
+        vec![vec!["Ada"], vec!["Bea"]]
+    );
+    let result = run(
+        &mut s,
+        "MATCH (n:N)
+         LET label = n.name
+         MATCH (d:N WHERE d.name = 'Ada')
+         DETACH DELETE d
+         FILTER label = 'Bea'
+         RETURN n.name AS name, n IS LABELED N AS labeled",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["Bea", "true"]]);
+    assert_eq!(
+        rows(&run(&mut s, "MATCH (n:N) RETURN n.name AS name").await),
+        vec![vec!["Bea"]]
+    );
+}
+
+#[tokio::test]
 async fn repeated_inserts_do_not_rewrite_one_file_per_previous_row() {
     let dir = Durable::new();
     let db = dir.open();
@@ -556,4 +633,70 @@ async fn detach_indexes_handle_parallel_edges_loops_directions_and_separate_id_s
             );
         }
     }
+}
+
+#[tokio::test]
+async fn deleted_elements_fail_in_null_writes_and_direction_tests() {
+    for query in [
+        "MATCH (n:N), (m:M) DETACH DELETE n SET m.flag = n.missing",
+        "MATCH (n:N) DETACH DELETE n INSERT (:Made {flag: n.missing})",
+        "MATCH ()-[e:E]->() DELETE e RETURN e IS DIRECTED AS directed",
+    ] {
+        let db = Database::new();
+        let mut s = session(&db);
+        s.run("INSERT (n:N {name:'n'}), (m:M {name:'m', flag:true}), (n)-[:E]->(m)")
+            .await
+            .unwrap();
+        let error = s
+            .run(query)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("deleted access committed: {query}"));
+        assert!(
+            error.to_string().contains("deleted or unavailable"),
+            "{query}: {error}"
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH (n) RETURN COUNT(*) AS c").await),
+            vec![vec!["2"]]
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH ()-[e:E]->() RETURN COUNT(*) AS c").await),
+            vec![vec!["1"]]
+        );
+        assert_eq!(
+            rows(&run(&mut s, "MATCH (m:M) RETURN m.flag AS flag").await),
+            vec![vec!["true"]]
+        );
+    }
+}
+
+#[tokio::test]
+async fn fragment_comparison_rejects_deleted_elements_and_rolls_back() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:I {v:1,k:1}),(:I {v:2,k:2}),(:T {v:'text',k:3})").await.unwrap();
+    let result = s
+        .run("MATCH (n),(m:I {k:1}) DELETE m FILTER n.v = 1 RETURN 1 AS v")
+        .await;
+    let error = result.expect_err("deleted element comparison unexpectedly succeeded");
+    assert!(
+        error.to_string().contains("deleted or unavailable"),
+        "{error}"
+    );
+    assert_eq!(s.query("MATCH (n) RETURN n").await.unwrap().row_count(), 3);
+}
+
+#[tokio::test]
+async fn stored_reference_comparison_rejects_deleted_aliases() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1,k:1}),(:P {v:2,k:2}),(:D {v:'1',k:3})").await.unwrap();
+    let error = s
+        .run("MATCH (n) LET r=n MATCH (m:P {k:1}) DELETE m FILTER r.v = '1' RETURN 1 AS value")
+        .await
+        .expect_err("deleted alias comparison committed");
+    assert!(
+        error.to_string().contains("deleted or unavailable"),
+        "{error}"
+    );
+    assert_eq!(s.query("MATCH (n) RETURN n").await.unwrap().row_count(), 3);
 }
