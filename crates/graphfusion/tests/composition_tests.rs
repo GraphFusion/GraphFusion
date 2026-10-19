@@ -3058,3 +3058,20 @@ async fn next_composite_references_do_not_adopt_one_branchs_layout() {
     assert_eq!(r.schema.field(0).data_type(), &DataType::Utf8);
     assert_eq!(r.row_count(), 3);
 }
+
+#[tokio::test]
+async fn next_except_and_intersect_keep_the_left_reference_layout() {
+    let mut s = social().await;
+    s.run("CREATE GRAPH other ANY; USE GRAPH other INSERT (:Document {id:'other'})")
+        .await
+        .unwrap();
+    for query in [
+        "MATCH(p:Person) RETURN p EXCEPT MATCH(d:Document) RETURN d AS p NEXT RETURN p.id+0 AS id ORDER BY id",
+        "MATCH(p:Person) RETURN p INTERSECT MATCH(d) RETURN d AS p NEXT RETURN p.id+0 AS id ORDER BY id",
+        "MATCH(p:Person) RETURN p EXCEPT USE GRAPH other MATCH(d) RETURN d AS p NEXT RETURN p.id+0 AS id ORDER BY id",
+    ] {
+        let r = s.query(query).await.unwrap();
+        assert_eq!(r.schema.field(0).data_type(), &DataType::Int64, "{query}");
+        assert_eq!(strings(&r), vec![vec!["1".to_string()],vec!["2".to_string()]], "{query}");
+    }
+}
