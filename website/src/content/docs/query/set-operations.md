@@ -21,6 +21,6 @@ For a complete row that appears L times on the left and R times on the right:
 | INTERSECT ALL | min(L, R) |
 | EXCEPT ALL | max(L − R, 0) |
 
-Null fields compare equal for matching result rows. Branch schemas must have the same column names, count and order. Types must match or permit supported null/numeric widening; differently named columns are not automatically aligned.
+Null fields compare equal for matching result rows. Branch schemas must have the same column names, count and order. Types must match or permit supported null/numeric widening; differently named columns are not automatically aligned. Integer and float lists widen the same way, including nested lists. An empty list is accepted beside a typed list. A string or boolean list cannot be combined with a number list.
 
 Each branch has an independent binding scope. A branch-local graph selection does not modify another branch or the session. Only one conjunction kind is accepted at a composite level; use nested query braces to combine levels. Composite writes are rejected before branch execution.

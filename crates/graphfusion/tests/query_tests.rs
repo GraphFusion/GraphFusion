@@ -139,6 +139,73 @@ async fn three_valued_logic_and_null_predicates() {
 }
 
 #[tokio::test]
+async fn coalesce_null_with_byte_string() {
+    let mut session = Database::new().session();
+    let result = session
+        .query(
+            "LET n = NULL \
+             RETURN COALESCE(NULL, X'0A') AS missing, \
+                    COALESCE(X'0A', NULL) AS present, \
+                    COALESCE(NULL, NULL, X'0B') AS later, \
+                    COALESCE(X'01', X'02') AS first, \
+                    COALESCE(n, X'FF') AS bound",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Binary);
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Binary(Some(vec![0x0A])),
+            ScalarValue::Binary(Some(vec![0x0A])),
+            ScalarValue::Binary(Some(vec![0x0B])),
+            ScalarValue::Binary(Some(vec![0x01])),
+            ScalarValue::Binary(Some(vec![0xFF])),
+        ]
+    );
+    session.set_parameter("b", Value::Null).unwrap();
+    session
+        .execute("SESSION SET VALUE $typed BYTES = NULL")
+        .unwrap();
+    let parameters = session
+        .query("RETURN COALESCE($b, X'0A') AS untyped, COALESCE($typed, X'0A') AS typed")
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&parameters),
+        vec![
+            ScalarValue::Binary(Some(vec![0x0A])),
+            ScalarValue::Binary(Some(vec![0x0A])),
+        ]
+    );
+    session
+        .run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {b: X'0A'}), (:N {})")
+        .await
+        .unwrap();
+    let matched = session
+        .query(
+            "MATCH (n) WHERE COALESCE(NULL, n.b) = X'0A' \
+             RETURN COALESCE(n.b, X'FF') AS b",
+        )
+        .await
+        .unwrap();
+    assert_eq!(row(&matched), vec![ScalarValue::Binary(Some(vec![0x0A]))]);
+    assert!(matches!(
+        session
+            .query("RETURN COALESCE(NULL, X'0A', 'text') AS bad")
+            .await,
+        Err(Error::InvalidQuery(_))
+    ));
+    assert_eq!(
+        row(&session
+            .query("RETURN COALESCE(NULL, NULL) AS n, COALESCE(NULL, 1, 1.5) AS number")
+            .await
+            .unwrap()),
+        vec![ScalarValue::Null, ScalarValue::Float64(Some(1.0))]
+    );
+}
+
+#[tokio::test]
 async fn untyped_null_concatenation_infers_string_type() {
     let mut session = Database::new().session();
     session.set_parameter("a", Value::Null).unwrap();
@@ -232,6 +299,45 @@ async fn typed_parameter_nulls_and_numeric_initializers_keep_their_type_family()
         session.query("RETURN $flag + 1 AS n").await,
         Err(Error::InvalidQuery(_))
     ));
+}
+
+#[tokio::test]
+async fn char_length_limits_the_session_value() {
+    let mut session = Database::new().session();
+    session
+        .execute("SESSION SET VALUE $s CHAR(2) = 'ab'; SESSION SET VALUE $short CHAR(2) = 'a'; SESSION SET VALUE $mark CHAR(1) = 'é'")
+        .unwrap();
+    let result = session
+        .query("RETURN $s AS s, $short AS short, $mark AS mark")
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Utf8(Some("ab".into())),
+            ScalarValue::Utf8(Some("a".into())),
+            ScalarValue::Utf8(Some("é".into())),
+        ]
+    );
+    for declaration in [
+        "SESSION SET VALUE $bad CHAR(2) = 'abc'",
+        "SESSION SET VALUE $bad CHAR(2) = 'abcd'",
+        "SESSION SET VALUE $bad CHAR(1) = 'éx'",
+        "SESSION SET VALUE $bad CHAR(0) = ''",
+        "SESSION SET VALUE $bad CHAR(2, 4) = 'ab'",
+        "SESSION SET VALUE $items LIST<CHAR(2)> = ['ab', 'abcd']",
+    ] {
+        assert!(
+            matches!(
+                session.execute(declaration),
+                Err(Error::InvalidDefinition(_))
+            ),
+            "{declaration}"
+        );
+    }
+    session
+        .execute("SESSION SET VALUE $items LIST<CHAR(2)> = ['ab', 'a']")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -331,6 +437,20 @@ async fn gql_type_checks_reject_implicit_string_and_boolean_numeric_coercion() {
     ] {
         assert!(session.query(query).await.is_err(), "{query}");
     }
+    for query in ["RETURN 1e999 AS n", "RETURN -1e309 AS n"] {
+        assert!(
+            matches!(session.query(query).await, Err(Error::Parse(_))),
+            "{query}"
+        );
+    }
+    assert!(matches!(
+        session.run("SESSION SET VALUE $x = 1e999").await,
+        Err(Error::Parse(_))
+    ));
+    assert_eq!(
+        row(&session.query("RETURN 1e308 AS n").await.unwrap()),
+        vec![ScalarValue::Float64(Some(1e308))]
+    );
     assert_eq!(
         row(&session.query("RETURN $max - 1 AS n").await.unwrap()),
         vec![ScalarValue::Int64(Some(i64::MAX - 1))]

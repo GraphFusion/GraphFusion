@@ -1,4 +1,4 @@
-use datafusion::common::ScalarValue;
+use datafusion::{arrow::datatypes::DataType, common::ScalarValue};
 use graphfusion::{Database, QueryResult, Session};
 async fn graph() -> Session {
     let db = Database::new();
@@ -27,6 +27,205 @@ fn rows(result: &QueryResult) -> Vec<Vec<String>> {
 }
 async fn query(s: &mut Session, q: &str) -> QueryResult {
     s.query(q).await.unwrap_or_else(|e| panic!("{q}\n{e}"))
+}
+fn scans(plan: &str) -> (usize, usize) {
+    let mut nodes = 0;
+    let mut edges = 0;
+    let mut rest = plan;
+    while let Some(index) = rest.find("TableScan: __gf_scan_") {
+        let prelude = rest[..index].rsplit("Projection:").next().unwrap_or(rest);
+        if prelude.contains("__gf_source") {
+            edges += 1;
+        } else if prelude.contains("__gf_id") {
+            nodes += 1;
+        }
+        rest = &rest[index + "TableScan: __gf_scan_".len()..];
+    }
+    (nodes, edges)
+}
+#[tokio::test]
+async fn quantified_anonymous_start_reads_edges() {
+    let mut s = graph().await;
+    s.run("INSERT (:N {name:'Z'})").await.unwrap();
+    let pairs = [
+        (
+            "MATCH ()-[:E]->{1,2}(b) RETURN b.name AS name ORDER BY name",
+            "MATCH (a)-[:E]->{1,2}(b) RETURN b.name AS name ORDER BY name",
+        ),
+        (
+            "MATCH ()-[es:E]->{2}(b {name:'D'}) FOR e IN es RETURN ELEMENT_ID(e) AS id ORDER BY id",
+            "MATCH (a)-[es:E]->{2}(b {name:'D'}) FOR e IN es RETURN ELEMENT_ID(e) AS id ORDER BY id",
+        ),
+        (
+            "MATCH p = ()-[:E]->{1,3}() RETURN PATH_LENGTH(p) AS hops ORDER BY hops",
+            "MATCH p = (a)-[:E]->{1,3}() RETURN PATH_LENGTH(p) AS hops ORDER BY hops",
+        ),
+        (
+            "MATCH ()<-[:E]-{1,2}(b) RETURN b.name AS name ORDER BY name",
+            "MATCH (a)<-[:E]-{1,2}(b) RETURN b.name AS name ORDER BY name",
+        ),
+        (
+            "MATCH ()-[:Loop]->{1,2}() RETURN COUNT(*) AS n",
+            "MATCH (a)-[:Loop]->{1,2}() RETURN COUNT(*) AS n",
+        ),
+        (
+            "MATCH REPEATABLE ELEMENTS ()-[:Loop]->{1,2}() RETURN COUNT(*) AS n",
+            "MATCH REPEATABLE ELEMENTS (a)-[:Loop]->{1,2}() RETURN COUNT(*) AS n",
+        ),
+        (
+            "FOR x IN [1, 1] MATCH ()-[:E]->{1}() RETURN COUNT(*) AS n",
+            "FOR x IN [1, 1] MATCH (a)-[:E]->{1}() RETURN COUNT(*) AS n",
+        ),
+        (
+            "MATCH ()-[:E]->{0,1}(b) RETURN b.name AS name ORDER BY name",
+            "MATCH (a)-[:E]->{0,1}(b) RETURN b.name AS name ORDER BY name",
+        ),
+        (
+            "MATCH p = ANY SHORTEST ()-[:E]->*(b) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY name, hops",
+            "MATCH p = ANY SHORTEST (a)-[:E]->*(b) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY name, hops",
+        ),
+        (
+            "MATCH ()-[:E]->()-[:E]->{1,2}(b) RETURN b.name AS name ORDER BY name",
+            "MATCH (a)-[:E]->()-[:E]->{1,2}(b) RETURN b.name AS name ORDER BY name",
+        ),
+    ];
+    for (open, named) in pairs {
+        assert_eq!(
+            rows(&query(&mut s, open).await),
+            rows(&query(&mut s, named).await),
+            "{open}"
+        );
+    }
+    s.run("MATCH (a {name:'A'}) INSERT (a)-[:W {w:1}]->(:N {name:'Y'}), (a)-[:W {w:9}]->(:N {name:'X'})").await.unwrap();
+    let filtered = [
+        "MATCH ()-[e:W WHERE e.w < 5]->{1,2}(b) RETURN b.name AS name ORDER BY name",
+        "MATCH (a)-[e:W WHERE e.w < 5]->{1,2}(b) RETURN b.name AS name ORDER BY name",
+    ];
+    assert_eq!(
+        rows(&query(&mut s, filtered[0]).await),
+        rows(&query(&mut s, filtered[1]).await)
+    );
+    s.run("INSERT (:N {name:'P'})~[:U]~(:N {name:'Q'})")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&query(&mut s, "MATCH ()~[:U]~{1}() RETURN COUNT(*) AS n").await),
+        rows(&query(&mut s, "MATCH (a)~[:U]~{1}() RETURN COUNT(*) AS n").await)
+    );
+
+    let open = scans(
+        &query(&mut s, "MATCH ()-[:E]->{1,2}() RETURN COUNT(*) AS n")
+            .await
+            .logical_plan,
+    );
+    let named = scans(
+        &query(&mut s, "MATCH (a)-[:E]->{1,2}() RETURN COUNT(*) AS n")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(
+        named.0,
+        open.0 + 1,
+        "named start adds one node scan: open={open:?} named={named:?}"
+    );
+    let zero = scans(
+        &query(&mut s, "MATCH ()-[:E]->{0,1}() RETURN COUNT(*) AS n")
+            .await
+            .logical_plan,
+    );
+    let zero_named = scans(
+        &query(&mut s, "MATCH (a)-[:E]->{0,1}() RETURN COUNT(*) AS n")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(
+        zero.0, zero_named.0,
+        "zero repetitions still anchor on nodes"
+    );
+    let labeled = scans(
+        &query(&mut s, "MATCH (:N)-[:E]->{1,2}() RETURN COUNT(*) AS n")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(labeled.0, open.0 + 1);
+}
+#[tokio::test]
+async fn anonymous_path_starts_at_the_first_edge() {
+    let mut s = graph().await;
+    let q = "MATCH ()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["5"]]);
+    let q = "MATCH ()-[:E]->()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["6"]]);
+    let q = "MATCH ()<-[:E]-() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["5"]]);
+    let q = "FOR x IN [1, 2] MATCH ()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["10"]]);
+    let open = scans(
+        &query(&mut s, "MATCH ()-[e:E]->() RETURN e")
+            .await
+            .logical_plan,
+    );
+    let named = scans(
+        &query(&mut s, "MATCH (a)-[e:E]->() RETURN e")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(open.1, 1, "edge scans");
+    assert_eq!(named, (open.0 + 1, 1), "named start adds one node scan");
+    let end = scans(
+        &query(&mut s, "MATCH ()-[e:E]->(b) RETURN b.name AS name")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(end, named);
+    let labeled = scans(
+        &query(&mut s, "MATCH (:N)-[e:E]->() RETURN e")
+            .await
+            .logical_plan,
+    );
+    assert_eq!(labeled.0, open.0 + 1);
+    assert_eq!(
+        rows(&query(&mut s, "MATCH (:N)-[:E]->() RETURN COUNT(*) AS n").await),
+        vec![vec!["5"]]
+    );
+}
+#[tokio::test]
+async fn anonymous_endpoints_reuse_the_edge_endpoint() {
+    let mut s = graph().await;
+    s.run("INSERT (:N {name:'A'})-[:E]->({name:'Z'})")
+        .await
+        .unwrap();
+    // Five original :E edges, plus A -> Z.
+    let q = "MATCH ()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["6"]]);
+    let plan = query(&mut s, "MATCH ()-[e:E]->() RETURN e")
+        .await
+        .logical_plan;
+    let open = scans(&plan);
+    assert_eq!(open, (0, 1), "{plan}");
+    let named = query(&mut s, "MATCH ()-[e:E]->(b) RETURN e")
+        .await
+        .logical_plan;
+    // Naming the endpoint still reads the node tables.
+    let named_scans = scans(&named);
+    assert!(named_scans.0 > 0 && named_scans.1 == 1, "{named}");
+    // A label or property map still has to read the endpoint node.
+    let q = "MATCH ()-[:E]->(:N) RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["5"]]);
+    let q = "MATCH (a)-[:E]->({name:'Z'}) RETURN a.name AS name";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["A"]]);
+    let q = "MATCH ()-[:E]->()-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["6"]]);
+    let plan = query(&mut s, q).await.logical_plan;
+    assert_eq!(scans(&plan), (open.0, 2), "{plan}");
+    let q = "MATCH ()-[:E]->({name:'B'})-[:E]->() RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["1"]]);
+    let plan = query(&mut s, q).await.logical_plan;
+    assert_eq!(scans(&plan), (named_scans.0, 2), "{plan}");
+    let q = "MATCH (a {name:'A'})(()-[:E]->()) RETURN COUNT(*) AS n";
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["3"]]);
+    let plan = query(&mut s, q).await.logical_plan;
+    assert_eq!(scans(&plan), (named_scans.0, 1), "{plan}");
 }
 #[tokio::test]
 async fn parentheses_concatenation_subpaths_and_prefilters() {
@@ -149,6 +348,9 @@ async fn questioned_paths_expose_conditional_singletons() {
         .unwrap_err()
         .to_string()
         .contains("conditional"));
+    let q = "MATCH p = ((a)-[e:E]->(b))?(c) RETURN COUNT(*) AS n";
+    // Four zero-hop anchors plus one row for each :E edge.
+    assert_eq!(rows(&query(&mut s, q).await), vec![vec!["9"]]);
 }
 #[tokio::test]
 async fn union_and_multiset_alternation_preserve_the_right_bags() {
@@ -188,6 +390,102 @@ async fn alternatives_expose_nulls_and_reject_incompatible_bindings() {
         .query("MATCH (x)->() | ()-[x]->() RETURN ELEMENT_ID(x) AS id")
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn alternation_unifies_divergent_property_schemas() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {name:'a', v:1}), (:B {name:'b', v:1.5})").await.unwrap();
+    let widened = query(
+        &mut s,
+        "MATCH (n:A) | (n:B) RETURN n.name AS name, n.v AS v, n IS LABELED A AS a, n IS LABELED B AS b ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        widened.schema.field_with_name("v").unwrap().data_type(),
+        &DataType::Float64
+    );
+    assert_eq!(
+        rows(&widened),
+        vec![
+            vec!["a", "1", "true", "false"],
+            vec!["b", "1.5", "false", "true"]
+        ]
+    );
+    let reversed = query(
+        &mut s,
+        "MATCH (n:B) | (n:A) WHERE n.v > 1.2 RETURN n.name AS name",
+    )
+    .await;
+    assert_eq!(
+        reversed.schema.field_with_name("name").unwrap().data_type(),
+        &DataType::Utf8
+    );
+    assert_eq!(rows(&reversed), vec![vec!["b"]]);
+
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {name:'a', v:1}), (:B {name:'b'})")
+        .await
+        .unwrap();
+    // The extra property exists on only one branch. Projecting the shared name
+    // used to fail while resolving the other branch's missing column.
+    assert_eq!(
+        rows(
+            &query(
+                &mut s,
+                "MATCH (n:A) | (n:B) RETURN n.name AS name, n.v AS v ORDER BY name"
+            )
+            .await
+        ),
+        vec![vec!["a", "1"], vec!["b", "NULL"]]
+    );
+
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {v:1}), (:B {v:true})")
+        .await
+        .unwrap();
+    let alternation = query(&mut s, "MATCH (n:A) | (n:B) RETURN n.v AS v ORDER BY v").await;
+    let disjunction = query(&mut s, "MATCH (n:A|B) RETURN n.v AS v ORDER BY v").await;
+    assert_eq!(
+        alternation.schema.field_with_name("v").unwrap().data_type(),
+        disjunction.schema.field_with_name("v").unwrap().data_type()
+    );
+    assert_eq!(rows(&alternation), rows(&disjunction));
+
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {name:'a'}), (:B {name:'b'})")
+        .await
+        .unwrap();
+    s.run("MATCH (n:A) | (n:B) SET n.flag = true RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(
+            &query(
+                &mut s,
+                "MATCH (n:A|B) RETURN n.name AS name, n.flag AS flag ORDER BY name"
+            )
+            .await
+        ),
+        vec![vec!["a", "true"], vec!["b", "true"]]
+    );
+
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:N)-[:E {v:1}]->(:N), (:N)-[:F {v:1.5, w:true}]->(:N)").await.unwrap();
+    let edges = query(
+        &mut s,
+        "MATCH ()-[e:E]->() | ()-[e:F]->() RETURN e.v AS v, e.w AS w ORDER BY v",
+    )
+    .await;
+    assert_eq!(
+        edges.schema.field_with_name("v").unwrap().data_type(),
+        &DataType::Float64
+    );
+    assert_eq!(
+        edges.schema.field_with_name("w").unwrap().data_type(),
+        &DataType::Boolean
+    );
+    assert_eq!(rows(&edges), vec![vec!["1", "NULL"], vec!["1.5", "true"]]);
 }
 #[tokio::test]
 async fn alternation_and_nested_quantifiers_compose_inside_recursion() {
@@ -241,6 +539,29 @@ async fn group_scope_limits_and_runtime_errors_are_atomic() {
 }
 
 #[tokio::test]
+async fn independent_repeated_group_reuses_one_step() {
+    let mut s = graph().await;
+    let shared = "MATCH p = (a)((x)-[:E]->{1,1}(y)){1,2}(b) RETURN a.name AS a, b.name AS b, PATH_LENGTH(p) AS hops ORDER BY a, hops, b";
+    let result = query(&mut s, shared).await;
+    assert!(
+        !result.logical_plan.contains("step_row"),
+        "{}",
+        result.logical_plan
+    );
+    let flat = "MATCH p = (a)-[:E]->{1,2}(b) RETURN a.name AS a, b.name AS b, PATH_LENGTH(p) AS hops ORDER BY a, hops, b";
+    assert_eq!(rows(&result), rows(&query(&mut s, flat).await));
+    let dependent =
+        "MATCH (a)((x)-[:Loop]->{1,1}(y WHERE x.name = a.name)){1}(b) RETURN a.name AS a, b.name AS b";
+    let dependent_result = query(&mut s, dependent).await;
+    assert!(
+        dependent_result.logical_plan.contains("step_row"),
+        "{}",
+        dependent_result.logical_plan
+    );
+    assert_eq!(rows(&dependent_result), vec![vec!["A", "A"]]);
+}
+
+#[tokio::test]
 async fn groups_match_flat_expansions_and_keep_ordered_bindings() {
     let mut s = graph().await;
     for mode in ["WALK", "TRAIL", "SIMPLE", "ACYCLIC"] {
@@ -286,6 +607,78 @@ async fn groups_match_flat_expansions_and_keep_ordered_bindings() {
 }
 
 #[tokio::test]
+async fn selective_search_uses_the_node_bound_under_different_edges() {
+    let mut s = graph().await;
+    // Four nodes and six edges. Zero-or-more selection is complete by hop 3.
+    let q =
+        "MATCH p = ANY SHORTEST (a {name:'A'})-[:E]->*(d {name:'D'}) RETURN PATH_LENGTH(p) AS hops";
+    let result = query(&mut s, q).await;
+    assert_eq!(rows(&result), vec![vec!["2"]]);
+    assert!(
+        result.logical_plan.contains("< UInt64(3)"),
+        "{}",
+        result.logical_plan
+    );
+    assert!(
+        !result.logical_plan.contains("< UInt64(6)"),
+        "{}",
+        result.logical_plan
+    );
+    let q = "MATCH p = ALL SHORTEST (a {name:'A'})-[:E]->+(d) RETURN d.name AS name, PATH_LENGTH(p) AS hops ORDER BY name, hops";
+    let open = query(&mut s, q).await;
+    assert_eq!(
+        rows(&open),
+        rows(&query(&mut s, &q.replace("->+", "->{1,8}")).await)
+    );
+    assert!(
+        open.logical_plan.contains("< UInt64(4)"),
+        "{}",
+        open.logical_plan
+    );
+
+    let anonymous = "MATCH p = ALL SHORTEST ()-[:E]->+(d) RETURN d.name AS name, PATH_LENGTH(p) AS hops ORDER BY name, hops";
+    let seeded = query(&mut s, anonymous).await;
+    assert_eq!(
+        rows(&seeded),
+        rows(&query(&mut s, &anonymous.replace("->+", "->{1,8}")).await)
+    );
+    assert!(
+        seeded.logical_plan.contains("< UInt64(4)"),
+        "{}",
+        seeded.logical_plan
+    );
+
+    // The unique A-to-D route has length 3, equal to the zero-or-more bound.
+    s.execute("CREATE GRAPH line ANY; SESSION SET GRAPH line")
+        .unwrap();
+    s.run(
+        "INSERT (a:N {name:'A'})-[:E]->(b:N {name:'B'})-[:E]->(c:N {name:'C'})-[:E]->(d:N {name:'D'}), \
+         (b)-[:E]->(a), (c)-[:E]->(a), (c)-[:E]->(b), (d)-[:E]->(a), (d)-[:E]->(b)",
+    )
+    .await
+    .unwrap();
+    let q =
+        "MATCH p = ANY SHORTEST (a {name:'A'})-[:E]->*(d {name:'D'}) RETURN PATH_LENGTH(p) AS hops";
+    let result = query(&mut s, q).await;
+    assert_eq!(rows(&result), vec![vec!["3"]]);
+    assert!(
+        result.logical_plan.contains("< UInt64(3)"),
+        "{}",
+        result.logical_plan
+    );
+    for selector in ["ALL SHORTEST", "SHORTEST 2 GROUPS"] {
+        let q = format!(
+            "MATCH p = {selector} (a {{name:'A'}})-[:E]->*(b) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY name, hops"
+        );
+        assert_eq!(
+            rows(&query(&mut s, &q).await),
+            rows(&query(&mut s, &q.replace("-[:E]->*", "-[:E]->{0,8}")).await),
+            "{q}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unbounded_homogeneous_selection_uses_complete_finite_bounds() {
     let mut s = graph().await;
     for selector in [
@@ -327,6 +720,61 @@ async fn unbounded_homogeneous_selection_uses_complete_finite_bounds() {
         .contains("unbounded"));
     let q = q.replace("->*(b", "->{0,8}(b");
     assert_eq!(rows(&query(&mut s, &q).await), vec![vec!["8"]]);
+}
+
+#[tokio::test]
+async fn shared_elements_accept_an_empty_alternative_in_either_order() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {v:1})")
+        .await
+        .unwrap();
+    for q in [
+        "MATCH (n:A) | (n:Missing) RETURN n.v AS v",
+        "MATCH (n:Missing) | (n:A) RETURN n.v AS v",
+    ] {
+        let result = query(&mut s, q).await;
+        assert_eq!(rows(&result), vec![vec!["1"]]);
+        assert_eq!(result.schema.field(0).data_type(), &DataType::Int64);
+    }
+}
+
+#[tokio::test]
+async fn plain_repeated_group_expands_from_the_frontier() {
+    let mut s = graph().await;
+    let q =
+        "MATCH (a {name:'A'})((x)-[:E]->(m)-[:E]->(y)){1,2}(b) RETURN b.name AS name ORDER BY name";
+    let result = query(&mut s, q).await;
+    assert_eq!(
+        rows(&result),
+        vec![vec!["B"], vec!["C"], vec!["D"], vec!["D"]]
+    );
+    let plan = &result.logical_plan;
+    let recursive = plan.find("RecursiveQuery").expect(plan);
+    let body = &plan[recursive..];
+    assert!(
+        body.contains("__gf_from"),
+        "plain group must read edges inside the recursive term:\n{plan}"
+    );
+    assert!(
+        !body.contains("__gf_step_row"),
+        "plain group must not join a precomputed step:\n{plan}"
+    );
+    let outer = "MATCH (a {name:'A'})((x)-[:E]->(y) WHERE y.name <> a.name){1,3}(b) RETURN b.name AS name ORDER BY name";
+    assert_eq!(
+        rows(&query(&mut s, outer).await),
+        vec![vec!["B"], vec!["C"], vec!["D"], vec!["D"]]
+    );
+    let nested = query(
+        &mut s,
+        "MATCH p = (a {name:'A'})((x)-[:E]->{1,2}(y)){1,2}(b) RETURN MAX(PATH_LENGTH(p)) AS longest",
+    )
+    .await;
+    assert_eq!(rows(&nested), vec![vec!["4"]]);
+    assert!(
+        nested.logical_plan.contains("__gf_step_nodes"),
+        "a quantified body still freezes its step:\n{}",
+        nested.logical_plan
+    );
 }
 
 #[tokio::test]
@@ -377,4 +825,16 @@ async fn match_where_keeps_conditional_and_group_predicates() {
     assert_eq!(rows(&query(&mut s, inline).await), vec![vec!["Y"]]);
     let singleton = "MATCH (n)-[:E]->(m) WHERE n.a = 1 RETURN m.name AS m ORDER BY m";
     assert_eq!(rows(&query(&mut s, singleton).await), vec![vec!["Y"]]);
+}
+
+#[tokio::test]
+async fn conditional_where_preserves_stored_property_types() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (a:N {a:1})-[:E]->(:N {a:0}),(:Text {a:'text'})").await.unwrap();
+    let r = query(
+        &mut s,
+        "MATCH ((n)-[:E]->(m))?(end) WHERE n.a = 1 RETURN end.a AS a",
+    )
+    .await;
+    assert_eq!(rows(&r), vec![vec!["0"]]);
 }
