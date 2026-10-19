@@ -15,6 +15,6 @@ RETURN PERCENTILE_CONT(value, 0.5) AS continuous,
 
 The continuous result interpolates (25 here) and has Float64 type. An integer continuous percentile interpolates the exact integers and rounds that blend once to Float64. The discrete result chooses an input value (20 here) and preserves its numeric type, including exact Int64 values. Null inputs are omitted; ALL/DISTINCT controls duplicate contribution.
 
-The rank multiplies the fraction by the sample size in floating point. A product that rounds to within a few ULPs of an integer is treated as that integer, so 25 sorted values at 0.28 select the 7th observation, and a continuous fraction that lands on an order statistic returns that observation.
+Decimal fractions that land exactly on an order statistic select that observation: 25 sorted values at 0.28 select the 7th value. Nearby fractions retain their fractional rank and interpolation weight.
 
 Out-of-range or row-dependent fractions are errors. Use [GROUP BY](/query/group-by/) for per-group percentiles.

@@ -979,10 +979,12 @@ async fn percentile_nulls_extremes_distinct_and_discrete_exact_values() {
         &[&["7", "8"]],
     )
     .await;
+    // Division yields an approximate Float64 fraction, whose non-integer
+    // rank retains its interpolation weight.
     check(
         &mut s,
         "FOR x IN [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23] RETURN PERCENTILE_CONT(x, 15.0 / 22.0) AS c",
-        &[&["16"]],
+        &[&["15.999999999999998"]],
     )
     .await;
     check(
@@ -1435,4 +1437,31 @@ async fn tiny_positive_percentiles_keep_their_weight_and_repeated_ordering() {
         "FOR x IN [0,1,2] RETURN DISTINCT PERCENTILE_CONT(x,0.5) AS p ORDER BY PERCENTILE_CONT(x,0.5)",
         "FOR x IN [0,1,2] RETURN DISTINCT PERCENTILE_DISC(x,0.5) AS p ORDER BY PERCENTILE_DISC(x,0.5)",
     ] { check(&mut session,query,&[&["1"]]).await; }
+}
+
+#[tokio::test]
+async fn percentile_rank_keeps_a_legitimate_offset_above_an_integer() {
+    let mut session = fixture().await;
+    let result = query(
+        &mut session,
+        "FOR x IN [0,0,1000000000000000000] RETURN PERCENTILE_CONT(x,0.5000000000000001) AS value",
+    )
+    .await;
+    let value = result.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Float64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(value, 1e18 * f64::EPSILON);
+    let values = (1..=25)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    check(
+        &mut session,
+        &format!("FOR x IN [{values}] RETURN PERCENTILE_DISC(x,0.2800000000000001) AS value"),
+        &[&["8"]],
+    )
+    .await;
 }
