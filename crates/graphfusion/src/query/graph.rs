@@ -1,3 +1,4 @@
+use super::casefold::{CaseFoldMap, CaseFoldSet};
 use super::{expressions::Binder, native::NativePush};
 use crate::{
     catalog::ObjectId,
@@ -57,25 +58,37 @@ impl ElementBinding {
             name,
         ))
     }
+    fn stored_property<'a>(&'a self, name: &str) -> Option<&'a str> {
+        self.properties
+            .keys()
+            .find(|stored| stored.eq_ignore_ascii_case(name))
+            .map(String::as_str)
+    }
     fn raw_property(&self, name: &str) -> Expr {
-        if self.properties.contains_key(name) {
-            self.column(name)
-        } else {
-            lit(ScalarValue::Null)
+        match self.stored_property(name) {
+            Some(stored) => self.column(stored),
+            None => lit(ScalarValue::Null),
         }
     }
     pub fn property(&self, name: &str) -> Expr {
-        let data_type = self.properties.get(name).cloned().unwrap_or(DataType::Null);
+        let data_type = self
+            .stored_property(name)
+            .and_then(|stored| self.properties.get(stored))
+            .cloned()
+            .unwrap_or(DataType::Null);
         self.ensure_live(self.raw_property(name), data_type)
     }
     pub fn property_exists(&self, name: &str) -> Expr {
-        let value = self.present.get(name).map_or_else(
-            || lit(false),
-            |column| {
-                self.column(column)
-                    .and(self.raw_property(name).is_not_null())
-            },
-        );
+        let value = self
+            .stored_property(name)
+            .and_then(|stored| self.present.get(stored))
+            .map_or_else(
+                || lit(false),
+                |column| {
+                    self.column(column)
+                        .and(self.raw_property(name).is_not_null())
+                },
+            );
         self.ensure_live(self.nullable_predicate(value), DataType::Boolean)
     }
     pub fn label(&self, label: &ast::LabelExpression) -> Expr {
@@ -193,17 +206,17 @@ fn reject_deleted(flags: &dyn Array) -> datafusion::error::Result<()> {
 
 #[derive(Clone, Default)]
 pub(super) struct Bindings {
-    pub scalars: BTreeMap<String, Column>,
-    pub elements: BTreeMap<String, ElementBinding>,
+    pub scalars: CaseFoldMap<Column>,
+    pub elements: CaseFoldMap<ElementBinding>,
     pub order: Vec<String>,
-    pub conditional: BTreeSet<String>,
-    pub groups: BTreeSet<String>,
-    pub references: BTreeMap<String, super::references::ReferenceBinding>,
+    pub conditional: CaseFoldSet,
+    pub groups: CaseFoldSet,
+    pub references: CaseFoldMap<super::references::ReferenceBinding>,
     pub sources: BTreeMap<ObjectId, std::sync::Arc<GraphData>>,
-    pub domains: BTreeMap<String, super::references::Domain>,
+    pub domains: CaseFoldMap<super::references::Domain>,
     /// Element a `LET` name was copied from. Resolving that reference reads
     /// the source label set instead of every fragment of the element kind.
-    pub reference_sources: BTreeMap<String, ElementBinding>,
+    pub reference_sources: CaseFoldMap<Vec<ElementBinding>>,
     next: usize,
 }
 impl Bindings {
@@ -219,9 +232,12 @@ impl Bindings {
         self.scalars.contains_key(name) || self.elements.contains_key(name)
     }
     pub fn scalar(&mut self, name: &str) -> Column {
+        if let Some(column) = self.scalars.get(name) {
+            return column.clone();
+        }
         let column = Column::new_unqualified(format!("__gf_scalar_{}", self.next));
         self.next += 1;
-        self.scalars.insert(name.into(), column.clone());
+        self.scalars.insert(name, column.clone());
         self.order.push(name.into());
         column
     }
@@ -265,10 +281,10 @@ pub(super) async fn matches(
         Some(predicate) if !where_runs_after_search(clause, session)? => {
             match super::native::clause_filters(session, plan.schema(), scope, predicate)? {
                 Some(filters) => (filters, true),
-                None => (BTreeMap::new(), false),
+                None => (CaseFoldMap::new(), false),
             }
         }
-        _ => (BTreeMap::new(), false),
+        _ => (CaseFoldMap::new(), false),
     };
     let mut compiler = super::patterns::Compiler {
         session,
@@ -280,7 +296,7 @@ pub(super) async fn matches(
         predicates: Vec::new(),
         clause_filters,
         clause_push,
-        clause_hit: BTreeSet::new(),
+        clause_hit: CaseFoldSet::new(),
         match_filter: clause.where_clause.clone(),
     };
     let mut edge_lists: Vec<Expr> = Vec::new();
@@ -416,7 +432,7 @@ pub(super) fn declare(scope: &mut Bindings, name: &str, binding: &ElementBinding
             "variable {name} is already bound"
         )));
     }
-    scope.elements.insert(name.into(), binding.clone());
+    scope.elements.insert(name, binding.clone());
     scope.order.push(name.into());
     Ok(())
 }
@@ -687,13 +703,16 @@ fn scan_tables(
     // an empty aggregate does not invent a group from a constant null. The
     // columns stay untyped: copying another label's type makes `n.id = 1` fail
     // when some unrelated fragment stores that name as a string.
+    for (table, _) in &scanned {
+        graph::validate_query_property_names(table.schema.as_ref())?;
+    }
     let properties = if let Some(before) = refresh_of {
         before.properties.clone()
     } else if scanned.is_empty() && inserted.is_none() {
         let mut properties = BTreeMap::new();
         for (table, _) in &all_tables {
             for field in table.schema.fields() {
-                if !field.name().starts_with("__gf_") {
+                if !graph::is_reserved_property(field.name()) {
                     properties
                         .entry(field.name().clone())
                         .or_insert(DataType::Null);
@@ -842,7 +861,7 @@ fn scan_tables(
                 ]);
             }
             for (name, data_type) in &binding.properties {
-                let field = table.schema.field_with_name(name).ok();
+                let field = graph::property_field(table.schema.as_ref(), name);
                 // A neighbor fragment can store the same name differently. Cast
                 // only a widening that fits; an incompatible value stays null
                 // instead of failing the rows this fragment does not describe.
@@ -852,9 +871,13 @@ fn scan_tables(
                 });
                 projections.push(if compatible {
                     if field.is_some_and(|field| field.data_type() == data_type) {
-                        col(name)
+                        col(field.expect("compatible property").name()).alias(name)
                     } else {
-                        cast(col(name), data_type.clone()).alias(name)
+                        cast(
+                            col(field.expect("compatible property").name()),
+                            data_type.clone(),
+                        )
+                        .alias(name)
                     }
                 } else {
                     lit(ScalarValue::try_from(data_type)?).alias(name)
@@ -928,17 +951,22 @@ fn one_label_apart(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
 
 fn shares_property(table: &Table, before: &ElementBinding) -> bool {
     table.schema.fields().iter().any(|field| {
-        !field.name().starts_with("__gf_") && before.properties.contains_key(field.name())
+        !graph::is_reserved_property(field.name())
+            && before
+                .properties
+                .keys()
+                .any(|stored| stored.eq_ignore_ascii_case(field.name()))
     })
 }
 
 fn properties_fit(table: &Table, before: &ElementBinding) -> bool {
     table.schema.fields().iter().all(|field| {
-        field.name().starts_with("__gf_")
+        graph::is_reserved_property(field.name())
             || before
                 .properties
-                .get(field.name())
-                .is_none_or(|bound| graph::property_fits(field.data_type(), bound))
+                .iter()
+                .find(|(stored, _)| stored.eq_ignore_ascii_case(field.name()))
+                .is_none_or(|(_, bound)| graph::property_fits(field.data_type(), bound))
     })
 }
 
@@ -972,4 +1000,78 @@ pub(super) fn label_holds(labels: &BTreeSet<String>, expression: &ast::LabelExpr
 
 fn col(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{graph::NodeTable, transaction::StatementTxn, Database};
+    use datafusion::arrow::{
+        array::{Int64Array, UInt64Array},
+        datatypes::{Field, Schema},
+        record_batch::RecordBatch,
+    };
+
+    #[tokio::test]
+    async fn ambiguous_imported_property_case_does_not_lose_columns_on_update() {
+        let db = Database::new();
+        let mut s = db.session();
+        s.execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+            .unwrap();
+        let id = s.state().current_graph.unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(crate::graph::ID, DataType::UInt64, false),
+            Field::new("age", DataType::Int64, false),
+            Field::new("AGE", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(Int64Array::from(vec![20])),
+            ],
+        )
+        .unwrap();
+        let committed = s
+            .replace_graph_data(
+                GraphData::try_new(
+                    vec![NodeTable::try_new(vec!["N".into()], schema, vec![batch]).unwrap()],
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let result = s.run("MATCH(n) SET n.age=99").await;
+        assert!(
+            matches!(result,Err(Error::InvalidQuery(ref message)) if message.contains("ambiguous")),
+            "{result:?}"
+        );
+        assert!(s.query("MATCH(n) RETURN n.age").await.is_err());
+        let mut read = StatementTxn::begin(&db).unwrap();
+        assert_eq!(read.base.commit_seq, committed);
+        let data = read.graph_data(id).unwrap();
+        let batch = &data.nodes[0].0.batches[0];
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec![crate::graph::ID.to_string(), "age".into(), "AGE".into()]
+        );
+        for (name, value) in [("age", 10), ("AGE", 20)] {
+            assert_eq!(
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                value
+            );
+        }
+    }
 }

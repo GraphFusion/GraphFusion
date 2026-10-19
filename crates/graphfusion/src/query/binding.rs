@@ -67,8 +67,7 @@ pub(super) async fn source(
 
 fn parameter_table(session: &SessionState, name: &str) -> Result<LogicalPlan> {
     let parameter = session
-        .parameters
-        .get(name)
+        .parameter(name)
         .ok_or_else(|| Error::NotFound(format!("parameter {name}")))?;
     let Value::BindingTable(rows) = &parameter.value else {
         return Err(Error::InvalidQuery(format!(

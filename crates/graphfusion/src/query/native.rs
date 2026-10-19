@@ -10,6 +10,7 @@
 //! compare the stringified column instead.
 
 use super::{
+    casefold::CaseFoldMap,
     expressions::Binder,
     graph::{Bindings, ElementBinding, ElementKind},
 };
@@ -172,7 +173,7 @@ pub(super) fn clause_filters(
     schema: &DFSchema,
     scope: &Bindings,
     expr: &ast::Expr,
-) -> Result<Option<BTreeMap<String, NativeAtom>>> {
+) -> Result<Option<CaseFoldMap<NativeAtom>>> {
     filters_with_values(session, schema, scope, expr, false)
 }
 
@@ -182,7 +183,7 @@ fn filters_with_values(
     scope: &Bindings,
     expr: &ast::Expr,
     working_row: bool,
-) -> Result<Option<BTreeMap<String, NativeAtom>>> {
+) -> Result<Option<CaseFoldMap<NativeAtom>>> {
     let Some(parts) = partition(expr) else {
         return Ok(None);
     };
@@ -191,10 +192,15 @@ fn filters_with_values(
     if parts.contains_key(CLOSED) {
         return Ok(None);
     }
-    let mut filters = BTreeMap::new();
+    let mut filters = CaseFoldMap::new();
     for (variable, local) in parts {
         let Some(atom) = bind_local_value(session, schema, scope, &local, working_row)? else {
             return Ok(None);
+        };
+        // `n` and `N` are one variable, so combine their conjuncts.
+        let atom = match filters.remove(&variable) {
+            Some(existing) => NativeAtom::And(Box::new(existing), Box::new(atom)),
+            None => atom,
         };
         filters.insert(variable, atom);
     }
@@ -258,10 +264,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
         } => {
             let mut conflict = None;
             for table in tables {
-                let stored = table
-                    .schema
-                    .field_with_name(property)
-                    .ok()
+                let stored = crate::graph::property_field(table.schema.as_ref(), property)
                     .map(|field| field.data_type().clone());
                 if unify_coalesce(stored.as_ref(), fallbacks, right_type).is_some() {
                     return Ok(());
@@ -292,7 +295,7 @@ fn validate_comparison(
     let mut stored = None;
     let mut absent = false;
     for table in tables {
-        let Some(field) = table.schema.field_with_name(property).ok() else {
+        let Some(field) = crate::graph::property_field(table.schema.as_ref(), property) else {
             absent = true;
             continue;
         };
@@ -336,6 +339,12 @@ fn qualified_column(qualifier: Option<&str>, property: &str) -> Expr {
         Some(alias) => Expr::Column(Column::new(Some(TableReference::bare(alias)), property)),
         None => column(property),
     }
+}
+
+fn qualified_property(schema: &Schema, qualifier: Option<&str>, property: &str) -> Expr {
+    let stored = crate::graph::property_field(schema, property)
+        .map_or(property, |field| field.name().as_str());
+    qualified_column(qualifier, stored)
 }
 
 fn compile_in(
@@ -420,7 +429,7 @@ fn compile_in(
             value_type,
         } => compare_property(
             schema,
-            &qualified_column(qualifier, property),
+            &qualified_property(schema, qualifier, property),
             property,
             *op,
             value.clone(),
@@ -489,13 +498,10 @@ fn compare_property(
     value: Expr,
     value_type: &DataType,
 ) -> Result<Expr> {
-    let Some(stored) = schema
-        .field_with_name(property)
-        .ok()
-        .map(|field| field.data_type().clone())
-    else {
+    let Some(field) = crate::graph::property_field(schema, property) else {
         return Ok(unknown());
     };
+    let stored = field.data_type().clone();
     if !comparable(&stored, value_type) {
         return Ok(unknown());
     }
@@ -533,11 +539,14 @@ fn null_expr(
     negated: bool,
     qualifier: Option<&str>,
 ) -> Expr {
-    let name = property.unwrap_or(crate::graph::ID);
-    // Internal storage fields are not user properties.
-    if property.is_some_and(|name| name.starts_with("__gf_"))
-        || schema.field_with_name(name).is_err()
-    {
+    let name = match property {
+        Some(property) => match crate::graph::property_field(schema, property) {
+            Some(field) => field.name().as_str(),
+            None => return lit(!negated),
+        },
+        None => crate::graph::ID,
+    };
+    if schema.field_with_name(name).is_err() {
         return lit(!negated);
     }
     let value = qualified_column(qualifier, name);
@@ -552,8 +561,8 @@ fn exists_expr(schema: &Schema, property: &str, qualifier: Option<&str>) -> Expr
     if schema.field_with_name(crate::graph::ID).is_err() {
         return unknown();
     }
-    let present = if !property.starts_with("__gf_") && schema.field_with_name(property).is_ok() {
-        qualified_column(qualifier, property).is_not_null()
+    let present = if crate::graph::property_field(schema, property).is_some() {
+        qualified_property(schema, qualifier, property).is_not_null()
     } else {
         lit(false)
     };
@@ -673,7 +682,7 @@ fn element_id_comparison(expr: &ast::Expr, variable: &str) -> Option<Local> {
             Some(Local::ElementSelf { op })
         }
         (ast::Expr::ElementId { variable: name }, other)
-            if name.value == variable && !mentions(other, variable) =>
+            if name.value.eq_ignore_ascii_case(variable) && !mentions(other, variable) =>
         {
             Some(Local::ElementCompare {
                 op,
@@ -681,7 +690,7 @@ fn element_id_comparison(expr: &ast::Expr, variable: &str) -> Option<Local> {
             })
         }
         (other, ast::Expr::ElementId { variable: name })
-            if name.value == variable && !mentions(other, variable) =>
+            if name.value.eq_ignore_ascii_case(variable) && !mentions(other, variable) =>
         {
             Some(Local::ElementCompare {
                 op: flip(op),
@@ -899,23 +908,28 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
         ast::Expr::PropertyExists {
             variable: name,
             property,
-        } if name.value == variable => Some(Local::Exists {
+        } if name.value.eq_ignore_ascii_case(variable) => Some(Local::Exists {
             property: property.value.clone(),
         }),
         ast::Expr::IsLabeled {
             variable: name,
             negated,
             label_expression,
-        } if name.value == variable => Some(Local::Labeled {
+        } if name.value.eq_ignore_ascii_case(variable) => Some(Local::Labeled {
             expression: label_expression.clone(),
             negated: *negated,
         }),
         ast::Expr::IsDirected {
             variable: name,
             negated,
-        } if name.value == variable => Some(Local::Directed { negated: *negated }),
+        } if name.value.eq_ignore_ascii_case(variable) => {
+            Some(Local::Directed { negated: *negated })
+        }
         ast::Expr::Same { variables }
-            if !variables.is_empty() && variables.iter().all(|name| name.value == variable) =>
+            if !variables.is_empty()
+                && variables
+                    .iter()
+                    .all(|name| name.value.eq_ignore_ascii_case(variable)) =>
         {
             Some(Local::Identity {
                 different: false,
@@ -923,7 +937,10 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             })
         }
         ast::Expr::AllDifferent { variables }
-            if !variables.is_empty() && variables.iter().all(|name| name.value == variable) =>
+            if !variables.is_empty()
+                && variables
+                    .iter()
+                    .all(|name| name.value.eq_ignore_ascii_case(variable)) =>
         {
             Some(Local::Identity {
                 different: true,
@@ -992,13 +1009,14 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
                     negated: *negated,
                 });
             }
-            if matches!(expr.as_ref(), ast::Expr::Identifier(name) if name.value == variable) {
+            if matches!(expr.as_ref(), ast::Expr::Identifier(name) if name.value.eq_ignore_ascii_case(variable))
+            {
                 return Some(Local::Null {
                     property: None,
                     negated: *negated,
                 });
             }
-            if matches!(expr.as_ref(), ast::Expr::ElementId { variable: name } if name.value == variable)
+            if matches!(expr.as_ref(), ast::Expr::ElementId { variable: name } if name.value.eq_ignore_ascii_case(variable))
             {
                 return Some(Local::Null {
                     property: None,
@@ -1067,7 +1085,9 @@ fn property_of(expr: &ast::Expr, variable: &str) -> Option<String> {
     let ast::Expr::Identifier(name) = base.as_ref() else {
         return None;
     };
-    (name.value == variable).then(|| key.value.clone())
+    name.value
+        .eq_ignore_ascii_case(variable)
+        .then(|| key.value.clone())
 }
 
 fn flip(op: Operator) -> Operator {
@@ -1299,7 +1319,12 @@ fn bind_value(
 fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
     if let ast::Expr::Property { base, .. } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
-            names.insert(name.value.clone());
+            if !names
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&name.value))
+            {
+                names.insert(name.value.to_ascii_lowercase());
+            }
         }
     }
     for child in children(expr) {
@@ -1335,12 +1360,12 @@ fn named_variable(expr: &ast::Expr, variable: &str) -> bool {
         | ast::Expr::PropertyExists { variable: name, .. }
         | ast::Expr::ElementId { variable: name }
         | ast::Expr::IsDirected { variable: name, .. }
-        | ast::Expr::IsLabeled { variable: name, .. } => name.value == variable,
-        ast::Expr::Same { variables } | ast::Expr::AllDifferent { variables } => {
-            variables.iter().any(|name| name.value == variable)
-        }
+        | ast::Expr::IsLabeled { variable: name, .. } => name.value.eq_ignore_ascii_case(variable),
+        ast::Expr::Same { variables } | ast::Expr::AllDifferent { variables } => variables
+            .iter()
+            .any(|name| name.value.eq_ignore_ascii_case(variable)),
         ast::Expr::SourceDestination { node, edge, .. } => {
-            node.value == variable || edge.value == variable
+            node.value.eq_ignore_ascii_case(variable) || edge.value.eq_ignore_ascii_case(variable)
         }
         _ => false,
     }
@@ -1664,9 +1689,9 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
         NativeAtom::Coalesce(args) => args.iter().any(|atom| atom_mixes(atom, tables)),
         NativeAtom::NullIf(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
         NativeAtom::NullIfNull { property, .. } | NativeAtom::ValueCoalesce { property, .. }
-            if tables
-                .iter()
-                .any(|table| table.schema.field_with_name(property).is_err()) =>
+            if tables.iter().any(|table| {
+                crate::graph::property_field(table.schema.as_ref(), property).is_none()
+            }) =>
         {
             true
         }
@@ -1675,7 +1700,8 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
         | NativeAtom::ValueCoalesce { property, .. } => {
             let mut seen: Vec<&DataType> = Vec::new();
             for table in tables {
-                let Some(field) = table.schema.field_with_name(property).ok() else {
+                let Some(field) = crate::graph::property_field(table.schema.as_ref(), property)
+                else {
                     continue;
                 };
                 let data_type = field.data_type();
@@ -1801,10 +1827,8 @@ fn nullif_is_null(
     negated: bool,
     qualifier: Option<&str>,
 ) -> Result<Expr> {
-    let Some(stored) = schema
-        .field_with_name(property)
-        .ok()
-        .map(|field| field.data_type().clone())
+    let Some(stored) =
+        crate::graph::property_field(schema, property).map(|field| field.data_type().clone())
     else {
         // The property is absent, so it is null. NULLIF of null is null.
         return Ok(lit(!negated));
@@ -1812,7 +1836,7 @@ fn nullif_is_null(
     if !comparable(&stored, value_type) {
         return Ok(unknown());
     }
-    let mut left = qualified_column(qualifier, property);
+    let mut left = qualified_property(schema, qualifier, property);
     let mut right = value;
     if *value_type == DataType::Null {
         right = cast(right, stored);
@@ -1837,17 +1861,15 @@ fn value_coalesce(
     right_type: &DataType,
     qualifier: Option<&str>,
 ) -> Result<Expr> {
-    let stored = schema
-        .field_with_name(property)
-        .ok()
-        .map(|field| field.data_type().clone());
+    let stored =
+        crate::graph::property_field(schema, property).map(|field| field.data_type().clone());
     let Some(unified) = unify_coalesce(stored.as_ref(), fallbacks, right_type) else {
         return Ok(unknown());
     };
     let mut args = Vec::new();
     if let Some(stored) = &stored {
         args.push(cast_to(
-            qualified_column(qualifier, property),
+            qualified_property(schema, qualifier, property),
             stored,
             &unified,
         ));

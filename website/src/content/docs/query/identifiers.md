@@ -7,6 +7,13 @@ sidebar:
 
 Regular identifiers accept Unicode letters and digits. Use delimited identifiers for spaces, punctuation or keyword-like names. Identifier spelling is preserved; catalog names are case-sensitive after decoding.
 
+Query variables, property names and parameters compare without regard to ASCII case, the same way the parser rejects `name` and `NAME` as duplicates. The first spelling is the one stored, so `SET n.AGE = 31` updates a property inserted as `age`. Labels stay case-sensitive: `:Person` and `:person` are different labels, and graph `g` is not graph `G`.
+
+```gql test
+MATCH (n:Person) WHERE n.AGE >= 40
+RETURN N.name AS name;
+```
+
 ```gql test
 LET `display name` = 'Alice'
 RETURN `display name` AS name;

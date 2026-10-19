@@ -17,10 +17,14 @@ impl Compiler<'_> {
         alternation: ast::PathPatternAlternation,
     ) -> Result<(Plan, State)> {
         let incoming = input.schema().columns();
-        let mut names = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         for (_, branch, _) in &branches {
             for name in &branch.order {
-                if !scope.contains(name) && !names.contains(name) {
+                if !scope.contains(name)
+                    && !names
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(name))
+                {
                     names.push(name.clone());
                 }
             }

@@ -408,3 +408,26 @@ async fn composite_reference_ordering_keeps_source_types_and_column_shape() {
     assert_eq!(r.schema.fields().len(), 1);
     assert_eq!(r.schema.field(0).name(), "n");
 }
+
+#[tokio::test]
+async fn composite_reference_layouts_include_only_participating_labels_and_graphs() {
+    let mut s = graph().await;
+    s.run("INSERT (:A {v:2}),(:B {v:10}),(:Document {v:'text'}); CREATE GRAPH other ANY; USE GRAPH other INSERT (:B {v:10}),(:Document {v:'other'})").await.unwrap();
+    for q in [
+        "MATCH(n:A) RETURN n UNION ALL MATCH(n:B) RETURN n ORDER BY n.v NEXT RETURN n.v+0 AS v",
+        "MATCH(n:A) RETURN n UNION ALL USE GRAPH other MATCH(n:B) RETURN n ORDER BY n.v+0 NEXT LET copy=n RETURN copy.v+0 AS v",
+    ] { check(&mut s, q, &[&["2"],&["10"]]).await; }
+}
+
+#[tokio::test]
+async fn case_folded_composite_aliases_keep_reference_domains_and_layouts() {
+    let mut s = graph().await;
+    s.run("INSERT (:Document {v:'text'})").await.unwrap();
+    check(&mut s,"MATCH(n:N) RETURN n AS r UNION ALL MATCH(n:N) RETURN n AS R NEXT YIELD R AS item RETURN item.v+0 AS v ORDER BY v",&[&["1"],&["1"],&["2"],&["2"],&["3"],&["3"]]).await;
+    check(
+        &mut s,
+        "MATCH(n:N) RETURN n AS r UNION ALL RETURN NULL AS R ORDER BY R.v NEXT RETURN r.v AS v",
+        &[&["1"], &["2"], &["3"], &["NULL"]],
+    )
+    .await;
+}

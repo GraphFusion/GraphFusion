@@ -2,6 +2,7 @@
 mod aggregates;
 mod arithmetic;
 mod binding;
+mod casefold;
 mod execution;
 mod expressions;
 mod graph;
@@ -183,8 +184,8 @@ async fn drive_chain(
         return Err(Error::InvalidQuery("query chain is empty".into()));
     }
     let mut carried_graph = session.current_graph;
-    let mut carried_domains = BTreeMap::new();
-    let mut carried_sources = BTreeMap::new();
+    let mut carried_domains = references::Domains::new();
+    let mut carried_sources = references::ReferenceSources::new();
     let mut working = None;
     let last = chain.len() - 1;
     for (index, (yield_clause, query)) in chain.iter().enumerate() {
@@ -226,7 +227,7 @@ async fn drive_chain(
 fn apply_yield(
     plan: LogicalPlan,
     yield_clause: Option<&ast::YieldClause>,
-    domains: &mut BTreeMap<String, references::Domain>,
+    domains: &mut references::Domains,
     reference_sources: &mut references::ReferenceSources,
 ) -> Result<LogicalPlan> {
     let Some(yield_clause) = yield_clause else {
@@ -246,7 +247,7 @@ fn apply_yield(
     }
     let mut projections = Vec::new();
     let mut renamed = BTreeMap::new();
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = casefold::CaseFoldSet::new();
     for item in &yield_clause.items {
         let ast::YieldItem::Item { name, alias } = item else {
             continue;
@@ -262,7 +263,7 @@ fn apply_yield(
             .schema()
             .columns()
             .into_iter()
-            .find(|column| column.name() == name.value)
+            .find(|column| column.name().eq_ignore_ascii_case(&name.value))
             .ok_or_else(|| Error::InvalidQuery(format!("unbound yield column {}", name.value)))?;
         projections.push(Expr::Column(column).alias(&output.value));
         renamed.insert(output.value.clone(), name.value.clone());
@@ -270,9 +271,14 @@ fn apply_yield(
     if projections.is_empty() {
         return Err(Error::InvalidQuery("YIELD requires a column".into()));
     }
-    let mut next_domains = BTreeMap::new();
+    let mut next_domains = references::Domains::new();
     for (output, source) in &renamed {
-        if let Some(domain) = domains.get(source) {
+        if let Some(domain) = domains.get(source).or_else(|| {
+            domains
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(source))
+                .map(|(_, domain)| domain)
+        }) {
             next_domains.insert(output.clone(), domain.clone());
         }
     }
@@ -296,7 +302,7 @@ fn unsupported(feature: &str) -> Error {
 
 struct WorkingTable {
     plan: LogicalPlan,
-    domains: BTreeMap<String, references::Domain>,
+    domains: references::Domains,
     reference_sources: references::ReferenceSources,
 }
 
@@ -375,7 +381,7 @@ async fn plan(
                 clone_working(&incoming),
             )
             .await?;
-            merge_result_metadata(&mut checked_domains, &mut checked_sources, &validation);
+            merge_result_metadata(&mut checked_domains, &mut checked_sources, &validation)?;
             checked =
                 relational::set_operation(checked, right, ast::QuerySetOperator::Union, true)?;
         }
@@ -452,7 +458,7 @@ async fn plan(
         )
         .await?;
         if op.operator == ast::QuerySetOperator::Union {
-            merge_result_metadata(&mut domains, &mut reference_sources, trace);
+            merge_result_metadata(&mut domains, &mut reference_sources, trace)?;
         }
         result = relational::set_operation(
             result,
@@ -470,16 +476,17 @@ async fn plan(
 }
 
 fn merge_result_metadata(
-    domains: &mut BTreeMap<String, references::Domain>,
+    domains: &mut references::Domains,
     sources: &mut references::ReferenceSources,
     right: &execution::Trace,
-) {
-    references::retain_common_sources(
+) -> Result<()> {
+    references::merge_sources(
         sources,
         &right.output_reference_sources,
         domains,
         &right.output_domains,
-    );
+        &right.sources,
+    )?;
     domains.retain(|name, domain| {
         if let Some(right) = right.output_domains.get(name) {
             domain.extend(right.iter().copied());
@@ -488,6 +495,7 @@ fn merge_result_metadata(
             false
         }
     });
+    Ok(())
 }
 
 fn without_trailing_page<'a>(
@@ -528,6 +536,9 @@ async fn apply_trailing_page(
         )?
         .build()?);
     }
+    let plan = freeze_page_before_sort(LogicalPlanBuilder::from(plan), true, ctx, trace)
+        .await?
+        .build()?;
     let columns = plan.schema().columns();
     let mut scope = graph::Bindings::default();
     for column in &columns {
@@ -717,7 +728,8 @@ async fn plan_body(
                         if let Some(element) = scope
                             .elements
                             .get(&source.value)
-                            .or_else(|| scope.reference_sources.get(&source.value))
+                            .map(|binding| vec![binding.clone()])
+                            .or_else(|| scope.reference_sources.get(&source.value).cloned())
                         {
                             scope
                                 .reference_sources
@@ -913,8 +925,7 @@ fn page_count(value: &ast::UnsignedIntegerSpecification, session: &SessionState)
         ast::UnsignedIntegerSpecification::Literal(n) => *n,
         ast::UnsignedIntegerSpecification::Parameter(name) => {
             let value = session
-                .parameters
-                .get(name)
+                .parameter(name)
                 .ok_or_else(|| Error::NotFound(format!("parameter {name}")))?;
             match value.value {
                 Value::Integer(n) if n >= 0 => n as u64,

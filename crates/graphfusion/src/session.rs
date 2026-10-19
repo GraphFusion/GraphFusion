@@ -96,6 +96,35 @@ pub struct Session {
     branch: String,
 }
 
+impl SessionState {
+    /// Parameter names compare without regard to ASCII case. An exact key wins
+    /// when both spellings were installed through different APIs.
+    pub(crate) fn parameter(&self, name: &str) -> Option<&Parameter> {
+        if let Some(parameter) = self.parameters.get(name) {
+            return Some(parameter);
+        }
+        self.parameters
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, parameter)| parameter)
+    }
+
+    /// Keep the first stored spelling and drop any other ASCII-case variants.
+    fn parameter_key(&mut self, name: &str) -> String {
+        let matches: Vec<String> = self
+            .parameters
+            .keys()
+            .filter(|key| key.eq_ignore_ascii_case(name))
+            .cloned()
+            .collect();
+        let key = matches.first().cloned().unwrap_or_else(|| name.to_owned());
+        for extra in matches.into_iter().skip(1) {
+            self.parameters.remove(&extra);
+        }
+        key
+    }
+}
+
 impl Session {
     pub(crate) fn new(db: Database) -> Self {
         let state = SessionState::default();
@@ -237,8 +266,9 @@ impl Session {
         if matches!(self.transaction_status(), TransactionStatus::Failed { .. }) {
             return Err(Error::TransactionFailed);
         }
+        let key = self.state.parameter_key(&name.into());
         self.state.parameters.insert(
-            name.into(),
+            key,
             Parameter {
                 value,
                 declared_type: None,
@@ -565,8 +595,17 @@ fn execute_statement(
                 ast::SessionResetTarget::Graph => session.current_graph = initial.current_graph,
                 ast::SessionResetTarget::TimeZone => session.time_zone = initial.time_zone.clone(),
                 ast::SessionResetTarget::Parameter(name) => {
-                    if session.parameters.remove(name).is_none() {
+                    let stored: Vec<String> = session
+                        .parameters
+                        .keys()
+                        .filter(|key| key.eq_ignore_ascii_case(name))
+                        .cloned()
+                        .collect();
+                    if stored.is_empty() {
                         return Err(Error::NotFound(format!("parameter {name}")));
+                    }
+                    for key in stored {
+                        session.parameters.remove(&key);
                     }
                 }
             }
@@ -865,21 +904,21 @@ fn session_set(
             session.time_zone = zone;
         }
         ast::SessionSetTarget::ValueParameter(p) => {
-            if p.if_not_exists && session.parameters.contains_key(&p.name) {
+            if p.if_not_exists && session.parameter(&p.name).is_some() {
                 return Ok(());
             }
             let value = eval(tx, session, &p.initializer)?;
             install_parameter(tx, session, &p.name, value, p.value_type.as_ref())?;
         }
         ast::SessionSetTarget::GraphParameter(p) => {
-            if p.if_not_exists && session.parameters.contains_key(&p.name) {
+            if p.if_not_exists && session.parameter(&p.name).is_some() {
                 return Ok(());
             }
             let value = Value::Graph(resolve_graph(tx, session, &p.initializer)?);
             install_parameter(tx, session, &p.name, value, p.value_type.as_ref())?;
         }
         ast::SessionSetTarget::BindingTableParameter(p) => {
-            if p.if_not_exists && session.parameters.contains_key(&p.name) {
+            if p.if_not_exists && session.parameter(&p.name).is_some() {
                 return Ok(());
             }
             let value = match &p.initializer {
@@ -919,8 +958,9 @@ fn install_parameter(
     if let Some(t) = &declared_type {
         check_value(tx, &value, t)?;
     }
+    let key = session.parameter_key(name);
     session.parameters.insert(
-        name.into(),
+        key,
         Parameter {
             value,
             declared_type,
@@ -930,8 +970,7 @@ fn install_parameter(
 }
 fn parameter<'a>(session: &'a SessionState, name: &str) -> Result<&'a Value> {
     session
-        .parameters
-        .get(name)
+        .parameter(name)
         .map(|p| &p.value)
         .ok_or_else(|| Error::NotFound(format!("parameter {name}")))
 }

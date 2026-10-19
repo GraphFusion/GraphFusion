@@ -25,6 +25,7 @@ use datafusion::{
 use std::{collections::BTreeSet, sync::Arc};
 
 pub(super) type Domain = BTreeSet<(ObjectId, ElementKind)>;
+pub(super) type Domains = super::casefold::CaseFoldMap<Domain>;
 
 pub(super) fn domain_for_name(name: &str, scope: &Bindings) -> Option<Domain> {
     scope
@@ -56,11 +57,8 @@ pub(super) fn domain(expr: &ast::Expr, scope: &Bindings) -> Option<Domain> {
     }
 }
 
-pub(super) fn result_domains(
-    body: &ast::QueryBody,
-    scope: &Bindings,
-) -> std::collections::BTreeMap<String, Domain> {
-    let mut result = std::collections::BTreeMap::new();
+pub(super) fn result_domains(body: &ast::QueryBody, scope: &Bindings) -> Domains {
+    let mut result = Domains::new();
     for (index, item) in body.result_clause.items.iter().enumerate() {
         if matches!(item.expr, ast::Expr::Wildcard) {
             for name in &scope.order {
@@ -85,14 +83,15 @@ pub(super) fn result_domains(
 
 /// Source layouts retained across materialized query results. Only a direct
 /// element copy has one source; expressions spanning domains keep the fallback.
-pub(super) type ReferenceSources = std::collections::BTreeMap<String, ElementBinding>;
+pub(super) type ReferenceSources = super::casefold::CaseFoldMap<Vec<ElementBinding>>;
 
 pub(super) fn result_sources(body: &ast::QueryBody, scope: &Bindings) -> ReferenceSources {
     let source = |name: &str| {
         scope
             .elements
             .get(name)
-            .or_else(|| scope.reference_sources.get(name))
+            .map(|binding| vec![binding.clone()])
+            .or_else(|| scope.reference_sources.get(name).cloned())
     };
     let mut result = ReferenceSources::new();
     for item in &body.result_clause.items {
@@ -116,32 +115,66 @@ pub(super) fn result_sources(body: &ast::QueryBody, scope: &Bindings) -> Referen
     result
 }
 
-/// A composite result can reuse a layout when every non-null branch agrees.
-pub(super) fn retain_common_sources(
+/// Retain a layout for each participating graph/kind. An unconstrained or
+/// unknown branch keeps the full-kind fallback for that domain.
+pub(super) fn merge_sources(
     left: &mut ReferenceSources,
     right: &ReferenceSources,
-    left_domains: &std::collections::BTreeMap<String, Domain>,
-    right_domains: &std::collections::BTreeMap<String, Domain>,
-) {
-    left.retain(|name, source| {
-        if right_domains.get(name).is_some_and(Domain::is_empty) {
-            return true;
+    left_domains: &Domains,
+    right_domains: &Domains,
+    graphs: &std::collections::BTreeMap<ObjectId, Arc<GraphData>>,
+) -> Result<()> {
+    let mut merged = ReferenceSources::new();
+    for (name, left_domain) in left_domains {
+        let Some(right_domain) = right_domains.get(name) else {
+            continue;
+        };
+        let mut layouts = Vec::new();
+        for &(graph, kind) in left_domain.union(right_domain) {
+            let l = left.get(name).and_then(|sources| {
+                sources.iter().find(|source| {
+                    source.graph == graph && source.kind == kind && source.constrained
+                })
+            });
+            let r = right.get(name).and_then(|sources| {
+                sources.iter().find(|source| {
+                    source.graph == graph && source.kind == kind && source.constrained
+                })
+            });
+            if (left_domain.contains(&(graph, kind)) && l.is_none())
+                || (right_domain.contains(&(graph, kind)) && r.is_none())
+            {
+                continue;
+            }
+            let mut source = l.or(r).expect("participating constrained source").clone();
+            if let (Some(_), Some(other)) = (l, r) {
+                for labels in &other.source_labels {
+                    if !source.source_labels.contains(labels) {
+                        source.source_labels.push(labels.clone());
+                    }
+                }
+                source.tombstones.extend(other.tombstones.iter().copied());
+                let Some(data) = graphs.get(&graph) else {
+                    continue;
+                };
+                let tables: Vec<&crate::graph::Table> = match kind {
+                    ElementKind::Node => data.nodes.iter().map(|node| &node.0).collect(),
+                    ElementKind::Edge => data.edges.iter().map(|edge| &edge.table).collect(),
+                };
+                source.properties = crate::graph::property_types(
+                    tables
+                        .into_iter()
+                        .filter(|table| source.source_labels.contains(&table.labels)),
+                )?;
+            }
+            layouts.push(source);
         }
-        right.get(name).is_some_and(|other| {
-            source.graph == other.graph
-                && source.kind == other.kind
-                && source.constrained == other.constrained
-                && source.source_labels == other.source_labels
-                && source.properties == other.properties
-                && source.tombstones == other.tombstones
-        })
-    });
-    // A literal NULL contributes no element layouts to the result.
-    for (name, source) in right {
-        if left_domains.get(name).is_some_and(Domain::is_empty) {
-            left.insert(name.clone(), source.clone());
+        if !layouts.is_empty() {
+            merged.insert(name.clone(), layouts);
         }
     }
+    *left = merged;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -173,7 +206,11 @@ impl ReferenceBinding {
         let values: Vec<_> = self
             .parts
             .iter()
-            .filter(|p| p.properties.contains_key(key))
+            .filter(|p| {
+                p.properties
+                    .keys()
+                    .any(|stored| stored.eq_ignore_ascii_case(key))
+            })
             .map(|p| p.property(key))
             .collect();
         let mut previous = DataType::Null;
@@ -335,7 +372,7 @@ pub(super) fn resolve(
     let names = scope
         .scalars
         .iter()
-        .filter(|(name, _)| !scope.references.contains_key(*name))
+        .filter(|(name, _)| !scope.references.contains_key(name))
         .map(|(name, column)| (name.clone(), column.clone()))
         .collect::<Vec<_>>();
     for (name, column) in names {
@@ -358,7 +395,11 @@ pub(super) fn resolve(
         plan = plan.project(projection)?;
         let key = |i: usize| Expr::Column(datafusion::common::Column::new_unqualified(&keys[i].1));
         let sources = scope.sources.clone();
-        let template = scope.reference_sources.get(&name).cloned();
+        let templates = scope
+            .reference_sources
+            .get(&name)
+            .cloned()
+            .unwrap_or_default();
         let mut parts = Vec::new();
         for (id, data) in sources {
             for kind in [ElementKind::Node, ElementKind::Edge] {
@@ -371,19 +412,24 @@ pub(super) fn resolve(
                 }
                 // A LET copy of one matched element keeps that label set's
                 // property types. An unconstrained match still unions the kind.
-                let (scan, binding) = if let Some(source) = template.as_ref().filter(|source| {
-                    source.constrained && source.graph == id && source.kind == kind
-                }) {
+                let template = templates
+                    .iter()
+                    .find(|source| source.constrained && source.graph == id && source.kind == kind);
+                let (scan, binding) = if let Some(source) = template {
                     graph::scan_refresh(scope, id, &data, source)?
                 } else {
                     graph::scan(scope, id, &data, kind, None)?
                 };
-                if template.as_ref().is_some_and(|source| {
-                    source.constrained && source.graph == id && source.kind == kind
-                }) {
-                    scope
+                if template.is_some() {
+                    let sources = scope
                         .reference_sources
-                        .insert(name.clone(), binding.clone());
+                        .get_mut(&name)
+                        .expect("source layouts");
+                    let source = sources
+                        .iter_mut()
+                        .find(|source| source.graph == id && source.kind == kind)
+                        .expect("source domain");
+                    *source = binding.clone();
                 }
                 let matched = key(0)
                     .eq(lit(id))
@@ -457,10 +503,14 @@ pub(super) async fn refresh(
         .collect();
     for name in names {
         let old = scope.references.remove(&name).expect("existing reference");
-        if let Some(source) = scope.reference_sources.get(&name).cloned() {
-            if source.graph == graph {
+        if let Some(mut sources) = scope.reference_sources.get(&name).cloned() {
+            for source in sources.iter_mut().filter(|source| source.graph == graph) {
                 let mut ids = BTreeSet::new();
-                for binding in old.parts.iter().filter(|binding| binding.graph == graph) {
+                for binding in old
+                    .parts
+                    .iter()
+                    .filter(|binding| binding.graph == graph && binding.kind == source.kind)
+                {
                     ids.extend(
                         super::mutations::delete_ids(
                             Some(plan.clone().project([binding.column(ID).alias(ID)])?),
@@ -470,10 +520,9 @@ pub(super) async fn refresh(
                         .await?,
                     );
                 }
-                scope
-                    .reference_sources
-                    .insert(name.clone(), graph::refresh_source(data, &source, &ids)?);
+                *source = graph::refresh_source(data, source, &ids)?;
             }
+            scope.reference_sources.insert(name.clone(), sources);
         }
         aliases.extend(
             old.parts
