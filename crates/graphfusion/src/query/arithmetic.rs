@@ -889,3 +889,80 @@ mod exact_average_tests {
         }
     }
 }
+
+/// Integer SUM has one checked conversion function per accumulator type, so
+/// repeated aggregates remain equal during grouping and DISTINCT rebasing.
+pub(super) fn checked_int_sum(value: Expr, data_type: DataType) -> Result<Expr, DataFusionError> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<DataType, ScalarUDF>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let function = if let Some(function) = cache.get(&data_type) {
+        function.clone()
+    } else {
+        let function = checked_int_sum_new(data_type.clone())?;
+        cache.insert(data_type, function.clone());
+        function
+    };
+    Ok(function.call(vec![value]))
+}
+
+fn checked_int_sum_new(data_type: DataType) -> Result<ScalarUDF, DataFusionError> {
+    let DataType::Decimal128(_, scale) = data_type.clone() else {
+        return Err(DataFusionError::Internal(format!(
+            "integer sum accumulator has type {data_type}"
+        )));
+    };
+    if scale < 0 {
+        return Err(DataFusionError::Internal(format!(
+            "integer sum accumulator has scale {scale}"
+        )));
+    }
+    let scale = scale as u32;
+    Ok(create_udf(
+        "gql_checked_int_sum",
+        vec![data_type],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(move |args| {
+            use datafusion::arrow::array::{Decimal128Array, Int64Builder};
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let values = arrays[0]
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("expected Decimal128 integer sum".into())
+                })?;
+            let factor = 10i128
+                .checked_pow(scale)
+                .ok_or_else(|| DataFusionError::Execution("integer overflow".into()))?;
+            let mut output = Int64Builder::with_capacity(values.len());
+            for value in values.iter() {
+                let Some(value) = value else {
+                    output.append_null();
+                    continue;
+                };
+                if value % factor != 0 {
+                    return Err(DataFusionError::Execution("integer overflow".into()));
+                }
+                let value = value / factor;
+                let value = i64::try_from(value)
+                    .map_err(|_| DataFusionError::Execution("integer overflow".into()))?;
+                output.append_value(value);
+            }
+            let output: datafusion::arrow::array::ArrayRef = Arc::new(output.finish());
+            if args
+                .iter()
+                .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+            {
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                    &output, 0,
+                )?))
+            } else {
+                Ok(ColumnarValue::Array(output))
+            }
+        }),
+    ))
+}

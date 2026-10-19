@@ -1411,7 +1411,7 @@ fn named_variable(expr: &ast::Expr, variable: &str) -> bool {
     }
 }
 
-fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
+pub(super) fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
     use ast::Expr as E;
     match expr {
         E::Property { base, .. } => vec![base],

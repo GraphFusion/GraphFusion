@@ -5667,3 +5667,78 @@ async fn grouping_and_distinct_check_scalar_list_and_wildcard_aliases() {
         ]
     );
 }
+
+#[tokio::test]
+async fn nested_otherwise_checks_families_after_selecting_the_branch() {
+    let mut session = social().await;
+    let inner =
+        "MATCH(d:Document) RETURN d.id AS x OTHERWISE MATCH(n:Person|Document) RETURN n.id AS x";
+    for consumer in [
+        "RETURN MIN(x) AS v",
+        "RETURN x AS v ORDER BY v",
+        "RETURN DISTINCT x AS v",
+        "LET y=COALESCE(x,NULL) RETURN MIN(y) AS v",
+        "FOR y IN [x] RETURN MIN(y) AS v",
+    ] {
+        let query = format!("{{ {inner} }} {consumer} OTHERWISE RETURN 'fallback' AS v");
+        let result = session.query(&query).await.unwrap();
+        assert_eq!(strings(&result), vec![vec!["doc".to_owned()]], "{query}");
+    }
+    let result=session.query(&format!("{{ {inner} }} RETURN x AS v,COUNT(*) AS c GROUP BY v OTHERWISE RETURN 'fallback' AS v,0 AS c")).await.unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![vec!["doc".to_owned(), "1".to_owned()]]
+    );
+    let result=session.query("{ MATCH(d:Document {id:'absent'}) RETURN d.id AS x OTHERWISE MATCH(n:Person|Document) RETURN n.id AS x } RETURN MIN(x) AS v OTHERWISE RETURN 'fallback' AS v").await;
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("MIN cannot combine"), "{error}");
+}
+
+#[tokio::test]
+async fn derived_reference_families_keep_selected_layouts() {
+    let mut session = social().await;
+    for query in [
+        "{ MATCH(d:Document) RETURN d AS n } RETURN MIN(n.id) AS v",
+        "{ MATCH(d:Document) RETURN d AS n OTHERWISE MATCH(n:Person|Document) RETURN n } RETURN MIN(n.id) AS v OTHERWISE RETURN 'fallback' AS v",
+    ] {
+        let result=session.query(query).await.unwrap();
+        assert_eq!(strings(&result),vec![vec!["doc".to_owned()]],"{query}");
+    }
+}
+
+#[tokio::test]
+async fn coalesce_families_ignore_unreachable_mixed_fallbacks() {
+    let mut session = social().await;
+    for query in [
+        "MATCH(n:Person|Document) RETURN DISTINCT COALESCE('fixed',n.id) AS v",
+        "MATCH(n:Person|Document) LET x='fixed' RETURN DISTINCT COALESCE(x,n.id) AS v",
+        "MATCH(n:Person|Document) LET x=COALESCE('fixed',n.id) RETURN DISTINCT x AS v",
+        "MATCH(n:Person|Document) FOR x IN ['fixed'] RETURN DISTINCT COALESCE(x,n.id) AS v",
+    ] {
+        let result = session
+            .query(query)
+            .await
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        assert_eq!(strings(&result), vec![vec!["fixed".to_owned()]], "{query}");
+    }
+    let result = session
+        .query(
+            "MATCH(n:Person|Document) RETURN COALESCE('fixed',n.id) AS v,COUNT(*) AS c GROUP BY v",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![vec!["fixed".to_owned(), "3".to_owned()]]
+    );
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN COUNT(DISTINCT COALESCE('fixed',n.id)) AS c")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["1".to_owned()]]);
+    let result=session.query("MATCH(n:Person|Document) OPTIONAL MATCH(m:Missing) LET x=m.id RETURN DISTINCT COALESCE(x,n.id) AS v").await;
+    assert!(
+        matches!(result, Err(graphfusion::Error::InvalidQuery(_))),
+        "{result:?}"
+    );
+}
