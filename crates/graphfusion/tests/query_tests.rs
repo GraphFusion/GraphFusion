@@ -107,6 +107,77 @@ async fn parameters_bind_values_without_query_text_substitution() {
 }
 
 #[tokio::test]
+async fn decimal_parameters_validate_scale_and_read_as_float() {
+    let mut session = Database::new().session();
+    session
+        .execute(
+            "SESSION SET VALUE $price DECIMAL(4, 1) = 1.5; \
+             SESSION SET VALUE $whole DECIMAL(4) = 10; \
+             SESSION SET VALUE $open DECIMAL = 1.25; \
+             SESSION SET VALUE $neg DEC(2, 1) = -1.5; \
+             SESSION SET VALUE $list LIST<DECIMAL(4, 1)> = [1, NULL, 1.5]",
+        )
+        .unwrap();
+    let result = session
+        .query(
+            "RETURN $price AS price, $price + 1 AS sum, $whole AS whole, \
+             $open AS open, $neg AS neg",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Float64(Some(1.5)),
+            ScalarValue::Float64(Some(2.5)),
+            ScalarValue::Float64(Some(10.0)),
+            ScalarValue::Float64(Some(1.25)),
+            ScalarValue::Float64(Some(-1.5)),
+        ]
+    );
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+    let listed = session
+        .query("FOR x IN $list WITH ORDINALITY i RETURN i AS i, x AS x ORDER BY i")
+        .await
+        .unwrap();
+    assert_eq!(listed.schema.field(1).data_type(), &DataType::Float64);
+    assert_eq!(
+        listed
+            .batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows())
+                .map(|row| { ScalarValue::try_from_array(batch.column(1), row).unwrap() }))
+            .collect::<Vec<_>>(),
+        vec![
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Float64(None),
+            ScalarValue::Float64(Some(1.5)),
+        ]
+    );
+    for statement in [
+        "SESSION SET VALUE $bad DECIMAL(4, 1) = 1.25",
+        "SESSION SET VALUE $bad DECIMAL(2, 1) = 10",
+        "SESSION SET VALUE $bad DECIMAL(4) = 1.5",
+        "SESSION SET VALUE $bad DECIMAL(4, 2) = 100",
+        "SESSION SET VALUE $bad DECIMAL(19) = 9007199254740993",
+        "SESSION SET VALUE $bad DECIMAL = 'no'",
+    ] {
+        assert!(
+            matches!(session.execute(statement), Err(Error::InvalidDefinition(_))),
+            "{statement}"
+        );
+    }
+    session
+        .execute("SESSION SET VALUE $exact DECIMAL(16, 0) = 9007199254740992")
+        .unwrap();
+    let exact = session.query("RETURN $exact AS n").await.unwrap();
+    assert_eq!(
+        row(&exact),
+        vec![ScalarValue::Float64(Some(9007199254740992.0))]
+    );
+}
+
+#[tokio::test]
 async fn three_valued_logic_and_null_predicates() {
     let mut session = Database::new().session();
     let result = session.query("RETURN UNKNOWN AS u, FALSE AND UNKNOWN AS f, TRUE OR UNKNOWN AS t, TRUE XOR UNKNOWN AS x, UNKNOWN IS UNKNOWN AS iu, UNKNOWN IS NOT TRUE AS nt, NULL IS NULL AS n, COALESCE(NULL, 9) AS c, NULLIF(1, 1) AS ni").await.unwrap();
@@ -1058,4 +1129,60 @@ async fn distinct_truth_predicates_accept_nullable_booleans() {
             ScalarValue::Boolean(Some(true))
         ]
     );
+}
+
+#[tokio::test]
+async fn decimal_parameters_reject_small_excess_fractional_digits() {
+    let mut s = Database::new().session();
+    for (ty, value) in [
+        ("DECIMAL(3,0)", "0.000000001"),
+        ("DECIMAL(4,2)", "1.230000001"),
+        ("DECIMAL(4,2)", "99.999999999"),
+    ] {
+        let q = format!("SESSION SET VALUE $bad {ty} = {value}");
+        assert!(
+            matches!(s.execute(&q), Err(Error::InvalidDefinition(_))),
+            "{q}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn numeric_parameters_enforce_declared_precision_and_scale() {
+    let mut s = Database::new().session();
+    for q in [
+        "SESSION SET VALUE $bad NUMERIC(2,1) = 12.3",
+        "SESSION SET VALUE $bad NUMERIC(2,1) = 1.23",
+        "SESSION SET VALUE $bad NUMERIC(0) = 0",
+        "SESSION SET VALUE $bad NUMERIC(1,2) = 0",
+    ] {
+        assert!(s.execute(q).is_err(), "{q}");
+    }
+    s.execute("SESSION SET VALUE $a NUMERIC(2,1) = 0.1; SESSION SET VALUE $b DECIMAL(5,2) = -10.25; SESSION SET VALUE $z DECIMAL(2,2) = 0.0").unwrap();
+    assert_eq!(
+        row(&s.query("RETURN $a AS a,$b AS b,$z AS z").await.unwrap()),
+        vec![
+            ScalarValue::Float64(Some(0.1)),
+            ScalarValue::Float64(Some(-10.25)),
+            ScalarValue::Float64(Some(0.0))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn decimal_parameters_accept_every_exact_integer_within_precision() {
+    let mut s = Database::new().session();
+    s.execute("SESSION SET VALUE $x DECIMAL(16) = 9007199254740994; SESSION SET VALUE $min DECIMAL(19) = -9223372036854775808").unwrap();
+    assert_eq!(
+        row(&s.query("RETURN $x AS x,$min AS min").await.unwrap()),
+        vec![
+            ScalarValue::Float64(Some(9007199254740994.0)),
+            ScalarValue::Float64(Some(i64::MIN as f64))
+        ]
+    );
+    for value in ["9007199254740993", "9223372036854775807"] {
+        assert!(s
+            .execute(&format!("SESSION SET VALUE $bad DECIMAL(19) = {value}"))
+            .is_err());
+    }
 }

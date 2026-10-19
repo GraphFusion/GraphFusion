@@ -27,6 +27,6 @@ SESSION SET VALUE $names LIST<STRING> = ['Alice', 'Bob'];
 RETURN $limit AS limit, $names AS names;
 ```
 
-Query scalars currently normalize integer and approximate numeric values to Int64/Float64 after supported declaration validation. Decimal literals are f64, not an exact decimal implementation. `CHAR(n)` limits a character string to `n` characters, the same maximum `VARCHAR(n)` and `STRING(n)` enforce; a shorter string is valid. Temporal values, arbitrary unions and structured references do not automatically become executable query scalars because their types parse.
+Query scalars currently normalize integer and approximate numeric values to Int64/Float64 after supported declaration validation. Decimal literals are f64, not an exact decimal implementation. A `DECIMAL` or `NUMERIC` session parameter accepts an integer or finite decimal literal that fits the declared precision and scale (`DECIMAL(p)` means scale 0), then reads back as Float64. `CHAR(n)` limits a character string to `n` characters, the same maximum `VARCHAR(n)` and `STRING(n)` enforce; a shorter string is valid. Temporal values, arbitrary unions and structured references do not automatically become executable query scalars because their types parse.
 
 Graph definitions preserve constraints including approximate-numeric scale. Unsupported nesting is rejected before durable publication so a committed definition remains recoverable.
