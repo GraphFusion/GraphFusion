@@ -12,7 +12,7 @@ MATCH p = (a {name: 'Alice'})((x)-[edges:Knows]->(y)){0,2}(b)
 RETURN b.name AS destination, PATH_LENGTH(p) AS hops ORDER BY hops;
 ```
 
-New element declarations inside a repeated group become ordered lists outside it. Zero repetitions expose empty lists. Nested groups concatenate their lists. Variables must be fresh relative to the outer bindings; declaration capture is rejected.
+New element declarations inside a repeated group become ordered lists outside it. Zero repetitions expose empty lists. Nested groups concatenate their lists. Variables must be fresh relative to the outer bindings; declaration capture is rejected. A MATCH `WHERE` sees those lists, so `WHERE x.name = 'Alice'` is rejected. Put that comparison on the node inside the group to test each repetition.
 
 ```gql test
 MATCH p = ALL SHORTEST

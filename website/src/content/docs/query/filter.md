@@ -21,4 +21,6 @@ A property stored as different non-numeric types is compared on each fragment, i
 
 An OPTIONAL MATCH predicate participates in matching before null padding. A later FILTER runs after padding and can remove unmatched rows. Put conditions on the optional neighbor inside OPTIONAL MATCH when you want to keep input rows that have no such neighbor.
 
+A name bound on only some alternatives, or only on the present side of a questioned segment, is null on the other rows. A comparison with that null is unknown and does not keep the row. A repeated group exposes a list, so a property comparison on that name is rejected; write the comparison on the node inside the group to test each repetition.
+
 For path selectors, a MATCH-level WHERE is applied after selection; an inline pattern predicate restricts candidates before selection. This can change shortest-path results. See [selectors](/patterns/selectors/).

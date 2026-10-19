@@ -302,6 +302,12 @@ pub(super) async fn matches(
         edge_lists.push(state.edges);
     }
     plan = compiler.apply_predicates(plan, scope, 0)?;
+    // A pushed comparison only saw rows where that name was an element.
+    // Conditional rows leave it null, and a repeated group exposes a list;
+    // both still need the original predicate.
+    compiler
+        .clause_hit
+        .retain(|name| !scope.conditional.contains(name) && !scope.groups.contains(name));
     let pushed = compiler.clause_push
         && compiler
             .clause_filters

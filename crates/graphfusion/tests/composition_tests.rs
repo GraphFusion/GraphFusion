@@ -1394,3 +1394,13 @@ async fn stored_row_comparisons_support_wrappers_and_repeated_predicates() {
         assert_eq!(s.query(query).await.unwrap().row_count(), 0, "{query}");
     }
 }
+
+#[tokio::test]
+async fn closed_conjuncts_apply_across_pattern_alternatives() {
+    let mut s = social().await;
+    let result = s
+        .query("MATCH (n:Person) | (m:Metric) WHERE n.id=1 AND FALSE RETURN 1 AS x")
+        .await
+        .unwrap();
+    assert_eq!(result.row_count(), 0);
+}
