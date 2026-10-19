@@ -14,6 +14,7 @@ mod paths;
 mod patterns;
 mod references;
 mod relational;
+mod stddev;
 
 use crate::{
     catalog::CommitSeq, gql as ast, transaction::StatementTxn, Error, Result, SessionState, Value,
