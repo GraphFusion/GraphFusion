@@ -1055,8 +1055,8 @@ fn decimal_fits(value: &Value, precision: Option<u64>, scale: Option<u64>) -> bo
 
 fn decimal_representable(value: &Value) -> bool {
     match value {
-        // Restrict integer inputs to the contiguous exact Float64 integer range.
-        Value::Integer(value) => (*value as i128).unsigned_abs() <= 1u128 << 53,
+        // Use the same exact round trip as FLOAT, including the saturation guard.
+        Value::Integer(value) => integer_fits_float(*value),
         Value::Float(value) => value.is_finite(),
         _ => false,
     }
@@ -1254,7 +1254,7 @@ mod tests {
     fn decimal_scale_and_exact_integer_limits() {
         assert!(decimal_representable(&Value::Integer(1_i64 << 53)));
         assert!(!decimal_representable(&Value::Integer((1_i64 << 53) + 1)));
-        assert!(!decimal_representable(&Value::Integer(i64::MIN)));
+        assert!(decimal_representable(&Value::Integer(i64::MIN)));
         assert!(!decimal_representable(&Value::Float(f64::INFINITY)));
         assert!(decimal_fits(&Value::Float(1.25), Some(4), Some(2)));
         assert!(!decimal_fits(&Value::Float(1.256), Some(4), Some(2)));

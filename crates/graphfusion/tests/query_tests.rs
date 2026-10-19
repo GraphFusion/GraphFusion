@@ -1168,3 +1168,21 @@ async fn numeric_parameters_enforce_declared_precision_and_scale() {
         ]
     );
 }
+
+#[tokio::test]
+async fn decimal_parameters_accept_every_exact_integer_within_precision() {
+    let mut s = Database::new().session();
+    s.execute("SESSION SET VALUE $x DECIMAL(16) = 9007199254740994; SESSION SET VALUE $min DECIMAL(19) = -9223372036854775808").unwrap();
+    assert_eq!(
+        row(&s.query("RETURN $x AS x,$min AS min").await.unwrap()),
+        vec![
+            ScalarValue::Float64(Some(9007199254740994.0)),
+            ScalarValue::Float64(Some(i64::MIN as f64))
+        ]
+    );
+    for value in ["9007199254740993", "9223372036854775807"] {
+        assert!(s
+            .execute(&format!("SESSION SET VALUE $bad DECIMAL(19) = {value}"))
+            .is_err());
+    }
+}
