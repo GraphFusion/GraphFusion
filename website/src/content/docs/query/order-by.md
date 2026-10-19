@@ -29,4 +29,13 @@ RETURN DISTINCT n + 1 AS value ORDER BY n + 1 DESC;
 
 This returns 3 then 2. Aggregate queries may order by available grouping and aggregate expressions, including an arithmetic grouping value written again in `ORDER BY`. Another input reference is an invalid query.
 
+A float aggregate can also be repeated:
+
+```gql test
+FOR n IN [1, 2, 1]
+RETURN DISTINCT n AS k, AVG(n) AS average ORDER BY AVG(n) DESC;
+```
+
+This returns 2/2.0 then 1/1.0. Sums, minimums, maximums, standard deviations and percentiles follow the same rule.
+
 ORDER BY can also appear in the linear pipeline before the result clause. A later operation can affect row order; put the final ORDER BY with the result when ordering matters to the caller.

@@ -13,6 +13,19 @@ use datafusion::{
 use std::{cmp::Ordering, sync::Arc};
 
 pub(super) fn finite(value: Expr) -> Expr {
+    // One function value for every finite check. A fresh closure would not
+    // compare equal, so DISTINCT could not recognize the same float aggregate
+    // in ORDER BY.
+    finite_udf().call(vec![value])
+}
+
+fn finite_udf() -> ScalarUDF {
+    use std::sync::OnceLock;
+    static UDF: OnceLock<ScalarUDF> = OnceLock::new();
+    UDF.get_or_init(finite_udf_new).clone()
+}
+
+fn finite_udf_new() -> ScalarUDF {
     create_udf(
         "gql_finite_float",
         vec![DataType::Float64],
@@ -34,7 +47,6 @@ pub(super) fn finite(value: Expr) -> Expr {
             Ok(args[0].clone())
         }),
     )
-    .call(vec![value])
 }
 
 pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType) -> Expr {
@@ -140,55 +152,63 @@ fn checked_udf_new(op: Operator, data_type: DataType) -> ScalarUDF {
 /// percentile. It is read as a dyadic rational, applied to the exact integer
 /// span, and rounded once. Casting both endpoints first drops bits above 2^53.
 pub(super) fn exact_lerp(left: Expr, right: Expr, weight: Expr) -> Expr {
-    create_udf(
-        "gql_exact_lerp",
-        vec![DataType::Int64, DataType::Int64, DataType::Float64],
-        DataType::Float64,
-        Volatility::Immutable,
-        Arc::new(|args| {
-            use datafusion::arrow::array::Array;
-            let arrays = ColumnarValue::values_to_arrays(args)?;
-            let endpoints = [
-                arrays[0]
+    exact_lerp_udf().call(vec![left, right, weight])
+}
+
+fn exact_lerp_udf() -> ScalarUDF {
+    use std::sync::OnceLock;
+    static UDF: OnceLock<ScalarUDF> = OnceLock::new();
+    UDF.get_or_init(|| {
+        create_udf(
+            "gql_exact_lerp",
+            vec![DataType::Int64, DataType::Int64, DataType::Float64],
+            DataType::Float64,
+            Volatility::Immutable,
+            Arc::new(|args| {
+                use datafusion::arrow::array::Array;
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let endpoints = [
+                    arrays[0]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal("expected Int64 percentile endpoint".into())
+                        })?,
+                    arrays[1]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal("expected Int64 percentile endpoint".into())
+                        })?,
+                ];
+                let weights = arrays[2]
                     .as_any()
-                    .downcast_ref::<Int64Array>()
+                    .downcast_ref::<Float64Array>()
                     .ok_or_else(|| {
-                        DataFusionError::Internal("expected Int64 percentile endpoint".into())
-                    })?,
-                arrays[1]
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal("expected Int64 percentile endpoint".into())
-                    })?,
-            ];
-            let weights = arrays[2]
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("expected Float64 percentile weight".into())
-                })?;
-            if endpoints[1].len() != endpoints[0].len() || weights.len() != endpoints[0].len() {
-                return Err(DataFusionError::Internal(
-                    "percentile endpoints have different lengths".into(),
-                ));
-            }
-            let mut output = Float64Builder::with_capacity(endpoints[0].len());
-            for i in 0..endpoints[0].len() {
-                if endpoints[0].is_null(i) || endpoints[1].is_null(i) || weights.is_null(i) {
-                    output.append_null();
-                } else {
-                    output.append_value(lerp_i64(
-                        endpoints[0].value(i),
-                        endpoints[1].value(i),
-                        weights.value(i),
+                        DataFusionError::Internal("expected Float64 percentile weight".into())
+                    })?;
+                if endpoints[1].len() != endpoints[0].len() || weights.len() != endpoints[0].len() {
+                    return Err(DataFusionError::Internal(
+                        "percentile endpoints have different lengths".into(),
                     ));
                 }
-            }
-            Ok(ColumnarValue::Array(Arc::new(output.finish())))
-        }),
-    )
-    .call(vec![left, right, weight])
+                let mut output = Float64Builder::with_capacity(endpoints[0].len());
+                for i in 0..endpoints[0].len() {
+                    if endpoints[0].is_null(i) || endpoints[1].is_null(i) || weights.is_null(i) {
+                        output.append_null();
+                    } else {
+                        output.append_value(lerp_i64(
+                            endpoints[0].value(i),
+                            endpoints[1].value(i),
+                            weights.value(i),
+                        ));
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(output.finish())))
+            }),
+        )
+    })
+    .clone()
 }
 
 fn lerp_i64(left: i64, right: i64, weight: f64) -> f64 {
@@ -498,6 +518,11 @@ mod tests {
             left,
             checked(col("n"), Operator::Minus, lit(1_i64), DataType::Int64)
         );
+    }
+
+    #[test]
+    fn identical_finite_checks_compare_equal() {
+        assert_eq!(finite(col("n")), finite(col("n")));
     }
 
     #[tokio::test]
