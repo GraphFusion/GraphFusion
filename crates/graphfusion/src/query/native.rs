@@ -967,14 +967,6 @@ fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
             names.insert(name.value.clone());
         }
     }
-    if let ast::Expr::IsNull { expr, .. } = expr {
-        if let ast::Expr::Identifier(name) = expr.as_ref() {
-            names.insert(name.value.clone());
-        }
-    }
-    if let ast::Expr::PropertyExists { variable, .. } = expr {
-        names.insert(variable.value.clone());
-    }
     for child in children(expr) {
         property_bases(child, names);
     }
