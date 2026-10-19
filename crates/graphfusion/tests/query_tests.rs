@@ -1846,3 +1846,217 @@ async fn native_coalesce_comparisons_keep_exact_integer_results() {
         );
     }
 }
+
+#[tokio::test]
+async fn mixed_arithmetic_rejects_inexact_integers() {
+    let mut session = Database::new().session();
+    session
+        .set_parameter("min", Value::Integer(i64::MIN))
+        .unwrap();
+    session
+        .set_parameter("max", Value::Integer(i64::MAX))
+        .unwrap();
+
+    let exact = session
+        .query(
+            "RETURN 1 + 0.5 AS small, \
+             9007199254740992 + 0.0 AS boundary, \
+             0.0 + 9007199254740992 AS flipped, \
+             $min - 0.0 AS min, \
+             9007199254740992 * 1.0 AS product, \
+             9007199254740992 / 2.0 AS quotient, \
+             9007199254740993 + 1 AS int_sum",
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(exact.schema.field(6).data_type(), &DataType::Int64);
+    assert_eq!(
+        row(&exact),
+        vec![
+            ScalarValue::Float64(Some(1.5)),
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(Some(i64::MIN as f64)),
+            ScalarValue::Float64(Some(9007199254740992.0)),
+            ScalarValue::Float64(Some(4503599627370496.0)),
+            ScalarValue::Int64(Some(9007199254740994)),
+        ]
+    );
+
+    for query in [
+        "RETURN 9007199254740993 + 0.0 AS n",
+        "RETURN 0.0 + 9007199254740993 AS n",
+        "RETURN 9007199254740993 - 0.0 AS n",
+        "RETURN 9007199254740993 * 1.0 AS n",
+        "RETURN 9007199254740993 / 1.0 AS n",
+        "RETURN $max + 0.0 AS n",
+        "FOR v IN [1, 9007199254740993] RETURN v + 0.0 AS n",
+    ] {
+        let error = session.query(query).await.unwrap_err();
+        assert!(
+            error.to_string().contains("not exactly representable"),
+            "{query}: {error}"
+        );
+    }
+
+    let rows = session
+        .query("FOR v IN [1, NULL] RETURN v + 0.5 AS n ORDER BY v")
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed_arithmetic_column(&rows),
+        vec![ScalarValue::Float64(Some(1.5)), ScalarValue::Float64(None)]
+    );
+
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session.run("INSERT (:N {id: 1})").await.unwrap();
+    let property = session
+        .query("MATCH (n:N) RETURN n.id + 0.5 AS n")
+        .await
+        .unwrap();
+    assert_eq!(row(&property), vec![ScalarValue::Float64(Some(1.5))]);
+    session
+        .run("INSERT (:N {id: 9007199254740993})")
+        .await
+        .unwrap();
+    let error = session
+        .query("MATCH (n:N) RETURN n.id + 0.0 AS n")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not exactly representable"),
+        "{error}"
+    );
+}
+
+fn mixed_arithmetic_column(result: &QueryResult) -> Vec<ScalarValue> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .map(|row| ScalarValue::try_from_array(batch.column(0), row).unwrap())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn null_float_propagates_before_exact_integer_conversion() {
+    let mut session = Database::new().session();
+    session
+        .execute("SESSION SET VALUE $f FLOAT = NULL")
+        .unwrap();
+    for operator in ["+", "-", "*", "/"] {
+        let query =
+            format!("FOR x IN [9007199254740993,1] RETURN x{operator}$f AS v,$f{operator}x AS w");
+        let result = session.query(&query).await.unwrap();
+        assert_eq!(
+            mixed_arithmetic_column(&result),
+            vec![ScalarValue::Float64(None); 2],
+            "{query}"
+        );
+        assert_eq!(
+            boolean_column(&result, 1),
+            vec![ScalarValue::Float64(None); 2],
+            "{query}"
+        );
+    }
+    let result=session.query("FOR x IN [9007199254740993,1] LET f=1.0/NULLIF(x-9007199254740993,0) RETURN x+f AS v ORDER BY x").await.unwrap();
+    let values = mixed_arithmetic_column(&result);
+    assert_eq!(
+        values[0],
+        ScalarValue::Float64(Some(1.0 - 1.0 / 9007199254740992.0))
+    );
+    assert_eq!(values[1], ScalarValue::Float64(None));
+    let result = session
+        .query("FOR x IN [1,2] RETURN DISTINCT x+0.5 AS v ORDER BY x+0.5")
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed_arithmetic_column(&result),
+        vec![
+            ScalarValue::Float64(Some(1.5)),
+            ScalarValue::Float64(Some(2.5))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn nested_coalesce_uses_a_bounded_plan() {
+    let mut session = Database::new().session();
+    for depth in [12, 20] {
+        for wrapped in [false, true] {
+            if wrapped && depth > 12 {
+                continue;
+            }
+            let mut expression = "x".to_owned();
+            for _ in 0..depth {
+                expression = if wrapped {
+                    format!("COALESCE(NULLIF({expression},0),0)")
+                } else {
+                    format!("COALESCE({expression},0)")
+                };
+            }
+            let query = format!("FOR x IN [1,NULL] RETURN {expression} AS v");
+            let result = session
+                .query(&query)
+                .await
+                .unwrap_or_else(|error| panic!("depth={depth} wrapped={wrapped}: {error}"));
+            assert_eq!(
+                mixed_arithmetic_column(&result),
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(0))]
+            );
+            let filtered = session
+                .query(&format!("FOR x IN [1,NULL] FILTER {expression}=0 RETURN x"))
+                .await
+                .unwrap();
+            assert_eq!(filtered.row_count(), 1);
+            assert_eq!(
+                mixed_arithmetic_column(&filtered),
+                vec![ScalarValue::Int64(None)]
+            );
+            assert!(
+                result.logical_plan.len() < 100_000,
+                "depth={depth} wrapped={wrapped}: {} bytes",
+                result.logical_plan.len()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn nested_coalesce_shares_for_sources_and_pattern_values() {
+    let mut session = Database::new().session();
+    let mut source = "seed".to_owned();
+    for _ in 0..20 {
+        source = format!("COALESCE({source},[])");
+    }
+    let result = session
+        .query(&format!(
+            "FOR seed IN [[1,NULL]] FOR x IN {source} RETURN x"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed_arithmetic_column(&result),
+        vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(None)]
+    );
+    assert!(result.logical_plan.len() < 100_000);
+    session
+        .run("CREATE GRAPH g ANY;SESSION SET GRAPH g;INSERT (:N {v:1})")
+        .await
+        .unwrap();
+    let mut value = "1".to_owned();
+    for _ in 0..10 {
+        value = format!("COALESCE(NULLIF({value},0),0)");
+    }
+    let result = session
+        .query(&format!("MATCH(n:N {{v:{value}}}) RETURN n.v AS v"))
+        .await
+        .unwrap();
+    assert_eq!(row(&result), vec![ScalarValue::Int64(Some(1))]);
+    assert!(result.logical_plan.len() < 100_000);
+}

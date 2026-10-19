@@ -202,6 +202,10 @@ pub(super) fn clause_filters(
     scope: &Bindings,
     expr: &ast::Expr,
 ) -> Result<Option<CaseFoldMap<NativeAtom>>> {
+    // COALESCE needs shared working-table columns, rather than expanded scan expressions.
+    if needs_shared_coalesce(expr) {
+        return Ok(None);
+    }
     filters_with_values(session, schema, scope, expr, false, BindContext::default())
 }
 
@@ -1362,6 +1366,12 @@ fn bind_value(
     working_row: bool,
     context: BindContext<'_>,
 ) -> Result<Option<(Expr, DataType)>> {
+    if !working_row
+        && needs_shared_coalesce(value)
+        && scope.order.iter().any(|name| mentions(value, name))
+    {
+        return Ok(None);
+    }
     let Ok(expr) = context.binder(session, schema, scope).bind(value) else {
         return Ok(None);
     };
@@ -1425,6 +1435,17 @@ pub(super) fn named_variable(expr: &ast::Expr, variable: &str) -> bool {
         }
         _ => false,
     }
+}
+
+pub(super) fn needs_shared_coalesce(expr: &ast::Expr) -> bool {
+    fn nested(expr: &ast::Expr, inside: bool) -> bool {
+        let coalesce = matches!(expr, ast::Expr::Coalesce(_));
+        (coalesce && inside)
+            || children(expr)
+                .into_iter()
+                .any(|child| nested(child, inside || coalesce))
+    }
+    nested(expr, false)
 }
 
 pub(super) fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {

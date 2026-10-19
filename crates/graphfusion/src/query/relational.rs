@@ -100,7 +100,11 @@ pub(super) async fn for_clause(
         return Err(Error::InvalidQuery("FOR variable is already bound".into()));
     }
     scope.value_types.set_schema(plan.schema().clone());
-    let mut source = Binder::with_bindings(session, plan.schema(), scope).bind(&clause.source)?;
+    let (plan, shared) = super::native::fragment_boolean(plan, scope, session, &clause.source)?;
+    let mut source = match shared {
+        Some(value) => value,
+        None => Binder::with_bindings(session, plan.schema(), scope).bind(&clause.source)?,
+    };
     if source.get_type(plan.schema())? == DataType::Null {
         source = cast(source, DataType::new_list(DataType::Null, true));
     }

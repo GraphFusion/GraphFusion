@@ -397,13 +397,25 @@ impl<'a> Binder<'a> {
                     }
                 };
                 if matches!(op, B::Add | B::Sub | B::Mul | B::Div) {
-                    let data_type = if left.get_type(self.schema)? == DataType::Float64
-                        || right.get_type(self.schema)? == DataType::Float64
-                    {
-                        DataType::Float64
-                    } else {
-                        DataType::Int64
-                    };
+                    let left_type = left.get_type(self.schema)?;
+                    let right_type = right.get_type(self.schema)?;
+                    if matches!(
+                        (&left_type, &right_type),
+                        (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+                    ) {
+                        return Ok(super::arithmetic::checked_mixed(
+                            left,
+                            operator,
+                            right,
+                            left_type == DataType::Int64,
+                        ));
+                    }
+                    let data_type =
+                        if left_type == DataType::Float64 || right_type == DataType::Float64 {
+                            DataType::Float64
+                        } else {
+                            DataType::Int64
+                        };
                     super::arithmetic::checked(left, operator, right, data_type)
                 } else if matches!(op, B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge) {
                     let left_type = left.get_type(self.schema)?;
@@ -470,8 +482,8 @@ impl<'a> Binder<'a> {
                 ))
             }
             E::Coalesce(args) => {
-                let args = args
-                    .iter()
+                let args = coalesce_arguments(args)
+                    .into_iter()
                     .map(|arg| self.bind(arg))
                     .collect::<Result<Vec<_>>>()?;
                 self.compatible(&args)?;
@@ -634,7 +646,15 @@ impl<'a> Binder<'a> {
             .iter()
             .map(|arg| arg.get_type(self.schema))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(super::arithmetic::lazy_coalesce(args, &types, element)?)
+        let value = super::arithmetic::lazy_coalesce(args, &types, element)?;
+        if value.column_refs().is_empty()
+            && datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty()
+        {
+            use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+            Ok(ExprSimplifier::new(SimplifyContext::default()).simplify(value)?)
+        } else {
+            Ok(value)
+        }
     }
 
     fn align_list_pair(&self, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
@@ -750,6 +770,25 @@ fn string(data_type: &DataType) -> bool {
         data_type,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
     )
+}
+
+// Flatten the associative abbreviation before binding when a caller only has
+// a schema. Working-table planning additionally shares arguments through columns.
+fn coalesce_arguments(args: &[ast::Expr]) -> Vec<&ast::Expr> {
+    fn collect<'a>(expr: &'a ast::Expr, result: &mut Vec<&'a ast::Expr>) {
+        if let ast::Expr::Coalesce(args) = expr {
+            for arg in args {
+                collect(arg, result);
+            }
+        } else {
+            result.push(expr);
+        }
+    }
+    let mut result = Vec::new();
+    for arg in args {
+        collect(arg, &mut result);
+    }
+    result
 }
 
 /// Decode nullable integer truth flags without exposing Boolean COALESCE to

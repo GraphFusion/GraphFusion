@@ -14,6 +14,13 @@ RETURN 6 * 7 AS answer, 7 / 2 AS quotient,
 
 Arithmetic uses checked kernels. Integer overflow (`integer overflow`), division by zero (`division by zero`) and non-finite floating results raise execution errors in both constant expressions and batch evaluation. Dividing the minimum integer by `-1` overflows. A null dividend divided by zero is null. A decimal literal that overflows to infinity is rejected as a bad number before execution. The binder rejects implicit text-to-number and boolean-to-number conversions.
 
+Mixed integer/float arithmetic requires the integer operand to be exactly representable as a float. Otherwise it reports `not exactly representable`. A null operand makes the result null before this conversion check.
+
+```gql test
+RETURN 9007199254740992 + 0.0 AS exact_value,
+       9007199254740993 + NULLIF(1.0, 1.0) AS missing_value;
+```
+
 `AND`, `OR`, and `XOR` decide each row before evaluating an operand that cannot change that row. A division by zero in a skipped operand does not fail the query. An operand the row still needs still raises the arithmetic error.
 
 Integer/float comparisons use the integer's exact value before widening. For example, `9007199254740993` is greater than `9007199254740992.0`. Comparisons on stored properties also retain that integer precision when other fragments store floats.
