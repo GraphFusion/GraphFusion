@@ -594,6 +594,7 @@ pub(super) fn result(
     let mut groups = Vec::new();
     if explicit {
         for expr in &body.group_by {
+            super::expressions::ensure_one_family(scope, expr, "GROUP BY")?;
             if let ast::Expr::Identifier(name) = expr {
                 if let Some(reference) = scope.references.get(&name.value) {
                     let scalar = scope.scalars.get(&name.value).expect("scalar reference");
@@ -649,6 +650,11 @@ pub(super) fn result(
                 && (!expr.column_refs().is_empty() || *property)
                 && !groups.contains(expr)
             {
+                super::expressions::ensure_one_family(
+                    scope,
+                    &ast::Expr::Identifier(ast::Identifier::new(name)),
+                    "GROUP BY",
+                )?;
                 groups.push(expr.clone());
             }
         }
@@ -661,6 +667,15 @@ pub(super) fn result(
     for dependency in dependencies {
         if !groups.contains(&dependency) {
             groups.push(dependency);
+        }
+    }
+    if body.result_clause.distinct {
+        for (name, _, _) in &projections {
+            super::expressions::ensure_one_family(
+                scope,
+                &ast::Expr::Identifier(ast::Identifier::new(name)),
+                "DISTINCT",
+            )?;
         }
     }
     let mut mapping = Vec::new();

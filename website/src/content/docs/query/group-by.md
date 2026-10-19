@@ -18,6 +18,8 @@ This returns Alice: 1, Bob: 1 and Cara: 0. COUNT(friend) ignores the null option
 
 Explicit GROUP BY accepts binding variables, including output aliases. Grouping an element groups its identity while retaining the columns needed for property access. `GROUP BY ()` chooses one global group.
 
+A property used as a group key, including an implicit key next to an aggregate, must use one comparable family. Integers and floats stay one family. Boolean, string, and byte-string values do not. Mixing those families is an invalid query, rather than grouping the string form of each cell. A fragment that does not store the property contributes null and does not add a family.
+
 ```gql test
 SELECT COUNT(*) AS people FROM social MATCH (p:Person)
 GROUP BY () HAVING COUNT(*) > 0;
