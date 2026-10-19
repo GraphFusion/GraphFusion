@@ -421,15 +421,20 @@ async fn plan(
             clone_working(&incoming),
         )
         .await?;
-        domains.retain(|name, domain| {
-            if let Some(right) = trace.output_domains.get(name) {
-                domain.extend(right.iter().copied());
-                true
-            } else {
-                false
-            }
-        });
-        references::retain_common_sources(&mut reference_sources, &trace.output_reference_sources);
+        if op.operator == ast::QuerySetOperator::Union {
+            domains.retain(|name, domain| {
+                if let Some(right) = trace.output_domains.get(name) {
+                    domain.extend(right.iter().copied());
+                    true
+                } else {
+                    false
+                }
+            });
+            references::retain_common_sources(
+                &mut reference_sources,
+                &trace.output_reference_sources,
+            );
+        }
         result = relational::set_operation(
             result,
             right,
