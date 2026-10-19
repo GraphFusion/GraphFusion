@@ -375,7 +375,7 @@ async fn plan(
                 clone_working(&incoming),
             )
             .await?;
-            merge_result_metadata(&mut checked_domains, &mut checked_sources, &validation);
+            merge_result_metadata(&mut checked_domains, &mut checked_sources, &validation)?;
             checked =
                 relational::set_operation(checked, right, ast::QuerySetOperator::Union, true)?;
         }
@@ -452,7 +452,7 @@ async fn plan(
         )
         .await?;
         if op.operator == ast::QuerySetOperator::Union {
-            merge_result_metadata(&mut domains, &mut reference_sources, trace);
+            merge_result_metadata(&mut domains, &mut reference_sources, trace)?;
         }
         result = relational::set_operation(
             result,
@@ -473,13 +473,14 @@ fn merge_result_metadata(
     domains: &mut BTreeMap<String, references::Domain>,
     sources: &mut references::ReferenceSources,
     right: &execution::Trace,
-) {
-    references::retain_common_sources(
+) -> Result<()> {
+    references::merge_sources(
         sources,
         &right.output_reference_sources,
         domains,
         &right.output_domains,
-    );
+        &right.sources,
+    )?;
     domains.retain(|name, domain| {
         if let Some(right) = right.output_domains.get(name) {
             domain.extend(right.iter().copied());
@@ -488,6 +489,7 @@ fn merge_result_metadata(
             false
         }
     });
+    Ok(())
 }
 
 fn without_trailing_page<'a>(
@@ -528,6 +530,9 @@ async fn apply_trailing_page(
         )?
         .build()?);
     }
+    let plan = freeze_page_before_sort(LogicalPlanBuilder::from(plan), true, ctx, trace)
+        .await?
+        .build()?;
     let columns = plan.schema().columns();
     let mut scope = graph::Bindings::default();
     for column in &columns {
@@ -717,7 +722,8 @@ async fn plan_body(
                         if let Some(element) = scope
                             .elements
                             .get(&source.value)
-                            .or_else(|| scope.reference_sources.get(&source.value))
+                            .map(|binding| vec![binding.clone()])
+                            .or_else(|| scope.reference_sources.get(&source.value).cloned())
                         {
                             scope
                                 .reference_sources

@@ -1202,3 +1202,14 @@ async fn trailing_page_applies_to_the_composite_result() {
     values.sort();
     assert_eq!(values, vec![vec!["0"], vec!["3"]]);
 }
+
+#[tokio::test]
+async fn composite_order_preserves_an_earlier_linear_branch_page() {
+    let mut s = fixture().await;
+    check(
+        &mut s,
+        "RETURN 0 AS n UNION ALL FOR n IN [1,2,3,4] LIMIT 2 RETURN n ORDER BY n DESC",
+        &[&["2"], &["1"], &["0"]],
+    )
+    .await;
+}
