@@ -82,7 +82,7 @@ pub(super) fn result_domains(body: &ast::QueryBody, scope: &Bindings) -> Domains
 }
 
 /// Source layouts retained across materialized query results. Only a direct
-/// element copy has one source; expressions spanning domains keep the fallback.
+/// element copy retains its participating layouts; unknown domains keep the fallback.
 pub(super) type ReferenceSources = super::casefold::CaseFoldMap<Vec<ElementBinding>>;
 
 pub(super) fn result_sources(body: &ast::QueryBody, scope: &Bindings) -> ReferenceSources {
