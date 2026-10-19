@@ -2225,7 +2225,7 @@ fn property_pair(
     };
     let left = fragment_binding(scope, left_name).expect("property element");
     let right = fragment_binding(scope, right_name).expect("property element");
-    if !pair_needs_stored_types(scope, &left, left_property, &right, right_property) {
+    if !pair_needs_stored_types(scope, &left, left_property, &right, right_property)? {
         return Ok((plan, None));
     }
     let (plan, expr) = compile_property_pair(
@@ -2268,7 +2268,7 @@ pub(super) fn equated_property(
         return Ok((plan, None));
     };
     let right = fragment_binding(scope, name).expect("property element");
-    if !pair_needs_stored_types(scope, binding, property, &right, right_property) {
+    if !pair_needs_stored_types(scope, binding, property, &right, right_property)? {
         return Ok((plan, None));
     }
     let (plan, expr) = compile_property_pair(
@@ -2289,12 +2289,12 @@ fn pair_needs_stored_types(
     left_property: &str,
     right: &ElementBinding,
     right_property: &str,
-) -> bool {
+) -> Result<bool> {
     let Some(left_data) = scope.sources.get(&left.graph) else {
-        return false;
+        return Ok(false);
     };
     let Some(right_data) = scope.sources.get(&right.graph) else {
-        return false;
+        return Ok(false);
     };
     let left_tables = element_tables(left_data, left);
     let right_tables = element_tables(right_data, right);
@@ -2319,7 +2319,13 @@ fn pair_needs_stored_types(
             }
         }
     }
-    comparable_pair && incompatible_pair
+    if !comparable_pair && !left_types.is_empty() && !right_types.is_empty() {
+        return Err(Error::InvalidQuery(format!(
+            "incomparable types {} and {}",
+            left_types[0], right_types[0]
+        )));
+    }
+    Ok(comparable_pair && incompatible_pair)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2365,4 +2371,73 @@ fn compile_property_pair(
         DataType::Boolean,
     );
     Ok((plan, expr))
+}
+
+/// Native value lowering only adds fragment joins; compare their counts before
+/// executing a barrier so ordinary expressions remain on their original plan.
+pub(super) fn added_fragment_joins(
+    before: &datafusion::logical_expr::LogicalPlan,
+    after: &datafusion::logical_expr::LogicalPlan,
+) -> bool {
+    fn joins(plan: &datafusion::logical_expr::LogicalPlan) -> usize {
+        usize::from(matches!(
+            plan,
+            datafusion::logical_expr::LogicalPlan::Join(_)
+        )) + plan
+            .inputs()
+            .iter()
+            .map(|input| joins(input))
+            .sum::<usize>()
+    }
+    joins(after) > joins(before)
+}
+
+/// Preserve working-row order even when a preceding reference lookup has
+/// already materialized the sort into a buffered scan.
+pub(super) async fn fragment_boolean_ordered(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    expression: &ast::Expr,
+    ctx: &datafusion::execution::context::SessionContext,
+    trace: &mut super::execution::Trace,
+) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
+    let (next, value) = fragment_boolean(plan.clone(), scope, session, expression)?;
+    if !added_fragment_joins(plan.plan(), next.plan()) {
+        return Ok((next, value));
+    }
+    let order = scope.fresh("fragment_order");
+    let plan = super::execution::ordinal(plan, ctx, trace, &order).await?;
+    let (next, value) = fragment_boolean(plan, scope, session, expression)?;
+    let columns = next
+        .schema()
+        .columns()
+        .into_iter()
+        .filter(|column| column.name != order)
+        .map(Expr::Column)
+        .collect::<Vec<_>>();
+    let next = next
+        .sort([Expr::Column(Column::new_unqualified(order)).sort(true, false)])?
+        .project(columns)?;
+    Ok((next, value))
+}
+
+pub(super) async fn fragment_predicate_ordered(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    predicate: &ast::Expr,
+    ctx: &datafusion::execution::context::SessionContext,
+    trace: &mut super::execution::Trace,
+) -> Result<Option<LogicalPlanBuilder>> {
+    let columns = plan.schema().columns();
+    let (plan, value) =
+        fragment_boolean_ordered(plan, scope, session, predicate, ctx, trace).await?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    Ok(Some(
+        plan.filter(value)?
+            .project(columns.into_iter().map(Expr::Column))?,
+    ))
 }
