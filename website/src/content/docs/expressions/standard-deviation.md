@@ -5,7 +5,7 @@ sidebar:
   order: 20
 ---
 
-STDDEV_POP computes population standard deviation; STDDEV_SAMP uses the sample form. Both accept ALL/DISTINCT and omit null inputs.
+STDDEV_POP computes population standard deviation; STDDEV_SAMP uses the sample form. Both accept ALL/DISTINCT and omit null inputs. DISTINCT keeps one copy of each number, so repeated values do not change the result. One distinct value has population deviation 0 and a null sample deviation.
 
 ```gql test
 FOR value IN [10, 20, 30]

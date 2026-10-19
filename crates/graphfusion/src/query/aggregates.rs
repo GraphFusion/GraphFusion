@@ -101,6 +101,8 @@ pub(super) fn call(
         "STDDEV_POP" | "STDDEV_SAMP" => {
             if data_type == DataType::Int64 {
                 super::stddev::integer_stddev(value, name == "STDDEV_POP")
+            } else if distinct {
+                distinct_stddev(value, name == "STDDEV_SAMP")?
             } else if name == "STDDEV_POP" {
                 agg::expr_fn::stddev_pop(value)
             } else {
@@ -206,6 +208,108 @@ fn percentile(
         )],
         Some(Box::new(result)),
     )))
+}
+
+/// `STDDEV_*(DISTINCT)` aggregates the distinct numbers, then takes the deviation.
+/// Values are sorted first so the one-pass update does not depend on group order.
+fn distinct_stddev(value: Expr, sample: bool) -> Result<Expr> {
+    let mut values = agg::expr_fn::array_agg(value.clone());
+    if let Expr::AggregateFunction(function) = &mut values {
+        function.params.distinct = true;
+        function.params.filter = Some(Box::new(value.is_not_null()));
+    }
+    Ok(stddev_values(values, sample))
+}
+
+fn stddev_values(values: Expr, sample: bool) -> Expr {
+    use datafusion::logical_expr::ScalarUDF;
+    static POP: std::sync::OnceLock<ScalarUDF> = std::sync::OnceLock::new();
+    static SAMP: std::sync::OnceLock<ScalarUDF> = std::sync::OnceLock::new();
+    let udf = if sample { &SAMP } else { &POP };
+    udf.get_or_init(|| stddev_values_udf(sample))
+        .call(vec![values])
+}
+
+fn stddev_values_udf(sample: bool) -> datafusion::logical_expr::ScalarUDF {
+    use datafusion::{
+        arrow::array::{Array, Float64Array, ListArray},
+        error::DataFusionError,
+        logical_expr::{create_udf, ColumnarValue, Volatility},
+    };
+    create_udf(
+        if sample {
+            "gql_stddev_samp_values"
+        } else {
+            "gql_stddev_pop_values"
+        },
+        vec![DataType::new_list(DataType::Float64, true)],
+        DataType::Float64,
+        Volatility::Immutable,
+        std::sync::Arc::new(move |args| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let lists = arrays[0]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("expected Float64 deviation list".into())
+                })?;
+            let mut output = Vec::with_capacity(lists.len());
+            for row in 0..lists.len() {
+                let deviation = if lists.is_null(row) {
+                    None
+                } else {
+                    let child = lists.value(row);
+                    let numbers =
+                        child
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .ok_or_else(|| {
+                                DataFusionError::Internal(
+                                    "expected Float64 deviation values".into(),
+                                )
+                            })?;
+                    deviation_of(numbers.iter().flatten(), sample)
+                };
+                output.push(deviation);
+            }
+            Ok(ColumnarValue::Array(std::sync::Arc::new(
+                Float64Array::from(output),
+            )))
+        }),
+    )
+}
+
+fn deviation_of(values: impl Iterator<Item = f64>, sample: bool) -> Option<f64> {
+    let mut numbers: Vec<f64> = values.collect();
+    if numbers.is_empty() || (sample && numbers.len() < 2) {
+        return None;
+    }
+    if numbers.iter().any(|value| !value.is_finite()) {
+        return Some(f64::NAN);
+    }
+    numbers.sort_by(f64::total_cmp);
+    // Recenter before scaling, retaining small differences between nearby large
+    // values while avoiding overflow for inputs with opposite signs.
+    let center = numbers[0] * 0.5 + numbers[numbers.len() - 1] * 0.5;
+    let scale = numbers
+        .iter()
+        .map(|value| (value - center).abs())
+        .fold(0.0_f64, f64::max);
+    if scale == 0.0 {
+        return Some(0.0);
+    }
+    let mut count = 0_u64;
+    let mut mean = 0.0_f64;
+    let mut square = 0.0_f64;
+    for value in numbers {
+        let value = (value - center) / scale;
+        count += 1;
+        let delta = value - mean;
+        mean += delta / count as f64;
+        square += delta * (value - mean);
+    }
+    let denominator = if sample { count - 1 } else { count };
+    Some((square / denominator as f64).sqrt() * scale)
 }
 
 fn percentile_fraction(value: Expr) -> Expr {
@@ -727,5 +831,25 @@ mod tests {
             );
         }
         assert!(percentile_product_value(f64::NAN, 2.0).is_nan());
+    }
+}
+
+#[cfg(test)]
+mod distinct_deviation_tests {
+    use super::deviation_of;
+    #[test]
+    fn floating_deviation_keeps_large_and_tiny_differences() {
+        assert_eq!(
+            deviation_of([1e308, -1e308].into_iter(), false),
+            Some(1e308)
+        );
+        assert_eq!(
+            deviation_of([1e16, 1e16 + 2.0].into_iter(), false),
+            Some(1.0)
+        );
+        assert_eq!(
+            deviation_of([1e-300, -1e-300].into_iter(), false),
+            Some(1e-300)
+        );
     }
 }
