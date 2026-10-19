@@ -147,6 +147,7 @@ async fn properties(
     scope: &mut Bindings,
     ctx: &SessionContext,
     trace: &mut Trace,
+    ordered: bool,
 ) -> Result<(LogicalPlanBuilder, Vec<(String, Expr)>)> {
     let mut result = Vec::new();
     if let Some(map) = map {
@@ -162,7 +163,8 @@ async fn properties(
             {
                 return Err(Error::InvalidDefinition("duplicate property".into()));
             }
-            let (next, value) = stored_value(plan, scope, session, value, ctx, trace).await?;
+            let (next, value) =
+                stored_value(plan, scope, session, value, ctx, trace, ordered).await?;
             plan = next;
             result.push((name.value.clone(), value));
         }
@@ -177,9 +179,13 @@ async fn stored_value(
     value: &ast::Expr,
     ctx: &SessionContext,
     trace: &mut Trace,
+    ordered: bool,
 ) -> Result<(LogicalPlanBuilder, Expr)> {
-    let (plan, mixed) =
-        super::native::fragment_boolean_ordered(plan, scope, session, value, ctx, trace).await?;
+    let (plan, mixed) = if ordered {
+        super::native::fragment_boolean_ordered(plan, scope, session, value, ctx, trace).await?
+    } else {
+        super::native::fragment_boolean(plan, scope, session, value)?
+    };
     let expression = match mixed {
         Some(value) => value,
         None => Binder::with_bindings(session, plan.schema(), scope).bind(value)?,
@@ -258,9 +264,16 @@ pub(super) async fn apply(
                         ast::Direction::Undirected => (left.column(ID), right.column(ID), false),
                         _ => return Err(super::unsupported("ambiguous INSERT edge direction")),
                     };
-                    let (next, values) =
-                        properties(edge.properties.as_ref(), session, plan, scope, ctx, trace)
-                            .await?;
+                    let (next, values) = properties(
+                        edge.properties.as_ref(),
+                        session,
+                        plan,
+                        scope,
+                        ctx,
+                        trace,
+                        true,
+                    )
+                    .await?;
                     plan = next;
                     let (next, _) = insert_element(
                         plan,
@@ -286,11 +299,31 @@ pub(super) async fn apply(
         }
         ast::QueryClause::Set(set) => {
             for item in &set.items {
-                let (name, mut edit, values) = match item {
+                let name = match item {
+                    ast::SetItem::Property { target, .. } => property_target(target)?.0,
+                    ast::SetItem::AllProperties { variable, .. }
+                    | ast::SetItem::Label { variable, .. } => variable.value.clone(),
+                };
+                let binding = target(&plan, scope, &name, id, ctx, trace).await?;
+                let original = plan.clone();
+                let active = original.clone().filter(binding.column(ID).is_not_null())?;
+                let (_, probe) = trace
+                    .collect(
+                        ctx,
+                        &active
+                            .clone()
+                            .limit(0, Some(1))?
+                            .project([lit(1_i64)])?
+                            .build()?,
+                    )
+                    .await?;
+                let has_target = probe.iter().any(|batch| batch.num_rows() != 0);
+                plan = active;
+                let (_, mut edit, values) = match item {
                     ast::SetItem::Property { target, value } => {
                         let (name, property) = property_target(target)?;
                         let (next, expr) =
-                            stored_value(plan, scope, session, value, ctx, trace).await?;
+                            stored_value(plan, scope, session, value, ctx, trace, false).await?;
                         plan = next;
                         (name, Edit::default(), vec![(property, expr)])
                     }
@@ -299,7 +332,7 @@ pub(super) async fn apply(
                         properties: map,
                     } => {
                         let (next, values) =
-                            properties(Some(map), session, plan, scope, ctx, trace).await?;
+                            properties(Some(map), session, plan, scope, ctx, trace, false).await?;
                         plan = next;
                         (
                             variable.value.clone(),
@@ -319,8 +352,15 @@ pub(super) async fn apply(
                         vec![],
                     ),
                 };
-                let binding = target(&plan, scope, &name, id, ctx, trace).await?;
-                let patch = patch(&plan, &binding, values, &mut edit, ctx, trace).await?;
+                let patch_plan = plan;
+                plan = original;
+                // Bind every RHS for query errors, but do not execute it when
+                // no target survives. The filtered patch never evaluates null
+                // target rows, and the original working rows remain available.
+                if !has_target {
+                    continue;
+                }
+                let patch = patch(&patch_plan, &binding, values, &mut edit, ctx, trace).await?;
                 if let Some((patch, ids)) = patch {
                     data = edit_graph(&data, binding.kind, &patch, &ids, &edit, ctx, trace).await?;
                     writes.affected += ids.len();
@@ -452,8 +492,16 @@ async fn insert_node(
             return Ok((plan, binding));
         }
     }
-    let (plan, values) =
-        properties(node.properties.as_ref(), session, plan, scope, ctx, trace).await?;
+    let (plan, values) = properties(
+        node.properties.as_ref(),
+        session,
+        plan,
+        scope,
+        ctx,
+        trace,
+        true,
+    )
+    .await?;
     insert_element(
         plan,
         scope,
@@ -582,6 +630,7 @@ async fn insert_element(
     // Empty input still needs typed bindings, but must not publish a new layout.
     if rows != 0 {
         *data = next;
+        scope.sources.insert(graph_id, Arc::new(data.clone()));
         *affected += rows;
     }
     plan = plan.join_on(
