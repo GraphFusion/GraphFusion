@@ -19,4 +19,4 @@ RETURN UNKNOWN IS UNKNOWN AS unknown,
        UNKNOWN IS NOT FALSE AS not_false;
 ```
 
-WHERE and FILTER retain only true rows. Declared BOOLEAN session initializers also accept `NOT UNKNOWN`; the result is a null value subject to the declaration's nullability constraint.
+WHERE and FILTER retain only true rows. A truth test of a property comparison classifies the result from each fragment's stored type. An integer compared with those same digits stored as text is unknown, not true. Declared BOOLEAN session initializers also accept `NOT UNKNOWN`; the result is a null value subject to the declaration's nullability constraint.

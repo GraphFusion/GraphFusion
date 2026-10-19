@@ -123,7 +123,8 @@ impl ValueType {
                 return Ok(t);
             }
             T::Named { name, parameters } => {
-                let kind = match name.value.to_ascii_uppercase().as_str() {
+                let upper = name.value.to_ascii_uppercase();
+                let kind = match upper.as_str() {
                     "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "INT64" | "INT32" | "INT16"
                     | "INT8" | "UINT64" | "UINT32" | "UINT16" | "UINT8" => "integer",
                     "STRING" | "VARCHAR" | "CHAR" => "string",
@@ -138,9 +139,28 @@ impl ValueType {
                     }
                 };
                 let mut t = Self::scalar(kind);
-                // Named syntax is retained semantically; precision is not an AST serialization.
-                for (i, v) in parameters.iter().enumerate() {
-                    t.parameters.insert(format!("parameter_{i}"), *v);
+                // CHAR(n) is parsed as a named type. Its length is a maximum, like
+                // VARCHAR(n) and STRING(n); a zero length is not a limit.
+                if upper == "CHAR" {
+                    match parameters.as_slice() {
+                        [] => {}
+                        [length] if *length > 0 => {
+                            t.parameters.insert("max_length".into(), *length);
+                        }
+                        [_] => {
+                            return Err(Error::InvalidDefinition(
+                                "character string max length must be positive".into(),
+                            ))
+                        }
+                        _ => {
+                            return Err(Error::InvalidDefinition("CHAR accepts one length".into()))
+                        }
+                    }
+                } else {
+                    // Named syntax is retained semantically; precision is not an AST serialization.
+                    for (i, v) in parameters.iter().enumerate() {
+                        t.parameters.insert(format!("parameter_{i}"), *v);
+                    }
                 }
                 t
             }

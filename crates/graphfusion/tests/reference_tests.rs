@@ -55,6 +55,38 @@ async fn path_and_group_references_read_properties_and_labels() {
 }
 
 #[tokio::test]
+async fn reference_lookup_keeps_prior_order() {
+    let mut s = graph().await;
+    s.run("INSERT (:N {name:'E'}),(:N {name:'D'}),(:N {name:'F'}),(:N {name:'H'}),(:N {name:'G'})")
+        .await
+        .unwrap();
+    check(
+        &mut s,
+        "MATCH (n:N) ORDER BY n.name LET r = n RETURN r.name AS name",
+        &[
+            &["A"],
+            &["B"],
+            &["C"],
+            &["D"],
+            &["E"],
+            &["F"],
+            &["G"],
+            &["H"],
+        ],
+    )
+    .await;
+    s.run("INSERT (:P {name:'P'})-[:R {name:'e1'}]->(:Q {name:'Q'})-[:R {name:'e2'}]->(:S {name:'S'})")
+        .await
+        .unwrap();
+    check(
+        &mut s,
+        "MATCH p = (a {name:'P'})-[:R]->()-[:R]->() FOR r IN ELEMENTS(p) RETURN r.name AS name",
+        &[&["P"], &["e1"], &["Q"], &["e2"], &["S"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn references_rebind_nodes_edges_and_preserve_input_multiplicity() {
     let mut s = graph().await;
     check(&mut s, "MATCH (a {name:'A'}) FOR r IN [a,a,NULL] MATCH (r)-[:E]->(b) RETURN r.name AS origin,b.name AS destination", &[&["A","B"], &["A","B"]]).await;
