@@ -529,6 +529,17 @@ pub(super) fn predicates_for(
             if native.properties.contains(&name.value) {
                 continue;
             }
+            let columns = plan.schema().columns();
+            let mut fragments = scope.clone();
+            let (next, equality) =
+                super::native::equated_property(plan, &mut fragments, binding, &name.value, value)?;
+            if let Some(equality) = equality {
+                plan = next
+                    .filter(equality)?
+                    .project(columns.into_iter().map(Expr::Column))?;
+                continue;
+            }
+            plan = next;
             let right = Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
             let equality = Binder::with_bindings(session, plan.schema(), scope)
                 .equals(binding.property(&name.value), right)?;

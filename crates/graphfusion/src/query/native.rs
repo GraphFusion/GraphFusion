@@ -26,6 +26,29 @@ use datafusion::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone, Copy, Default)]
+struct BindContext<'a> {
+    aliases: Option<&'a CaseFoldMap<Expr>>,
+    aggregates: bool,
+}
+impl<'a> BindContext<'a> {
+    fn binder(
+        self,
+        session: &'a SessionState,
+        schema: &'a DFSchema,
+        scope: &'a Bindings,
+    ) -> Binder<'a> {
+        let mut binder = Binder::with_bindings(session, schema, scope);
+        if self.aggregates {
+            binder = binder.aggregating();
+        }
+        if let Some(aliases) = self.aliases {
+            binder = binder.aliases(aliases);
+        }
+        binder
+    }
+}
+
 /// Partition key for a conjunct that does not read an element property.
 const CLOSED: &str = "\0";
 
@@ -174,7 +197,7 @@ pub(super) fn clause_filters(
     scope: &Bindings,
     expr: &ast::Expr,
 ) -> Result<Option<CaseFoldMap<NativeAtom>>> {
-    filters_with_values(session, schema, scope, expr, false)
+    filters_with_values(session, schema, scope, expr, false, BindContext::default())
 }
 
 fn filters_with_values(
@@ -183,6 +206,7 @@ fn filters_with_values(
     scope: &Bindings,
     expr: &ast::Expr,
     working_row: bool,
+    context: BindContext<'_>,
 ) -> Result<Option<CaseFoldMap<NativeAtom>>> {
     let Some(parts) = partition(expr) else {
         return Ok(None);
@@ -194,7 +218,8 @@ fn filters_with_values(
     }
     let mut filters = CaseFoldMap::new();
     for (variable, local) in parts {
-        let Some(atom) = bind_local_value(session, schema, scope, &local, working_row)? else {
+        let Some(atom) = bind_local_value(session, schema, scope, &local, working_row, context)?
+        else {
             return Ok(None);
         };
         // `n` and `N` are one variable, so combine their conjuncts.
@@ -1107,7 +1132,7 @@ fn bind_local(
     scope: &Bindings,
     local: &Local,
 ) -> Result<Option<NativeAtom>> {
-    bind_local_value(session, schema, scope, local, false)
+    bind_local_value(session, schema, scope, local, false, BindContext::default())
 }
 
 fn bind_local_value(
@@ -1116,6 +1141,7 @@ fn bind_local_value(
     scope: &Bindings,
     local: &Local,
     working_row: bool,
+    context: BindContext<'_>,
 ) -> Result<Option<NativeAtom>> {
     Ok(match local {
         Local::Exists { property } => Some(NativeAtom::Exists {
@@ -1135,42 +1161,42 @@ fn bind_local_value(
         }),
         Local::ElementSelf { op } => Some(NativeAtom::ElementSelf { op: *op }),
         Local::ElementCompare { op, value } => {
-            bind_value(session, schema, scope, value, working_row)?.map(|(value, value_type)| {
-                NativeAtom::ElementCompare {
+            bind_value(session, schema, scope, value, working_row, context)?.map(
+                |(value, value_type)| NativeAtom::ElementCompare {
                     op: *op,
                     value,
                     value_type,
-                }
-            })
+                },
+            )
         }
         Local::And(left, right) => match (
-            bind_local_value(session, schema, scope, left, working_row)?,
-            bind_local_value(session, schema, scope, right, working_row)?,
+            bind_local_value(session, schema, scope, left, working_row, context)?,
+            bind_local_value(session, schema, scope, right, working_row, context)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::And(Box::new(left), Box::new(right))),
             _ => None,
         },
         Local::Or(left, right) => match (
-            bind_local_value(session, schema, scope, left, working_row)?,
-            bind_local_value(session, schema, scope, right, working_row)?,
+            bind_local_value(session, schema, scope, left, working_row, context)?,
+            bind_local_value(session, schema, scope, right, working_row, context)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::Or(Box::new(left), Box::new(right))),
             _ => None,
         },
         Local::Xor(left, right) => match (
-            bind_local_value(session, schema, scope, left, working_row)?,
-            bind_local_value(session, schema, scope, right, working_row)?,
+            bind_local_value(session, schema, scope, left, working_row, context)?,
+            bind_local_value(session, schema, scope, right, working_row, context)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::Xor(Box::new(left), Box::new(right))),
             _ => None,
         },
-        Local::Not(inner) => bind_local_value(session, schema, scope, inner, working_row)?
+        Local::Not(inner) => bind_local_value(session, schema, scope, inner, working_row, context)?
             .map(|inner| NativeAtom::Not(Box::new(inner))),
         Local::Truth {
             inner,
             negated,
             value,
-        } => bind_local_value(session, schema, scope, inner, working_row)?.map(|inner| {
+        } => bind_local_value(session, schema, scope, inner, working_row, context)?.map(|inner| {
             NativeAtom::Truth {
                 inner: Box::new(inner),
                 negated: *negated,
@@ -1178,7 +1204,7 @@ fn bind_local_value(
             }
         }),
         Local::Unknown { inner, negated } => {
-            bind_local_value(session, schema, scope, inner, working_row)?.map(|inner| {
+            bind_local_value(session, schema, scope, inner, working_row, context)?.map(|inner| {
                 NativeAtom::Unknown {
                     inner: Box::new(inner),
                     negated: *negated,
@@ -1190,7 +1216,8 @@ fn bind_local_value(
             negated: *negated,
         }),
         Local::Closed(expr) => {
-            let Some((bound, data_type)) = bind_value(session, schema, scope, expr, working_row)?
+            let Some((bound, data_type)) =
+                bind_value(session, schema, scope, expr, working_row, context)?
             else {
                 return Ok(None);
             };
@@ -1207,18 +1234,20 @@ fn bind_local_value(
             property,
             op,
             value,
-        } => bind_value(session, schema, scope, value, working_row)?.map(|(expr, value_type)| {
-            NativeAtom::Compare {
+        } => bind_value(session, schema, scope, value, working_row, context)?.map(
+            |(expr, value_type)| NativeAtom::Compare {
                 property: property.clone(),
                 op: *op,
                 value: expr,
                 value_type,
-            }
-        }),
+            },
+        ),
         Local::Coalesce(args) => {
             let mut bound = Vec::with_capacity(args.len());
             for arg in args {
-                let Some(atom) = bind_local_value(session, schema, scope, arg, working_row)? else {
+                let Some(atom) =
+                    bind_local_value(session, schema, scope, arg, working_row, context)?
+                else {
                     return Ok(None);
                 };
                 bound.push(atom);
@@ -1226,14 +1255,15 @@ fn bind_local_value(
             Some(NativeAtom::Coalesce(bound))
         }
         Local::NullIf(left, right) => match (
-            bind_local_value(session, schema, scope, left, working_row)?,
-            bind_local_value(session, schema, scope, right, working_row)?,
+            bind_local_value(session, schema, scope, left, working_row, context)?,
+            bind_local_value(session, schema, scope, right, working_row, context)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::NullIf(Box::new(left), Box::new(right))),
             _ => None,
         },
         Local::Literal(value) => {
-            let Some((expr, value_type)) = bind_value(session, schema, scope, value, working_row)?
+            let Some((expr, value_type)) =
+                bind_value(session, schema, scope, value, working_row, context)?
             else {
                 return Ok(None);
             };
@@ -1249,14 +1279,14 @@ fn bind_local_value(
             property,
             value,
             negated,
-        } => bind_value(session, schema, scope, value, working_row)?.map(|(expr, value_type)| {
-            NativeAtom::NullIfNull {
+        } => bind_value(session, schema, scope, value, working_row, context)?.map(
+            |(expr, value_type)| NativeAtom::NullIfNull {
                 property: property.clone(),
                 value: expr,
                 value_type,
                 negated: *negated,
-            }
-        }),
+            },
+        ),
         Local::ValueCoalesce {
             property,
             fallbacks,
@@ -1266,13 +1296,14 @@ fn bind_local_value(
             let mut bound = Vec::with_capacity(fallbacks.len());
             for fallback in fallbacks {
                 let Some((expr, data_type)) =
-                    bind_value(session, schema, scope, fallback, working_row)?
+                    bind_value(session, schema, scope, fallback, working_row, context)?
                 else {
                     return Ok(None);
                 };
                 bound.push((expr, data_type));
             }
-            let Some((right, right_type)) = bind_value(session, schema, scope, value, working_row)?
+            let Some((right, right_type)) =
+                bind_value(session, schema, scope, value, working_row, context)?
             else {
                 return Ok(None);
             };
@@ -1296,7 +1327,7 @@ fn bind_closed(
     scope: &Bindings,
     value: &ast::Expr,
 ) -> Result<Option<(Expr, DataType)>> {
-    bind_value(session, schema, scope, value, false)
+    bind_value(session, schema, scope, value, false, BindContext::default())
 }
 
 // Fragment joins can read the working row; scan pushdown cannot.
@@ -1306,8 +1337,9 @@ fn bind_value(
     scope: &Bindings,
     value: &ast::Expr,
     working_row: bool,
+    context: BindContext<'_>,
 ) -> Result<Option<(Expr, DataType)>> {
-    let Ok(expr) = Binder::with_bindings(session, schema, scope).bind(value) else {
+    let Ok(expr) = context.binder(session, schema, scope).bind(value) else {
         return Ok(None);
     };
     if !working_row && !expr.column_refs().is_empty() {
@@ -1510,8 +1542,39 @@ pub(super) fn fragment_boolean(
     session: &SessionState,
     predicate: &ast::Expr,
 ) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
-    let Some(filters) = filters_with_values(session, plan.schema(), scope, predicate, true)? else {
-        return combine_fragments(plan, scope, session, predicate);
+    fragment_boolean_in(plan, scope, session, predicate, BindContext::default())
+}
+
+pub(super) fn fragment_result_value(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    aliases: &CaseFoldMap<Expr>,
+    expression: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Option<MixedValue>)> {
+    let context = BindContext {
+        aliases: Some(aliases),
+        aggregates: true,
+    };
+    let (plan, value) = fragment_boolean_in(plan, scope, session, expression, context)?;
+    Ok((plan, value.map(|expr| MixedValue { expr })))
+}
+
+fn fragment_boolean_in(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    predicate: &ast::Expr,
+    context: BindContext<'_>,
+) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
+    let (plan, pair) = property_pair(plan, scope, predicate)?;
+    if pair.is_some() {
+        return Ok((plan, pair));
+    }
+    let Some(filters) =
+        filters_with_values(session, plan.schema(), scope, predicate, true, context)?
+    else {
+        return combine_fragments(plan, scope, session, predicate, context);
     };
     if filters
         .keys()
@@ -1573,6 +1636,7 @@ fn combine_fragments(
     scope: &mut Bindings,
     session: &SessionState,
     predicate: &ast::Expr,
+    context: BindContext<'_>,
 ) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
     use BooleanComposition as C;
     let (operands, composition): (Vec<&ast::Expr>, C) = match predicate {
@@ -1609,7 +1673,7 @@ fn combine_fragments(
     };
     let mut lowered = Vec::with_capacity(operands.len());
     for operand in &operands {
-        let (next, value) = fragment_boolean(plan, scope, session, operand)?;
+        let (next, value) = fragment_boolean_in(plan, scope, session, operand, context)?;
         plan = next;
         lowered.push(value);
     }
@@ -1621,7 +1685,9 @@ fn combine_fragments(
         .zip(lowered)
         .map(|(operand, value)| match value {
             Some(value) => Ok(value),
-            None => Binder::with_bindings(session, plan.schema(), scope).predicate(operand),
+            None => context
+                .binder(session, plan.schema(), scope)
+                .predicate(operand),
         })
         .collect::<Result<Vec<_>>>()?
         .into_iter();
@@ -1801,19 +1867,16 @@ pub(super) fn grouping_columns(
         .collect()
 }
 
-fn compile_on_fragments(
+fn attach_fragments(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     binding: &ElementBinding,
-    atom: &NativeAtom,
-) -> Result<(LogicalPlanBuilder, Expr)> {
+) -> Result<(LogicalPlanBuilder, Vec<Fragment>)> {
     let data = scope
         .sources
         .get(&binding.graph)
         .ok_or_else(|| Error::Corrupt("missing graph for fragment comparison".into()))?;
     let tables = element_tables(data, binding);
-    validate_kind(atom, binding.kind)?;
-    validate(atom, tables.iter().copied())?;
     let key = FragmentKey {
         alias: binding.alias.clone(),
         graph: binding.graph,
@@ -1879,6 +1942,22 @@ fn compile_on_fragments(
         scope.fragment_cache.insert(key, fragments.clone());
         fragments
     };
+    Ok((plan, fragments))
+}
+
+fn compile_on_fragments(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    binding: &ElementBinding,
+    atom: &NativeAtom,
+) -> Result<(LogicalPlanBuilder, Expr)> {
+    let data = scope
+        .sources
+        .get(&binding.graph)
+        .ok_or_else(|| Error::Corrupt("missing graph for fragment comparison".into()))?;
+    validate_kind(atom, binding.kind)?;
+    validate(atom, element_tables(data, binding))?;
+    let (plan, fragments) = attach_fragments(plan, scope, binding)?;
     let mut parts = Vec::new();
     for fragment in fragments {
         parts.push(Expr::Case(datafusion::logical_expr::expr::Case::new(
@@ -2108,4 +2187,182 @@ fn comparison_op(op: &ast::BinaryOp) -> Option<Operator> {
         ast::BinaryOp::Ge => Operator::GtEq,
         _ => return None,
     })
+}
+
+fn element_property<'a>(expr: &'a ast::Expr, scope: &Bindings) -> Option<(&'a str, &'a str)> {
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    fragment_binding(scope, &name.value)?;
+    Some((&name.value, &key.value))
+}
+
+fn property_pair(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    expr: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
+    let ast::Expr::Binary { left, op, right } = expr else {
+        return Ok((plan, None));
+    };
+    let op = match op {
+        ast::BinaryOp::Eq => Operator::Eq,
+        ast::BinaryOp::Neq => Operator::NotEq,
+        ast::BinaryOp::Lt => Operator::Lt,
+        ast::BinaryOp::Le => Operator::LtEq,
+        ast::BinaryOp::Gt => Operator::Gt,
+        ast::BinaryOp::Ge => Operator::GtEq,
+        _ => return Ok((plan, None)),
+    };
+    let (Some((left_name, left_property)), Some((right_name, right_property))) = (
+        element_property(left, scope),
+        element_property(right, scope),
+    ) else {
+        return Ok((plan, None));
+    };
+    let left = fragment_binding(scope, left_name).expect("property element");
+    let right = fragment_binding(scope, right_name).expect("property element");
+    if !pair_needs_stored_types(scope, &left, left_property, &right, right_property) {
+        return Ok((plan, None));
+    }
+    let (plan, expr) = compile_property_pair(
+        plan,
+        scope,
+        &left,
+        left_property,
+        op,
+        &right,
+        right_property,
+    )?;
+    let expr = reference_pair_guard(scope, left_name, expr);
+    Ok((plan, Some(reference_pair_guard(scope, right_name, expr))))
+}
+
+fn reference_pair_guard(scope: &Bindings, name: &str, expr: Expr) -> Expr {
+    if scope.elements.contains_key(name) {
+        return expr;
+    }
+    let reference = scope.references.get(name).expect("resolved reference");
+    let column = scope.scalars.get(name).expect("reference column").clone();
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(reference.guard(Expr::Column(column))),
+            Box::new(expr),
+        )],
+        Some(Box::new(unknown())),
+    ))
+}
+
+pub(super) fn equated_property(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    binding: &ElementBinding,
+    property: &str,
+    value: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
+    let Some((name, right_property)) = element_property(value, scope) else {
+        return Ok((plan, None));
+    };
+    let right = fragment_binding(scope, name).expect("property element");
+    if !pair_needs_stored_types(scope, binding, property, &right, right_property) {
+        return Ok((plan, None));
+    }
+    let (plan, expr) = compile_property_pair(
+        plan,
+        scope,
+        binding,
+        property,
+        Operator::Eq,
+        &right,
+        right_property,
+    )?;
+    Ok((plan, Some(reference_pair_guard(scope, name, expr))))
+}
+
+fn pair_needs_stored_types(
+    scope: &Bindings,
+    left: &ElementBinding,
+    left_property: &str,
+    right: &ElementBinding,
+    right_property: &str,
+) -> bool {
+    let Some(left_data) = scope.sources.get(&left.graph) else {
+        return false;
+    };
+    let Some(right_data) = scope.sources.get(&right.graph) else {
+        return false;
+    };
+    let left_tables = element_tables(left_data, left);
+    let right_tables = element_tables(right_data, right);
+    let types = |tables: &[&Table], property: &str| {
+        tables
+            .iter()
+            .filter_map(|t| {
+                crate::graph::property_field(&t.schema, property).map(|f| f.data_type().clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let left_types = types(&left_tables, left_property);
+    let right_types = types(&right_tables, right_property);
+    let mut comparable_pair = false;
+    let mut incompatible_pair = false;
+    for a in &left_types {
+        for b in &right_types {
+            if comparable(a, b) {
+                comparable_pair = true;
+            } else {
+                incompatible_pair = true;
+            }
+        }
+    }
+    comparable_pair && incompatible_pair
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_property_pair(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    left: &ElementBinding,
+    left_property: &str,
+    op: Operator,
+    right: &ElementBinding,
+    right_property: &str,
+) -> Result<(LogicalPlanBuilder, Expr)> {
+    let (plan, left_fragments) = attach_fragments(plan, scope, left)?;
+    let (plan, right_fragments) = attach_fragments(plan, scope, right)?;
+    let mut parts = Vec::new();
+    for a in &left_fragments {
+        for b in &right_fragments {
+            if left.alias == right.alias && a.alias != b.alias {
+                continue;
+            }
+            let Some(field) = crate::graph::property_field(&b.schema, right_property) else {
+                continue;
+            };
+            let value = qualified_property(&b.schema, Some(&b.alias), right_property);
+            let comparison = compare_property(
+                &a.schema,
+                &qualified_property(&a.schema, Some(&a.alias), left_property),
+                left_property,
+                op,
+                value,
+                field.data_type(),
+            )?;
+            parts.push(comparison);
+        }
+    }
+    let expr = match parts.len() {
+        0 => unknown(),
+        1 => parts.pop().expect("property comparison"),
+        _ => coalesce(parts),
+    };
+    let expr = left.ensure_live(
+        right.ensure_live(expr, DataType::Boolean),
+        DataType::Boolean,
+    );
+    Ok((plan, expr))
 }

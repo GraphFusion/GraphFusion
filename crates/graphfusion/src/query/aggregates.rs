@@ -222,6 +222,7 @@ pub(super) fn result(
     session: &SessionState,
     outer: &mut Bindings,
     body: &ast::QueryBody,
+    input_order: Option<Expr>,
 ) -> Result<LogicalPlanBuilder> {
     let mut aliases = CaseFoldMap::new();
     let mut result_scope = outer.clone();
@@ -459,6 +460,11 @@ pub(super) fn result(
             .map(rewrite)
             .collect::<Result<Vec<_>>>()?
     };
+    if ordering.is_empty() && !grouped && !body.result_clause.distinct {
+        if let Some(order) = input_order {
+            plan = plan.sort([order.sort(true, false)])?;
+        }
+    }
     if !ordering.is_empty() {
         let ordering = ordering
             .into_iter()
@@ -526,7 +532,7 @@ fn bind_result_expr(
             return Ok((plan, alias.clone(), None));
         }
     }
-    let (plan, mixed) = super::native::fragment_value(plan, scope, session, expr)?;
+    let (plan, mixed) = super::native::fragment_result_value(plan, scope, session, aliases, expr)?;
     if let Some(mixed) = mixed {
         return Ok((
             plan,

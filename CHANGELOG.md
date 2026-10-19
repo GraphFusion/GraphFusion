@@ -214,6 +214,10 @@
   `SELECT WHERE`, `HAVING`, and `ORDER BY`. An integer property does not become
   equal to its text form after the columns are unified, including when `AND`,
   `OR`, `XOR`, or `NOT` combines the comparison with another boolean.
+- Compare two properties on each fragment's stored type. A mixed scan no longer
+  orders integers as text or treats an integer as equal to that text on another
+  element. The comparison applies in WHERE, parenthesized path predicates,
+  FILTER, property maps, RETURN, SELECT, HAVING, and ORDER BY.
 
 ## 0.2.0 — 2026-10-05
 

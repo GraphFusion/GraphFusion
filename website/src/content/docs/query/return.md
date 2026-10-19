@@ -7,6 +7,8 @@ sidebar:
 
 `RETURN` projects expressions into an Arrow result table. A variable keeps its name; give computed expressions an explicit `AS` alias to make result schemas stable. Otherwise scalar expressions receive names such as `column_1`. A comparison of a property that has different non-numeric types uses each stored type, not the unified text column.
 
+A comparison of two properties in `RETURN`, `SELECT`, `HAVING`, or `ORDER BY` uses each fragment's stored type, just as `WHERE` does.
+
 ```gql test
 MATCH (p:Person)
 RETURN p.name AS name, p.age + 1 AS next_age

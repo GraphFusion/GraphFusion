@@ -25,6 +25,8 @@ A property stored as different non-numeric types is compared on each fragment, i
 
 A property stored as different non-numeric types is compared on each fragment in `RETURN`, `SELECT`, `SELECT WHERE`, `HAVING`, and `ORDER BY`. A fragment that cannot compare the value is unknown, so an integer does not match the text it would show after the columns are unified. `AND`, `OR`, `XOR`, and `NOT` keep that result.
 
+A comparison between two properties uses each fragment's stored type, including a parenthesized path predicate. An integer is not equal to the same digits stored as text, and integer order is not lexicographic, when another fragment stores that name as a different type.
+
 An OPTIONAL MATCH predicate participates in matching before null padding. A later FILTER runs after padding and can remove unmatched rows. Put conditions on the optional neighbor inside OPTIONAL MATCH when you want to keep input rows that have no such neighbor.
 
 A name bound on only some alternatives, or only on the present side of a questioned segment, is null on the other rows. A comparison with that null is unknown and does not keep the row. A repeated group exposes a list, so a property comparison on that name is rejected; write the comparison on the node inside the group to test each repetition.
