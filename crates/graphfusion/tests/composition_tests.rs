@@ -4050,3 +4050,210 @@ async fn several_stored_operator_sources_keep_a_bounded_plan() {
         result.logical_plan.len()
     );
 }
+
+#[tokio::test]
+async fn result_operators_use_stored_types() {
+    let mut session = social().await;
+    let added = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id + 0 AS value ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(added.schema.field(1).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&added),
+        vec![
+            vec!["Ada".to_string(), "1".to_string()],
+            vec!["Bea".to_string(), "2".to_string()],
+            vec!["NULL".to_string(), "NULL".to_string()]
+        ]
+    );
+
+    let concatenated = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id || '!' AS value ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(concatenated.schema.field(1).data_type(), &DataType::Utf8);
+    assert_eq!(
+        strings(&concatenated),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string()],
+            vec!["NULL".to_string(), "doc!".to_string()]
+        ]
+    );
+
+    let multiplied = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id * 1 AS value ORDER BY value",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&multiplied),
+        vec![
+            vec!["Ada".to_string(), "1".to_string()],
+            vec!["Bea".to_string(), "2".to_string()],
+            vec!["NULL".to_string(), "NULL".to_string()]
+        ]
+    );
+
+    let negated = session
+        .query("MATCH (n:Person|Document) WHERE n.name = 'Ada' RETURN -n.id AS value")
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["-1".to_string()]]);
+
+    let widened = session
+        .query(
+            "MATCH (n:Person|Metric)
+             RETURN n.score + 0 AS score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![
+            vec!["1".to_string()],
+            vec!["1.5".to_string()],
+            vec!["2".to_string()]
+        ]
+    );
+
+    let ordered = session
+        .query("MATCH (n:Person|Document) RETURN n.name AS name ORDER BY n.id + 0")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&ordered),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+    let paged = session
+        .query(
+            "MATCH (n:Person|Document) ORDER BY n.id + 0 DESC
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&paged),
+        vec![
+            vec!["NULL".to_string()],
+            vec!["Bea".to_string()],
+            vec!["Ada".to_string()]
+        ]
+    );
+
+    let bound = session
+        .query(
+            "MATCH (n:Person|Document) LET computed = n.id + 0
+             FILTER computed = 1 RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&bound), vec![vec!["Ada".to_string()]]);
+    let bound_text = session
+        .query(
+            "MATCH (n:Person|Document) LET computed = n.id || '!'
+             FILTER computed = '1!' RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound_text.row_count(), 0);
+    let bound_doc = session
+        .query(
+            "MATCH (n:Person|Document) LET computed = n.id || '!'
+             FILTER computed = 'doc!' RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&bound_doc), vec![vec!["Spec".to_string()]]);
+
+    let incompatible = session
+        .query("MATCH (d:Document) RETURN d.id + 0 AS value")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d)",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->()
+             RETURN e.since * 1 AS since ORDER BY since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&edge),
+        vec![vec!["1".to_string()], vec!["NULL".to_string()]]
+    );
+    let edge_text = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->()
+             RETURN e.since || '!' AS since ORDER BY since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&edge_text),
+        vec![vec!["old!".to_string()], vec!["NULL".to_string()]]
+    );
+}
+
+mod stored_result_regressions {
+    use datafusion::arrow::array::Array;
+    use graphfusion::Database;
+    async fn session() -> graphfusion::Session {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:T {v:'text'})")
+            .await
+            .unwrap();
+        s
+    }
+    #[tokio::test]
+    async fn expression_fallback_survives_incompatible_operator() {
+        let mut s = session().await;
+        let r = s
+            .query("MATCH(n) RETURN COALESCE(n.v || '!', 'fallback') AS v")
+            .await
+            .unwrap();
+        assert_eq!(r.row_count(), 2);
+        assert_eq!(
+            r.batches
+                .iter()
+                .map(|b| b.column(0).null_count())
+                .sum::<usize>(),
+            0,
+            "{r:?}"
+        );
+    }
+    #[tokio::test]
+    async fn distinct_ordering_reuses_equivalent_stored_expression() {
+        let mut s = session().await;
+        s.query("MATCH(n) RETURN DISTINCT n.v || '!' AS v ORDER BY n.v || '!'")
+            .await
+            .unwrap();
+    }
+}

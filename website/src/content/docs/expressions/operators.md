@@ -27,3 +27,5 @@ RETURN [1, NULL] = [1, NULL] IS UNKNOWN AS unknown_element,
 ```
 
 The numeric function `MOD(a, b)` has parser support only; there is no executable remainder operator. Other named numeric functions have their own syntax-only pages.
+
+On a mixed property, `RETURN`, `LET`, and `ORDER BY` apply arithmetic and concatenation to each fragment's stored type; a fragment that cannot apply the operator yields null.

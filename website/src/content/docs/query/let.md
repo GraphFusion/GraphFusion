@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-An untyped `LET` clause evaluates expressions for each incoming row and introduces named bindings. Bindings may contain scalars, lists or graph element references.
+An untyped `LET` clause evaluates expressions for each incoming row and introduces named bindings. Bindings may contain scalars, lists or graph element references. Arithmetic and concatenation on a mixed property use each source fragment's stored type.
 
 ```gql test
 LET base = 6, answer = base * 7
