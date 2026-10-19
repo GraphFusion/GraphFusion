@@ -39,3 +39,5 @@ Candidate enumeration currently happens before path ranking. Dense graphs, paral
 The [support matrix](/start/status/) separates these execution limits from parser coverage.
 
 Arithmetic and concatenation on mixed properties use each fragment's stored type. Incompatible operators contribute NULL before classification or coalescing, while label, identity and property-existence metadata retain their original bindings.
+
+`RETURN`, `LET`, and `ORDER BY` evaluate arithmetic and string concatenation on stored types. A fragment that cannot apply the operator yields null; the expression is a type error when no selected fragment can apply it.

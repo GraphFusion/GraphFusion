@@ -104,6 +104,10 @@
   type. `FILTER n.id + 0 = 1` no longer fails when another label stores `id` as
   text, and `FILTER n.id || '' = '1'` no longer matches an integer that was cast
   to a string.
+- Evaluate arithmetic and string concatenation in `RETURN`, `LET`, and `ORDER BY`
+  on each fragment's stored type. `RETURN n.id + 0` no longer fails when another
+  label stores `id` as text, and `n.id || '!'` no longer stringifies an integer.
+  A fragment that cannot apply the operator yields null.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

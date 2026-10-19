@@ -28,3 +28,5 @@ MATCH (p:Person {name: 'Alice'}) SET p.age = 31 FINISH;
 ```
 
 Inside an explicit transaction, result rows describe the pending transaction snapshot. They do not acknowledge durability until COMMIT succeeds. See [result handling](/rust/results/).
+
+Arithmetic and concatenation on a mixed property use each source fragment's stored type. A fragment that cannot apply the operator contributes null. Wrappers such as `COALESCE` can supply a fallback for that null.

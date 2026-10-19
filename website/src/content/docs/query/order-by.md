@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-Without ORDER BY, row order is not guaranteed. Supply all needed tie-breakers when you require a reproducible sequence.
+Without ORDER BY, row order is not guaranteed. Supply all needed tie-breakers when you require a reproducible sequence. Arithmetic and concatenation in the sort key use each source fragment's stored type. A fragment that cannot apply the operator sorts as null.
 
 ```gql test
 MATCH (p:Person)
