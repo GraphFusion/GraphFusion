@@ -149,12 +149,15 @@ fn properties(
     let mut result = Vec::new();
     if let Some(map) = map {
         for (name, value) in &map.entries {
-            if name.value.starts_with("__gf_") {
+            if crate::graph::is_reserved_property(&name.value) {
                 return Err(Error::InvalidDefinition(
                     "reserved graph property name".into(),
                 ));
             }
-            if result.iter().any(|(n, _)| n == &name.value) {
+            if result
+                .iter()
+                .any(|(n, _): &(String, Expr)| n.eq_ignore_ascii_case(&name.value))
+            {
                 return Err(Error::InvalidDefinition("duplicate property".into()));
             }
             let value = Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
@@ -633,10 +636,7 @@ fn stored_property_type(
             .collect()
     };
     tables.iter().find_map(|table| {
-        table
-            .schema
-            .field_with_name(name)
-            .ok()
+        crate::graph::property_field(table.schema.as_ref(), name)
             .map(|field| field.data_type().clone())
     })
 }
@@ -678,7 +678,7 @@ fn pattern_binding_order(
 fn property_target(expr: &ast::Expr) -> Result<(String, String)> {
     if let ast::Expr::Property { base, key } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
-            if key.value.starts_with("__gf_") {
+            if crate::graph::is_reserved_property(&key.value) {
                 return Err(Error::InvalidDefinition(
                     "reserved graph property name".into(),
                 ));
@@ -689,6 +689,14 @@ fn property_target(expr: &ast::Expr) -> Result<(String, String)> {
     Err(Error::InvalidQuery(
         "property mutation requires an element variable".into(),
     ))
+}
+
+fn edit_mentions(edit: &Edit, name: &str) -> bool {
+    edit.values.keys().any(|key| key.eq_ignore_ascii_case(name))
+        || edit
+            .remove
+            .as_ref()
+            .is_some_and(|key| key.eq_ignore_ascii_case(name))
 }
 
 #[derive(Default)]
@@ -813,10 +821,8 @@ async fn edit_graph(
         let mut projections = Vec::new();
         for field in old.schema.fields() {
             let name = field.name();
-            if name.starts_with("__gf_")
-                || (!edit.replace
-                    && !edit.values.contains_key(name)
-                    && edit.remove.as_ref() != Some(name))
+            if crate::graph::is_reserved_property(name)
+                || (!edit.replace && !edit_mentions(edit, name))
             {
                 projections.push(col("__gf_old", name).alias(name));
             }
@@ -824,7 +830,8 @@ async fn edit_graph(
         for (name, value) in &edit.values {
             if let Some(column) = value {
                 let mut source = col("__gf_patch", column);
-                if let Ok(existing) = old.schema.field_with_name(name) {
+                let stored = crate::graph::property_field(old.schema.as_ref(), name);
+                if let Some(existing) = stored {
                     let incoming = patch
                         .schema()
                         .field_with_name(None, column)
@@ -835,11 +842,15 @@ async fn edit_graph(
                         source = cast(source, DataType::Float64);
                     } else if incoming.data_type() != existing.data_type() {
                         return Err(Error::UnsupportedFeature(format!(
-                            "mixed types for graph property {name}"
+                            "mixed types for graph property {}",
+                            existing.name()
                         )));
                     }
                 }
-                projections.push(source.alias(name));
+                let output = stored
+                    .map(|field| field.name().to_owned())
+                    .unwrap_or_else(|| name.clone());
+                projections.push(source.alias(&output));
             }
         }
         let mut labels = old.labels.clone();

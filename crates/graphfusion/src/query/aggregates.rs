@@ -1,3 +1,4 @@
+use super::casefold::CaseFoldMap;
 use super::{expressions::Binder, graph::Bindings};
 use crate::{gql as ast, Error, Result, SessionState};
 use datafusion::{
@@ -11,7 +12,6 @@ use datafusion::{
         cast, lit, utils::find_aggregate_exprs, Expr, ExprSchemable, LogicalPlanBuilder,
     },
 };
-use std::collections::BTreeMap;
 
 pub(super) fn call(
     name: &str,
@@ -224,7 +224,7 @@ pub(super) fn result(
     body: &ast::QueryBody,
 ) -> Result<LogicalPlanBuilder> {
     let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
-    let mut aliases = BTreeMap::new();
+    let mut aliases = CaseFoldMap::new();
     let mut result_scope = scope.clone();
     let mut projections = Vec::new();
     for (i, item) in body.result_clause.items.iter().enumerate() {

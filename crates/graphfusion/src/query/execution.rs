@@ -19,7 +19,7 @@ pub(super) struct Trace {
     pub physical: Vec<String>,
     pub validate_only: bool,
     pub sources: std::collections::BTreeMap<crate::catalog::ObjectId, Arc<crate::graph::GraphData>>,
-    pub output_domains: std::collections::BTreeMap<String, super::references::Domain>,
+    pub output_domains: super::references::Domains,
     pub output_reference_sources: super::references::ReferenceSources,
 }
 impl Trace {

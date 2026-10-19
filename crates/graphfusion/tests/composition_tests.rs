@@ -3091,3 +3091,43 @@ async fn early_where_does_not_repeat_native_integer_comparisons_after_widening()
         );
     }
 }
+
+#[tokio::test]
+async fn alternatives_align_property_values_and_presence_without_ascii_case() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT(:A {age:1}),(:B {AGE:2}),(:C {name:'empty'})").await.unwrap();
+    let r = s
+        .query(
+            "MATCH(n:A)|(N:B) RETURN n.age AS age,PROPERTY_EXISTS(N,aGe) AS present ORDER BY age",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&r),
+        vec![
+            vec!["1".to_string(), "true".to_string()],
+            vec!["2".to_string(), "true".to_string()]
+        ]
+    );
+    let r = s
+        .query(
+            "MATCH(n:A)|(N:C) RETURN n.AGE AS age,PROPERTY_EXISTS(N,aGe) AS present ORDER BY age",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&r),
+        vec![
+            vec!["1".to_string(), "true".to_string()],
+            vec!["NULL".to_string(), "false".to_string()]
+        ]
+    );
+    let r = s
+        .query("MATCH(n:A)|(N:B) WHERE n.aGe>0 RETURN N.AGE+0 AS age ORDER BY age")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&r),
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+}

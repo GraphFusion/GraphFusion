@@ -25,6 +25,7 @@ use datafusion::{
 use std::{collections::BTreeSet, sync::Arc};
 
 pub(super) type Domain = BTreeSet<(ObjectId, ElementKind)>;
+pub(super) type Domains = super::casefold::CaseFoldMap<Domain>;
 
 pub(super) fn domain_for_name(name: &str, scope: &Bindings) -> Option<Domain> {
     scope
@@ -56,11 +57,8 @@ pub(super) fn domain(expr: &ast::Expr, scope: &Bindings) -> Option<Domain> {
     }
 }
 
-pub(super) fn result_domains(
-    body: &ast::QueryBody,
-    scope: &Bindings,
-) -> std::collections::BTreeMap<String, Domain> {
-    let mut result = std::collections::BTreeMap::new();
+pub(super) fn result_domains(body: &ast::QueryBody, scope: &Bindings) -> Domains {
+    let mut result = Domains::new();
     for (index, item) in body.result_clause.items.iter().enumerate() {
         if matches!(item.expr, ast::Expr::Wildcard) {
             for name in &scope.order {
@@ -85,7 +83,7 @@ pub(super) fn result_domains(
 
 /// Source layouts retained across materialized query results. Only a direct
 /// element copy retains its participating layouts; unknown domains keep the fallback.
-pub(super) type ReferenceSources = std::collections::BTreeMap<String, Vec<ElementBinding>>;
+pub(super) type ReferenceSources = super::casefold::CaseFoldMap<Vec<ElementBinding>>;
 
 pub(super) fn result_sources(body: &ast::QueryBody, scope: &Bindings) -> ReferenceSources {
     let source = |name: &str| {
@@ -122,8 +120,8 @@ pub(super) fn result_sources(body: &ast::QueryBody, scope: &Bindings) -> Referen
 pub(super) fn merge_sources(
     left: &mut ReferenceSources,
     right: &ReferenceSources,
-    left_domains: &std::collections::BTreeMap<String, Domain>,
-    right_domains: &std::collections::BTreeMap<String, Domain>,
+    left_domains: &Domains,
+    right_domains: &Domains,
     graphs: &std::collections::BTreeMap<ObjectId, Arc<GraphData>>,
 ) -> Result<()> {
     let mut merged = ReferenceSources::new();
@@ -208,7 +206,11 @@ impl ReferenceBinding {
         let values: Vec<_> = self
             .parts
             .iter()
-            .filter(|p| p.properties.contains_key(key))
+            .filter(|p| {
+                p.properties
+                    .keys()
+                    .any(|stored| stored.eq_ignore_ascii_case(key))
+            })
             .map(|p| p.property(key))
             .collect();
         let mut previous = DataType::Null;
@@ -370,7 +372,7 @@ pub(super) fn resolve(
     let names = scope
         .scalars
         .iter()
-        .filter(|(name, _)| !scope.references.contains_key(*name))
+        .filter(|(name, _)| !scope.references.contains_key(name))
         .map(|(name, column)| (name.clone(), column.clone()))
         .collect::<Vec<_>>();
     for (name, column) in names {

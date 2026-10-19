@@ -418,3 +418,30 @@ async fn composite_reference_layouts_include_only_participating_labels_and_graph
         "MATCH(n:A) RETURN n UNION ALL USE GRAPH other MATCH(n:B) RETURN n ORDER BY n.v+0 NEXT LET copy=n RETURN copy.v+0 AS v",
     ] { check(&mut s, q, &[&["2"],&["10"]]).await; }
 }
+
+#[tokio::test]
+async fn case_folded_composite_aliases_keep_reference_domains_and_layouts() {
+    let mut s = graph().await;
+    s.run("INSERT (:Document {v:'text'})").await.unwrap();
+    check(&mut s,"MATCH(n:N) RETURN n AS r UNION ALL MATCH(n:N) RETURN n AS R NEXT YIELD R AS item RETURN item.v+0 AS v ORDER BY v",&[&["1"],&["1"],&["2"],&["2"],&["3"],&["3"]]).await;
+    check(
+        &mut s,
+        "MATCH(n:N) RETURN n AS r UNION ALL RETURN NULL AS R ORDER BY R.v NEXT RETURN r.v AS v",
+        &[&["1"], &["2"], &["3"], &["NULL"]],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn case_folded_reference_dependency_waits_for_its_later_rebind() {
+    let mut s = graph().await;
+    s.run("INSERT(:Person {id:1}),(:Document {id:'doc'})")
+        .await
+        .unwrap();
+    check(
+        &mut s,
+        "MATCH(p) LET r=p MATCH(x:Person),(r:Person) WHERE R.id+0=1 RETURN r.id AS id",
+        &[&["1"]],
+    )
+    .await;
+}

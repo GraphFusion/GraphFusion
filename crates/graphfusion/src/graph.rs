@@ -6,7 +6,7 @@ use crate::{
 use datafusion::{
     arrow::{
         array::UInt64Array,
-        datatypes::{DataType, SchemaRef},
+        datatypes::{DataType, Field, Schema, SchemaRef},
         record_batch::RecordBatch,
     },
     datasource::{MemTable, TableProvider},
@@ -23,6 +23,41 @@ pub const SOURCE: &str = "__gf_source";
 pub const DESTINATION: &str = "__gf_destination";
 pub(crate) const FROM: &str = "__gf_from";
 pub(crate) const TO: &str = "__gf_to";
+
+pub(crate) fn is_reserved_property(name: &str) -> bool {
+    name.get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__gf_"))
+}
+
+/// Ambiguous physical columns remain intact in imported storage. A GQL scan
+/// cannot choose one of them without hiding data from a later update.
+pub(crate) fn validate_query_property_names(schema: &Schema) -> Result<()> {
+    let mut names = BTreeMap::new();
+    for field in schema.fields() {
+        if is_reserved_property(field.name()) {
+            continue;
+        }
+        if let Some(previous) = names.insert(field.name().to_ascii_lowercase(), field.name()) {
+            return Err(Error::InvalidQuery(format!(
+                "ambiguous property names {previous} and {}",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Property names compare without regard to ASCII case. Reserved storage
+/// columns stay exact.
+pub(crate) fn property_field<'a>(schema: &'a Schema, name: &str) -> Option<&'a Field> {
+    schema
+        .fields()
+        .iter()
+        .find(|field| {
+            !is_reserved_property(field.name()) && field.name().eq_ignore_ascii_case(name)
+        })
+        .map(AsRef::as_ref)
+}
 
 #[derive(Clone, Debug)]
 pub struct NodeTable(pub(crate) Table);
@@ -470,11 +505,15 @@ pub(crate) fn validate_property_layouts<'a>(tables: impl Iterator<Item = &'a Tab
     for table in &tables {
         let layout = by_labels.entry(&table.labels).or_default();
         for field in table.schema.fields() {
-            if field.name().starts_with("__gf_") {
+            if is_reserved_property(field.name()) {
                 continue;
             }
-            if let Some(previous) = layout.get(field.name().as_str()) {
-                if *previous != field.data_type() {
+            if let Some(previous_name) = layout
+                .keys()
+                .copied()
+                .find(|stored| stored.eq_ignore_ascii_case(field.name()))
+            {
+                if *layout[&previous_name] != *field.data_type() {
                     return Err(Error::UnsupportedFeature(format!(
                         "mixed types for graph property {}",
                         field.name()
@@ -529,13 +568,18 @@ fn property_scalar(data_type: &DataType) -> bool {
 pub(crate) fn property_types<'a>(
     tables: impl Iterator<Item = &'a Table>,
 ) -> Result<BTreeMap<String, DataType>> {
-    let mut types = BTreeMap::new();
+    let mut types: BTreeMap<String, DataType> = BTreeMap::new();
     for table in tables {
         for field in table.schema.fields() {
-            if field.name().starts_with("__gf_") {
+            if is_reserved_property(field.name()) {
                 continue;
             }
-            if let Some(previous) = types.get(field.name()).cloned() {
+            if let Some(stored) = types
+                .keys()
+                .find(|stored| stored.eq_ignore_ascii_case(field.name()))
+                .cloned()
+            {
+                let previous = types.get(&stored).expect("stored property").clone();
                 let unified =
                     unify_property_type(&previous, field.data_type()).ok_or_else(|| {
                         Error::UnsupportedFeature(format!(
@@ -543,7 +587,7 @@ pub(crate) fn property_types<'a>(
                             field.name()
                         ))
                     })?;
-                types.insert(field.name().clone(), unified);
+                types.insert(stored, unified);
             } else {
                 types.insert(field.name().clone(), field.data_type().clone());
             }

@@ -10,7 +10,7 @@ pub(super) struct Binder<'a> {
     schema: &'a DFSchema,
     bindings: Option<&'a super::graph::Bindings>,
     aggregates: bool,
-    aliases: Option<&'a std::collections::BTreeMap<String, Expr>>,
+    aliases: Option<&'a super::casefold::CaseFoldMap<Expr>>,
 }
 
 impl<'a> Binder<'a> {
@@ -40,7 +40,7 @@ impl<'a> Binder<'a> {
         self.aggregates = true;
         self
     }
-    pub fn aliases(mut self, aliases: &'a std::collections::BTreeMap<String, Expr>) -> Self {
+    pub fn aliases(mut self, aliases: &'a super::casefold::CaseFoldMap<Expr>) -> Self {
         self.aliases = Some(aliases);
         self
     }
@@ -120,8 +120,7 @@ impl<'a> Binder<'a> {
             E::Parameter(name) => {
                 let parameter = self
                     .session
-                    .parameters
-                    .get(name)
+                    .parameter(name)
                     .ok_or_else(|| Error::NotFound(format!("parameter {name}")))?;
                 let mut expression = match &parameter.value {
                     Value::Null => datafusion::logical_expr::lit(ScalarValue::Null),

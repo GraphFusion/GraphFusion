@@ -1,6 +1,7 @@
 //! Compositional path-pattern compiler; every match is a DataFusion relation.
 mod groups;
 mod union;
+use super::casefold::{CaseFoldMap, CaseFoldSet};
 use super::{
     execution::{self, Trace},
     expressions::Binder,
@@ -19,7 +20,6 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::{Expr, JoinType, LogicalPlanBuilder},
 };
-use std::collections::{BTreeMap, BTreeSet};
 
 type Plan = LogicalPlanBuilder;
 type Built = (Plan, Bindings, State);
@@ -40,9 +40,9 @@ pub(super) struct Compiler<'a> {
     pub different: bool,
     pub predicates: Vec<Predicate>,
     /// Match-level comparisons already safe to apply on each fragment.
-    pub clause_filters: BTreeMap<String, NativeAtom>,
+    pub clause_filters: CaseFoldMap<NativeAtom>,
     pub clause_push: bool,
-    pub clause_hit: BTreeSet<String>,
+    pub clause_hit: CaseFoldSet,
     /// Remainder of the MATCH WHERE. Ready AND-conjuncts are applied as soon
     /// as the variables they read are bound, before a later variable-length
     /// expansion. Selective paths leave this untouched until after selection.
@@ -439,7 +439,7 @@ impl Compiler<'_> {
         }
         let column = scope.scalar(name);
         scope.domains.insert(
-            name.into(),
+            name,
             [
                 (self.graph_id, ElementKind::Node),
                 (self.graph_id, ElementKind::Edge),
@@ -963,7 +963,7 @@ fn depends_on(expr: &ast::Expr, name: &str) -> bool {
     use ast::Expr as E;
     match expr {
         E::Literal(_) | E::Parameter(_) => false,
-        E::Identifier(id) => id.value == name,
+        E::Identifier(id) => id.value.eq_ignore_ascii_case(name),
         E::Property { base, .. } => depends_on(base, name),
         E::Unary { expr, .. }
         | E::IsNull { expr, .. }
@@ -978,9 +978,9 @@ fn depends_on(expr: &ast::Expr, name: &str) -> bool {
         E::ElementId { variable }
         | E::PropertyExists { variable, .. }
         | E::IsLabeled { variable, .. }
-        | E::IsDirected { variable, .. } => variable.value == name,
+        | E::IsDirected { variable, .. } => variable.value.eq_ignore_ascii_case(name),
         E::Same { variables } | E::AllDifferent { variables } => {
-            variables.iter().any(|v| v.value == name)
+            variables.iter().any(|v| v.value.eq_ignore_ascii_case(name))
         }
         _ => true, // A new expression kind must be audited before it enables this proof.
     }

@@ -17,10 +17,14 @@ impl Compiler<'_> {
         alternation: ast::PathPatternAlternation,
     ) -> Result<(Plan, State)> {
         let incoming = input.schema().columns();
-        let mut names = Vec::new();
+        let mut names: Vec<String> = Vec::new();
         for (_, branch, _) in &branches {
             for name in &branch.order {
-                if !scope.contains(name) && !names.contains(name) {
+                if !scope.contains(name)
+                    && !names
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(name))
+                {
                     names.push(name.clone());
                 }
             }
@@ -211,7 +215,12 @@ fn unified_element(branches: &[Built], name: &str, alias: String) -> Result<grap
         }
         label_names.extend(element.labels.keys().cloned());
         for (property, data_type) in &element.properties {
-            match properties.get(property).cloned() {
+            let property = properties
+                .keys()
+                .find(|stored: &&String| stored.eq_ignore_ascii_case(property))
+                .cloned()
+                .unwrap_or_else(|| property.clone());
+            match properties.get(&property).cloned() {
                 None => {
                     properties.insert(property.clone(), data_type.clone());
                 }
@@ -287,15 +296,21 @@ fn element_values(
         ]);
     }
     for (name, data_type) in &unified.properties {
-        values.push(match source.properties.get(name) {
-            Some(actual) if actual == data_type => source.column(name),
-            Some(_) => cast(source.column(name), data_type.clone()),
+        let field = source
+            .properties
+            .iter()
+            .find(|(stored, _)| stored.eq_ignore_ascii_case(name));
+        values.push(match field {
+            Some((stored, actual)) if actual == data_type => source.column(stored),
+            Some((stored, _)) => cast(source.column(stored), data_type.clone()),
             None => lit(ScalarValue::try_from(data_type)?),
         });
-        values.push(match source.present.get(name) {
-            Some(column) => source.column(column),
-            None => lit(false),
-        });
+        values.push(
+            match field.and_then(|(stored, _)| source.present.get(stored)) {
+                Some(column) => source.column(column),
+                None => lit(false),
+            },
+        );
     }
     for label in unified.labels.keys() {
         values.push(match source.labels.get(label) {
