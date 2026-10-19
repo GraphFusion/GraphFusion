@@ -21,6 +21,7 @@ pub(super) struct Trace {
     pub sources: std::collections::BTreeMap<crate::catalog::ObjectId, Arc<crate::graph::GraphData>>,
     pub output_domains: super::references::Domains,
     pub output_reference_sources: super::references::ReferenceSources,
+    pub output_value_types: super::expressions::StoredTypes,
 }
 impl Trace {
     pub async fn collect(

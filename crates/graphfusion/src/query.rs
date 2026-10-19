@@ -23,7 +23,7 @@ use datafusion::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
     common::Column,
     execution::context::SessionContext,
-    logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder},
+    logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder},
 };
 use expressions::Binder;
 use std::collections::BTreeMap;
@@ -187,6 +187,7 @@ async fn drive_chain(
     let mut carried_graph = session.current_graph;
     let mut carried_domains = references::Domains::new();
     let mut carried_sources = references::ReferenceSources::new();
+    let mut carried_types = expressions::StoredTypes::new();
     let mut working = None;
     let last = chain.len() - 1;
     for (index, (yield_clause, query)) in chain.iter().enumerate() {
@@ -198,11 +199,13 @@ async fn drive_chain(
                 yield_clause.as_ref(),
                 &mut carried_domains,
                 &mut carried_sources,
+                &mut carried_types,
             )?;
             Some(WorkingTable {
                 plan,
                 domains: carried_domains.clone(),
                 reference_sources: carried_sources.clone(),
+                value_types: carried_types.clone(),
             })
         } else if yield_clause.is_some() {
             return Err(Error::InvalidQuery(
@@ -216,6 +219,7 @@ async fn drive_chain(
         carried_graph = graph.or(carried_graph);
         carried_domains = trace.output_domains.clone();
         carried_sources = trace.output_reference_sources.clone();
+        carried_types = trace.output_value_types.clone();
         if index == last {
             return Ok(plan);
         }
@@ -230,6 +234,7 @@ fn apply_yield(
     yield_clause: Option<&ast::YieldClause>,
     domains: &mut references::Domains,
     reference_sources: &mut references::ReferenceSources,
+    value_types: &mut expressions::StoredTypes,
 ) -> Result<LogicalPlan> {
     let Some(yield_clause) = yield_clause else {
         return Ok(plan);
@@ -291,6 +296,13 @@ fn apply_yield(
                 .map(|binding| (output.clone(), binding.clone()))
         })
         .collect();
+    let mut renamed_types = expressions::StoredTypes::new();
+    for (output, source) in &renamed {
+        if let Some(types) = value_types.get(source) {
+            renamed_types.insert(output.clone(), types.clone());
+        }
+    }
+    *value_types = renamed_types;
     *domains = next_domains;
     Ok(LogicalPlanBuilder::from(plan)
         .project(projections)?
@@ -305,6 +317,7 @@ struct WorkingTable {
     plan: LogicalPlan,
     domains: references::Domains,
     reference_sources: references::ReferenceSources,
+    value_types: expressions::StoredTypes,
 }
 
 fn clone_working(table: &Option<WorkingTable>) -> Option<WorkingTable> {
@@ -312,6 +325,7 @@ fn clone_working(table: &Option<WorkingTable>) -> Option<WorkingTable> {
         plan: table.plan.clone(),
         domains: table.domains.clone(),
         reference_sources: table.reference_sources.clone(),
+        value_types: table.value_types.clone(),
     })
 }
 
@@ -370,6 +384,7 @@ async fn plan(
         .await?;
         let mut checked_domains = validation.output_domains.clone();
         let mut checked_sources = validation.output_reference_sources.clone();
+        let mut checked_types = validation.output_value_types.clone();
         for (index, op) in query.set_operations.iter().enumerate() {
             let body = without_trailing_page(query, index, &op.body);
             let (right, _) = plan_body(
@@ -382,12 +397,18 @@ async fn plan(
                 clone_working(&incoming),
             )
             .await?;
-            merge_result_metadata(&mut checked_domains, &mut checked_sources, &validation)?;
+            merge_result_metadata(
+                &mut checked_domains,
+                &mut checked_sources,
+                &mut checked_types,
+                &validation,
+            )?;
             checked =
                 relational::set_operation(checked, right, ast::QuerySetOperator::Union, true)?;
         }
         validation.output_domains = checked_domains;
         validation.output_reference_sources = checked_sources;
+        validation.output_value_types = checked_types;
         let schema = checked.schema().clone();
         if trace.validate_only {
             let checked =
@@ -395,8 +416,10 @@ async fn plan(
             trace.sources.extend(validation.sources);
             trace.output_domains = validation.output_domains;
             trace.output_reference_sources = validation.output_reference_sources;
+            trace.output_value_types = validation.output_value_types;
             return Ok((checked, graph));
         }
+        let mut first_types = expressions::StoredTypes::new();
         for (index, (body, context)) in std::iter::once((&query.body, &first_context))
             .chain(query.set_operations.iter().map(|op| (&op.body, &context)))
             .enumerate()
@@ -417,6 +440,9 @@ async fn plan(
                 clone_working(&incoming),
             )
             .await?;
+            if index == 0 {
+                first_types = trace.output_value_types.clone();
+            }
             let branch = relational::coerce(branch, &schema)?;
             let (schema, batches) = trace.collect(ctx, &branch).await?;
             if batches.iter().any(|b| b.num_rows() > 0) {
@@ -427,6 +453,7 @@ async fn plan(
                 ));
             }
         }
+        trace.output_value_types = first_types;
         let empty =
             execution::memory(std::sync::Arc::new(schema.as_arrow().clone()), vec![])?.build()?;
         return Ok((
@@ -446,6 +473,7 @@ async fn plan(
     .await?;
     let mut domains = trace.output_domains.clone();
     let mut reference_sources = trace.output_reference_sources.clone();
+    let mut value_types = trace.output_value_types.clone();
     for (index, op) in query.set_operations.iter().enumerate() {
         let body = without_trailing_page(query, index, &op.body);
         let (right, _) = plan_body(
@@ -459,7 +487,12 @@ async fn plan(
         )
         .await?;
         if op.operator == ast::QuerySetOperator::Union {
-            merge_result_metadata(&mut domains, &mut reference_sources, trace)?;
+            merge_result_metadata(
+                &mut domains,
+                &mut reference_sources,
+                &mut value_types,
+                trace,
+            )?;
         }
         result = relational::set_operation(
             result,
@@ -470,6 +503,7 @@ async fn plan(
     }
     trace.output_domains = domains;
     trace.output_reference_sources = reference_sources;
+    trace.output_value_types = value_types;
     Ok((
         apply_trailing_page(result, &context, trailing_page, ctx, trace).await?,
         graph,
@@ -479,8 +513,10 @@ async fn plan(
 fn merge_result_metadata(
     domains: &mut references::Domains,
     sources: &mut references::ReferenceSources,
+    value_types: &mut expressions::StoredTypes,
     right: &execution::Trace,
 ) -> Result<()> {
+    expressions::merge_value_types(value_types, &right.output_value_types);
     references::merge_sources(
         sources,
         &right.output_reference_sources,
@@ -549,6 +585,7 @@ async fn apply_trailing_page(
     scope.sources = trace.sources.clone();
     scope.domains = trace.output_domains.clone();
     scope.reference_sources = trace.output_reference_sources.clone();
+    scope.value_types = trace.output_value_types.clone();
     let plan = references::prepare(LogicalPlanBuilder::from(plan), &mut scope, ctx, trace).await?;
     Ok(order_and_page(
         plan,
@@ -604,6 +641,7 @@ async fn plan_body(
         }
         scope.domains = incoming.domains;
         scope.reference_sources = incoming.reference_sources;
+        scope.value_types = incoming.value_types;
         // NEXT materializes the working table, so the next statement no longer
         // has the previous MATCH bindings. Element references still name rows
         // in the graphs that statement read or wrote; without those snapshots
@@ -661,6 +699,7 @@ async fn plan_body(
             }
             ast::QueryClause::BindingTable(expression) => {
                 let saved_domains = trace.output_domains.clone();
+                let saved_types = std::mem::take(&mut trace.output_value_types);
                 let nested = binding::source(
                     expression,
                     session,
@@ -673,9 +712,11 @@ async fn plan_body(
                 )
                 .await?;
                 let nested_domains = std::mem::replace(&mut trace.output_domains, saved_domains);
+                let nested_types = std::mem::replace(&mut trace.output_value_types, saved_types);
                 scope.sources.extend(trace.sources.clone());
                 plan = relational::derived(plan, &mut scope, nested)?;
                 scope.domains.extend(nested_domains);
+                scope.value_types.extend(nested_types);
                 plan = references::prepare(plan, &mut scope, ctx, trace).await?;
             }
             ast::QueryClause::NestedQuery(query) => {
@@ -698,6 +739,7 @@ async fn plan_body(
                 scope.sources.extend(trace.sources.clone());
                 scope.domains.extend(trace.output_domains.clone());
                 plan = relational::derived(plan, &mut scope, nested)?;
+                scope.value_types.extend(trace.output_value_types.clone());
                 plan = references::prepare(plan, &mut scope, ctx, trace).await?;
             }
             ast::QueryClause::For(clause) => {
@@ -745,7 +787,10 @@ async fn plan_body(
                         }
                     }
                     let domain = references::domain(&item.value, &scope);
+                    let types = expressions::stored_property_types(Some(&scope), &item.value)
+                        .unwrap_or(vec![expression.get_type(plan.schema())?]);
                     let column = scope.scalar(&item.name.value);
+                    scope.value_types.insert(item.name.value.clone(), types);
                     if let Some(domain) = domain {
                         scope.domains.insert(item.name.value.clone(), domain);
                     }
@@ -851,11 +896,13 @@ async fn plan_body(
         scope.sources.extend(trace.sources.clone());
         scope.domains.extend(trace.output_domains.clone());
         plan = relational::derived(plan, &mut scope, nested)?;
+        scope.value_types.extend(trace.output_value_types.clone());
         plan = references::prepare(plan, &mut scope, ctx, trace).await?;
     }
     if body.result_clause.kind == ast::ResultKind::Finish {
         trace.output_domains.clear();
         trace.output_reference_sources.clear();
+        trace.output_value_types.clear();
         trace.collect(ctx, &plan.build()?).await?;
         return Ok((LogicalPlanBuilder::empty(false).build()?, current_graph));
     }
@@ -896,6 +943,7 @@ async fn plan_body(
     } else {
         result
     };
+    trace.output_value_types = expressions::result_value_types(body, &scope, result.schema());
     Ok((result.build()?, current_graph))
 }
 
@@ -931,6 +979,7 @@ fn order_and_page(
         let mut sorts = Vec::new();
         for item in ordering {
             let (next, mixed) = if let Some(scope) = scope.as_deref_mut() {
+                expressions::ensure_one_family(scope, &item.expr, "ORDER BY")?;
                 native::fragment_value(plan, scope, session, &item.expr)?
             } else {
                 (plan, None)

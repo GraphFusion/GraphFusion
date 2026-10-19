@@ -207,6 +207,7 @@ fn reject_deleted(flags: &dyn Array) -> datafusion::error::Result<()> {
 #[derive(Clone, Default)]
 pub(super) struct Bindings {
     pub scalars: CaseFoldMap<Column>,
+    pub value_types: super::expressions::StoredTypes,
     pub elements: CaseFoldMap<ElementBinding>,
     pub order: Vec<String>,
     pub conditional: CaseFoldSet,

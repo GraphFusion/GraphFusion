@@ -458,6 +458,7 @@ pub(super) fn result(
     input_order: Option<Expr>,
 ) -> Result<LogicalPlanBuilder> {
     let mut aliases = CaseFoldMap::new();
+    let mut result_sources = CaseFoldMap::new();
     let mut result_scope = outer.clone();
     let mut projections = Vec::new();
     let mut aggregate_outputs = std::collections::BTreeSet::new();
@@ -500,9 +501,13 @@ pub(super) fn result(
                     "duplicate result column {name}"
                 )));
             }
+            result_sources.insert(name.clone(), &item.expr);
             // Output names shadow input names in grouping, HAVING and ordering.
             // Carry the source's lookup metadata along with its value expression,
             // always resolving against the input scope (aliases are simultaneous).
+            let types = super::expressions::stored_property_types(Some(outer), &item.expr)
+                .unwrap_or(vec![expr.get_type(plan.schema())?]);
+            result_scope.value_types.insert(name.clone(), types);
             result_scope.scalars.remove(&name);
             result_scope.elements.remove(&name);
             result_scope.references.remove(&name);
@@ -548,6 +553,13 @@ pub(super) fn result(
     }
     let mut ordering = Vec::new();
     for item in &body.order_by {
+        ensure_result_family(
+            outer,
+            &result_scope,
+            &result_sources,
+            &item.expr,
+            "ORDER BY",
+        )?;
         let (next, expr, dependent) = bind_result_expr(
             plan,
             &mut result_scope,
@@ -868,4 +880,33 @@ mod distinct_deviation_tests {
             Some(1e-300)
         );
     }
+}
+
+/// Result aliases are simultaneous. Validate their source in the input scope,
+/// while direct property reads use the bindings visible after output shadowing.
+fn ensure_result_family(
+    input: &Bindings,
+    result: &Bindings,
+    sources: &CaseFoldMap<&ast::Expr>,
+    expression: &ast::Expr,
+    operation: &str,
+) -> Result<()> {
+    match expression {
+        ast::Expr::Identifier(name) => {
+            if let Some(source) = sources.get(&name.value) {
+                return super::expressions::ensure_one_family(input, source, operation);
+            }
+        }
+        ast::Expr::Coalesce(args) => {
+            for arg in args {
+                ensure_result_family(input, result, sources, arg, operation)?;
+            }
+            return Ok(());
+        }
+        ast::Expr::NullIf { left, .. } => {
+            return ensure_result_family(input, result, sources, left, operation)
+        }
+        _ => {}
+    }
+    super::expressions::ensure_one_family(result, expression, operation)
 }
