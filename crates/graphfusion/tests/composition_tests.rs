@@ -4902,3 +4902,158 @@ async fn null_set_targets_skip_stored_map_evaluation() {
         "{result:?}"
     );
 }
+
+#[tokio::test]
+async fn aggregate_operators_use_stored_types() {
+    let mut session = social().await;
+    let summed = session
+        .query("MATCH (n:Person|Document) RETURN SUM(n.id + 0) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&summed), vec![vec!["3".to_string()]]);
+
+    let counted = session
+        .query("MATCH (n:Person|Document) RETURN COUNT(n.id + 0) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&counted), vec![vec!["2".to_string()]]);
+
+    let averaged = session
+        .query("MATCH (n:Person|Document) RETURN AVG(n.id * 1) AS total")
+        .await
+        .unwrap();
+    assert_eq!(averaged.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&averaged), vec![vec!["1.5".to_string()]]);
+
+    let minimum = session
+        .query("MATCH (n:Person|Document) RETURN MIN(-n.id) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&minimum), vec![vec!["-2".to_string()]]);
+
+    let text = session
+        .query("MATCH (n:Person|Document) RETURN COUNT(n.id || '!') AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&text), vec![vec!["1".to_string()]]);
+
+    let summed_text = session
+        .query("MATCH (n:Person|Document) RETURN SUM(n.id || '') AS total")
+        .await;
+    assert!(
+        matches!(summed_text, Err(graphfusion::Error::InvalidQuery(_))),
+        "{summed_text:?}"
+    );
+
+    let bare = session
+        .query("MATCH (n:Person|Document) RETURN n.id + 0 AS total")
+        .await;
+    // RETURN arithmetic is supported by the shared result compiler (#92).
+    assert_eq!(
+        strings(&bare.unwrap()),
+        vec![
+            vec!["1".to_owned()],
+            vec!["2".to_owned()],
+            vec!["NULL".to_owned()]
+        ]
+    );
+
+    let widened = session
+        .query("MATCH (n:Person|Metric) RETURN SUM(n.score + 0) AS total")
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&widened), vec![vec!["4.5".to_string()]]);
+
+    let filtered = session
+        .query(
+            "MATCH (n:Person|Document) SELECT SUM(n.id + 0) AS total
+             HAVING SUM(n.id + 0) = 3",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&filtered), vec![vec!["3".to_string()]]);
+
+    let incompatible = session
+        .query("MATCH (d:Document) RETURN SUM(d.id + 0) AS total")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+
+    let people = session
+        .query("MATCH (n:Person) RETURN SUM(n.id + 0) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&people), vec![vec!["3".to_string()]]);
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d)",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query("MATCH ()-[e:Knows|Cites]->() RETURN SUM(e.since * 1) AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge), vec![vec!["1".to_string()]]);
+    let edge_text = session
+        .query("MATCH ()-[e:Knows|Cites]->() RETURN COUNT(e.since || '') AS total")
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge_text), vec![vec!["1".to_string()]]);
+}
+
+mod stored_aggregate_regressions {
+    use graphfusion::Database;
+    async fn session() -> graphfusion::Session {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:T {v:'text'})")
+            .await
+            .unwrap();
+        s
+    }
+    #[tokio::test]
+    async fn wrapped_aggregate_uses_stored_arithmetic() {
+        let mut s = session().await;
+        let r = s
+            .query("MATCH(n) RETURN COALESCE(SUM(n.v+0),0) AS v")
+            .await
+            .unwrap();
+        assert_eq!(r.row_count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn stored_aggregate_wrappers_keep_empty_groups_and_repeated_values() {
+    let mut session = social().await;
+    let result = session
+        .query("MATCH(n:Person|Document) WHERE n.name='absent' RETURN COALESCE(SUM(n.id+0),0) AS v")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["0".to_owned()]]);
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN COALESCE(SUM(n.id+0),0)+COUNT(*) AS v")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["6".to_owned()]]);
+    let result=session.query("MATCH(n:Person|Document) RETURN DISTINCT COALESCE(SUM(n.id+0),0) AS v ORDER BY COALESCE(SUM(n.id+0),0)").await.unwrap();
+    assert_eq!(strings(&result), vec![vec!["3".to_owned()]]);
+    let result = session
+        .query("MATCH(n:Person|Metric) RETURN PERCENTILE_CONT(n.score+0,0.5) AS v")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["1.5".to_owned()]]);
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN SUM(SUM(n.id+0)) AS v")
+        .await;
+    assert!(
+        matches!(result, Err(graphfusion::Error::InvalidQuery(_))),
+        "{result:?}"
+    );
+}
