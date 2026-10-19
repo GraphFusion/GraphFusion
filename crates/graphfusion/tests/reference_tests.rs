@@ -353,3 +353,23 @@ async fn reference_lookups_use_the_explicit_transaction_snapshot() {
     reader.run("ROLLBACK").await.unwrap();
     check(&mut reader, q, &[&["2"]]).await;
 }
+
+#[tokio::test]
+async fn match_where_waits_for_rebound_reference_schema() {
+    let mut s = graph().await;
+    s.run("INSERT (:Person {id:1}), (:Document {id:'doc'})")
+        .await
+        .unwrap();
+    check(
+        &mut s,
+        "MATCH (p) LET r=p MATCH (r:Person) WHERE r.id + 0 = 1 RETURN r.id AS id",
+        &[&["1"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "MATCH (p) LET r=p MATCH (x:N), (r:Person) WHERE r.id + 0 = 1 RETURN DISTINCT r.id AS id",
+        &[&["1"]],
+    )
+    .await;
+}

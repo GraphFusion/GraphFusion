@@ -43,6 +43,10 @@ pub(super) struct Compiler<'a> {
     pub clause_filters: BTreeMap<String, NativeAtom>,
     pub clause_push: bool,
     pub clause_hit: BTreeSet<String>,
+    /// Remainder of the MATCH WHERE. Ready AND-conjuncts are applied as soon
+    /// as the variables they read are bound, before a later variable-length
+    /// expansion. Selective paths leave this untouched until after selection.
+    pub match_filter: Option<ast::Expr>,
 }
 fn narrower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -371,6 +375,7 @@ impl Compiler<'_> {
         endpoint: Option<Expr>,
         finite: Option<u64>,
         defer_predicates: bool,
+        early_where: bool,
     ) -> Result<(Plan, State)> {
         let predicate_start = self.predicates.len();
         let (mode, selection) = paths::prefix(path.prefix.as_ref(), self.session)?;
@@ -396,7 +401,16 @@ impl Compiler<'_> {
             ))
             .await?
         } else {
-            Box::pin(self.factors(plan, scope, &path.factors, endpoint, mode, finite)).await?
+            Box::pin(self.factors(
+                plan,
+                scope,
+                &path.factors,
+                endpoint,
+                mode,
+                finite,
+                early_where && matches!(selection, Selection::All),
+            ))
+            .await?
         };
         // Bind the complete path before its inline predicates, and filter
         // candidates before selection. Plain MATCH paths may refer forward
@@ -441,14 +455,16 @@ impl Compiler<'_> {
         projection.push(state.value(self.graph_id).alias(column.name));
         Ok(plan.project(projection)?)
     }
+    #[allow(clippy::too_many_arguments)]
     async fn factors(
         &mut self,
-        plan: Plan,
+        mut plan: Plan,
         scope: &mut Bindings,
         factors: &[ast::PathPatternFactor],
         endpoint: Option<Expr>,
         mode: ast::PathMode,
         finite: Option<u64>,
+        early_where: bool,
     ) -> Result<(Plan, State)> {
         let empty = empty_node();
         let (first, remaining) = match factors.split_first() {
@@ -457,6 +473,9 @@ impl Compiler<'_> {
         };
         // Keep predicates from earlier patterns pending until their variables are bound.
         let pending = self.predicates.len();
+        if early_where {
+            plan = self.apply_ready_filter(plan, scope)?;
+        }
         // The first edge already carries both anonymous endpoint identities.
         let opened = if endpoint.is_none() && reuses_known_endpoint(first) {
             match remaining.split_first() {
@@ -524,6 +543,9 @@ impl Compiler<'_> {
             (plan, state, remaining)
         };
         plan = self.flush_ready(plan, scope, pending)?;
+        if early_where {
+            plan = self.apply_ready_filter(plan, scope)?;
+        }
         for factor in rest {
             match factor {
                 ast::PathPatternFactor::Node(node) => {
@@ -655,8 +677,40 @@ impl Compiler<'_> {
             }
             plan = plan.filter(state.valid(mode, self.different))?;
             plan = self.flush_ready(plan, scope, pending)?;
+            if early_where {
+                plan = self.apply_ready_filter(plan, scope)?;
+            }
         }
         Ok((plan, state))
+    }
+    fn apply_ready_filter(&mut self, mut plan: Plan, scope: &mut Bindings) -> Result<Plan> {
+        let Some(filter) = self.match_filter.take() else {
+            return Ok(plan);
+        };
+        let mut waiting = Vec::new();
+        for expr in conjuncts(filter) {
+            // A scalar reference may still be rebound by a later node pattern.
+            // Its lookup schema can be wider than the pattern's selected labels.
+            let unrebound = scope
+                .references
+                .keys()
+                .any(|name| !scope.elements.contains_key(name) && depends_on(&expr, name));
+            if expr_is_ready(&expr, scope) && !unrebound {
+                if let Some(filtered) =
+                    super::native::fragment_predicate(plan.clone(), scope, self.session, &expr)?
+                {
+                    plan = filtered;
+                } else {
+                    let predicate = Binder::with_bindings(self.session, plan.schema(), scope)
+                        .predicate(&expr)?;
+                    plan = plan.filter(predicate)?;
+                }
+            } else {
+                waiting.push(expr);
+            }
+        }
+        self.match_filter = combine_and(waiting);
+        Ok(plan)
     }
     fn flush_ready(&mut self, mut plan: Plan, scope: &Bindings, start: usize) -> Result<Plan> {
         let pending = self.predicates.split_off(start);
@@ -782,7 +836,8 @@ impl Compiler<'_> {
         }
         let finite = narrower(finite, self.capacity(mode));
         let (mut plan, state) =
-            Box::pin(self.pattern(plan, scope, &group.pattern, endpoint, finite, false)).await?;
+            Box::pin(self.pattern(plan, scope, &group.pattern, endpoint, finite, false, false))
+                .await?;
         plan = plan.filter(state.valid(mode, self.different))?;
         if let Some(predicate) = &group.where_clause {
             let (next, stored) =
@@ -877,6 +932,7 @@ impl Compiler<'_> {
                 endpoint.clone(),
                 mode,
                 finite,
+                false,
             ))
             .await?;
             let plan = self.apply_predicates(plan, &branch_scope, predicate_start)?;
@@ -912,6 +968,31 @@ fn depends_on(expr: &ast::Expr, name: &str) -> bool {
         }
         _ => true, // A new expression kind must be audited before it enables this proof.
     }
+}
+
+fn conjuncts(expr: ast::Expr) -> Vec<ast::Expr> {
+    match expr {
+        ast::Expr::Binary {
+            op: ast::BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mut parts = conjuncts(*left);
+            parts.extend(conjuncts(*right));
+            parts
+        }
+        other => vec![other],
+    }
+}
+
+fn combine_and(exprs: Vec<ast::Expr>) -> Option<ast::Expr> {
+    let mut exprs = exprs.into_iter();
+    let first = exprs.next()?;
+    Some(exprs.fold(first, |left, right| ast::Expr::Binary {
+        op: ast::BinaryOp::And,
+        left: Box::new(left),
+        right: Box::new(right),
+    }))
 }
 
 fn predicate_is_noop(predicate: &Predicate) -> bool {
