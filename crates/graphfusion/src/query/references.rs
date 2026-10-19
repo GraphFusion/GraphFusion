@@ -14,7 +14,7 @@ use datafusion::{
         array::{Array, BooleanArray},
         datatypes::DataType,
     },
-    common::{DFSchema, ScalarValue, TableReference},
+    common::{Column, DFSchema, ScalarValue, TableReference},
     error::DataFusionError,
     functions::core::expr_fn::{coalesce, get_field},
     logical_expr::{
@@ -275,6 +275,7 @@ pub(super) fn resolve(
         plan = plan.project(projection)?;
         let key = |i: usize| Expr::Column(datafusion::common::Column::new_unqualified(&keys[i].1));
         let sources = scope.sources.clone();
+        let template = scope.reference_sources.get(&name).cloned();
         let mut parts = Vec::new();
         for (id, data) in sources {
             for kind in [ElementKind::Node, ElementKind::Edge] {
@@ -285,7 +286,22 @@ pub(super) fn resolve(
                 {
                     continue;
                 }
-                let (scan, binding) = graph::scan(scope, id, &data, kind, None)?;
+                // A LET copy of one matched element keeps that label set's
+                // property types. An unconstrained match still unions the kind.
+                let (scan, binding) = if let Some(source) = template.as_ref().filter(|source| {
+                    source.constrained && source.graph == id && source.kind == kind
+                }) {
+                    graph::scan_refresh(scope, id, &data, source)?
+                } else {
+                    graph::scan(scope, id, &data, kind, None)?
+                };
+                if template.as_ref().is_some_and(|source| {
+                    source.constrained && source.graph == id && source.kind == kind
+                }) {
+                    scope
+                        .reference_sources
+                        .insert(name.clone(), binding.clone());
+                }
                 let matched = key(0)
                     .eq(lit(id))
                     .and(key(1).eq(lit(if kind == ElementKind::Node { "n" } else { "e" })))
@@ -318,18 +334,33 @@ pub(super) async fn prepare(
     }
     // Isolate encoded/unnested reference values from their lookup joins. Otherwise
     // DF55 common-expression and leaf-projection rewrites can duplicate aliases.
-    let plan = super::execution::freeze(plan, ctx, trace, None).await?;
+    // Number the rows first: the lookup hash joins do not keep working-table
+    // order, so a preceding ORDER BY or a FOR list would be regrouped.
+    let order = scope.fresh("ref_order");
+    let plan = super::execution::ordinal(plan, ctx, trace, &order).await?;
     let plan = resolve(plan, scope)?;
+    let plan = plan.sort(vec![
+        Expr::Column(Column::new_unqualified(&order)).sort(true, false)
+    ])?;
+    let kept: Vec<_> = plan
+        .schema()
+        .columns()
+        .into_iter()
+        .filter(|column| column.name() != order)
+        .map(Expr::Column)
+        .collect();
     // Keep subsequent repeated property/identity expressions above the lookup
     // schema too; DF55 can otherwise push their CSE aliases through these joins.
-    super::execution::freeze(plan, ctx, trace, None).await
+    super::execution::freeze(plan.project(kept)?, ctx, trace, None).await
 }
 
-pub(super) fn refresh(
+pub(super) async fn refresh(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     graph: ObjectId,
     data: &GraphData,
+    ctx: &datafusion::execution::context::SessionContext,
+    trace: &mut super::execution::Trace,
 ) -> Result<LogicalPlanBuilder> {
     scope.sources.insert(graph, Arc::new(data.clone()));
     // Drop only lookup columns. LET values were materialized before the write,
@@ -343,6 +374,24 @@ pub(super) fn refresh(
         .collect();
     for name in names {
         let old = scope.references.remove(&name).expect("existing reference");
+        if let Some(source) = scope.reference_sources.get(&name).cloned() {
+            if source.graph == graph {
+                let mut ids = BTreeSet::new();
+                for binding in old.parts.iter().filter(|binding| binding.graph == graph) {
+                    ids.extend(
+                        super::mutations::delete_ids(
+                            Some(plan.clone().project([binding.column(ID).alias(ID)])?),
+                            ctx,
+                            trace,
+                        )
+                        .await?,
+                    );
+                }
+                scope
+                    .reference_sources
+                    .insert(name.clone(), graph::refresh_source(data, &source, &ids)?);
+            }
+        }
         aliases.extend(
             old.parts
                 .iter()
