@@ -859,3 +859,125 @@ async fn insert_star_lists_reused_nodes_once_in_pattern_order() {
         );
     }
 }
+
+fn column(result: &QueryResult) -> Vec<String> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows()).map(move |i| {
+                let value = ScalarValue::try_from_array(batch.column(0), i).unwrap();
+                if value.is_null() {
+                    "NULL".into()
+                } else {
+                    value.to_string()
+                }
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn distinct_truth_predicates_accept_nullable_booleans() {
+    let mut session = Database::new().session();
+    session
+        .run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .await
+        .unwrap();
+    let distinct = session
+        .query(
+            "FOR n IN [TRUE, FALSE, NULL, TRUE]
+             RETURN DISTINCT n IS TRUE AS v ORDER BY v DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(column(&distinct), ["true", "false"]);
+    for (predicate, expected) in [
+        ("n IS FALSE", ["true", "false"]),
+        ("n IS NOT TRUE", ["true", "false"]),
+        ("n IS NOT FALSE", ["true", "false"]),
+        ("NOT n IS TRUE", ["true", "false"]),
+    ] {
+        let result = session
+            .query(&format!(
+                "FOR n IN [TRUE, FALSE, NULL, TRUE]
+                 RETURN DISTINCT {predicate} AS v ORDER BY v DESC"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(column(&result), expected, "{predicate}");
+    }
+    let grouped = session
+        .query(
+            "FOR n IN [TRUE, FALSE, NULL, TRUE]
+             RETURN n IS TRUE AS v, COUNT(*) AS c GROUP BY v ORDER BY v",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        grouped
+            .batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(move |i| {
+                (
+                    ScalarValue::try_from_array(batch.column(0), i).unwrap(),
+                    ScalarValue::try_from_array(batch.column(1), i).unwrap(),
+                )
+            }))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ScalarValue::Boolean(Some(false)),
+                ScalarValue::Int64(Some(2))
+            ),
+            (
+                ScalarValue::Boolean(Some(true)),
+                ScalarValue::Int64(Some(2))
+            )
+        ]
+    );
+    session
+        .run("INSERT (:N {flag: TRUE}), (:N {flag: FALSE}), (:N)")
+        .await
+        .unwrap();
+    assert_eq!(
+        column(
+            &session
+                .query(
+                    "MATCH (n) WHERE n.flag IS TRUE
+                     RETURN n.flag AS flag"
+                )
+                .await
+                .unwrap()
+        ),
+        ["true"]
+    );
+    assert_eq!(
+        column(
+            &session
+                .query(
+                    "MATCH (n)
+                     RETURN DISTINCT n.flag IS NOT FALSE AS known
+                     ORDER BY known"
+                )
+                .await
+                .unwrap()
+        ),
+        ["false", "true"]
+    );
+    assert_eq!(
+        row(&session
+            .query(
+                "RETURN UNKNOWN IS NOT FALSE AS not_false,
+                            NULL IS TRUE AS is_true,
+                            NOT NULL IS TRUE AS not_is_true"
+            )
+            .await
+            .unwrap()),
+        vec![
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(Some(true))
+        ]
+    );
+}
