@@ -34,6 +34,14 @@ pub(super) enum NativeAtom {
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    ElementSelf {
+        op: Operator,
+    },
+    ElementCompare {
+        op: Operator,
+        value: Expr,
+        value_type: DataType,
+    },
     Identity {
         different: bool,
         copies: usize,
@@ -210,6 +218,8 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
         NativeAtom::Labeled { .. } => Ok(()),
         NativeAtom::Directed { .. } => Ok(()),
         NativeAtom::Identity { .. } => Ok(()),
+        NativeAtom::ElementSelf { .. } => Ok(()),
+        NativeAtom::ElementCompare { value_type, .. } => validate_identity_type(value_type),
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => {
@@ -306,6 +316,7 @@ fn validate_comparison(
 pub(super) struct FragmentMeta<'a> {
     pub labels: Option<&'a BTreeSet<String>>,
     pub directed: Option<bool>,
+    pub identity: Option<(crate::catalog::ObjectId, ElementKind)>,
 }
 
 pub(super) fn compile_fragment(
@@ -345,6 +356,23 @@ fn compile_in(
         NativeAtom::Identity { different, copies } => {
             identity_expr(schema, *different, *copies, qualifier)
         }
+        NativeAtom::ElementSelf { op } => {
+            if schema.field_with_name(crate::graph::ID).is_err() {
+                unknown()
+            } else {
+                self_compare(qualified_column(qualifier, crate::graph::ID), *op)
+            }
+        }
+        NativeAtom::ElementCompare {
+            op,
+            value,
+            value_type,
+        } => compare_identity_value(
+            stored_element_id(schema, metadata.identity, qualifier),
+            *op,
+            value.clone(),
+            value_type,
+        )?,
         NativeAtom::And(left, right) => compile_in(left, schema, qualifier, metadata)?
             .and(compile_in(right, schema, qualifier, metadata)?),
         NativeAtom::Or(left, right) => compile_in(left, schema, qualifier, metadata)?
@@ -625,6 +653,108 @@ fn identity_expr(schema: &Schema, different: bool, copies: usize, qualifier: Opt
     }
 }
 
+fn element_id_comparison(expr: &ast::Expr, variable: &str) -> Option<Local> {
+    let ast::Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    let op = match op {
+        ast::BinaryOp::Eq => Operator::Eq,
+        ast::BinaryOp::Neq => Operator::NotEq,
+        ast::BinaryOp::Lt => Operator::Lt,
+        ast::BinaryOp::Le => Operator::LtEq,
+        ast::BinaryOp::Gt => Operator::Gt,
+        ast::BinaryOp::Ge => Operator::GtEq,
+        _ => return None,
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (ast::Expr::ElementId { variable: left }, ast::Expr::ElementId { variable: right })
+            if left.value == variable && right.value == variable =>
+        {
+            Some(Local::ElementSelf { op })
+        }
+        (ast::Expr::ElementId { variable: name }, other)
+            if name.value == variable && !mentions(other, variable) =>
+        {
+            Some(Local::ElementCompare {
+                op,
+                value: other.clone(),
+            })
+        }
+        (other, ast::Expr::ElementId { variable: name })
+            if name.value == variable && !mentions(other, variable) =>
+        {
+            Some(Local::ElementCompare {
+                op: flip(op),
+                value: other.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn self_compare(value: Expr, op: Operator) -> Expr {
+    match op {
+        Operator::Eq | Operator::LtEq | Operator::GtEq => value.clone().eq(value),
+        Operator::NotEq | Operator::Lt | Operator::Gt => {
+            Expr::Not(Box::new(value.clone().eq(value.clone())))
+        }
+        _ => unknown(),
+    }
+}
+
+fn validate_identity_type(value_type: &DataType) -> Result<()> {
+    if matches!(value_type, DataType::Utf8 | DataType::Null) {
+        Ok(())
+    } else {
+        Err(Error::InvalidQuery(format!(
+            "incomparable types Utf8 and {value_type}"
+        )))
+    }
+}
+
+fn compare_identity_value(
+    left: Expr,
+    op: Operator,
+    right: Expr,
+    value_type: &DataType,
+) -> Result<Expr> {
+    validate_identity_type(value_type)?;
+    Ok(match op {
+        Operator::Eq => left.eq(right),
+        Operator::NotEq => left.not_eq(right),
+        Operator::Lt => left.lt(right),
+        Operator::LtEq => left.lt_eq(right),
+        Operator::Gt => left.gt(right),
+        Operator::GtEq => left.gt_eq(right),
+        _ => unknown(),
+    })
+}
+
+fn stored_element_id(
+    schema: &Schema,
+    identity: Option<(crate::catalog::ObjectId, ElementKind)>,
+    qualifier: Option<&str>,
+) -> Expr {
+    let null = lit(ScalarValue::Utf8(None));
+    if schema.field_with_name(crate::graph::ID).is_err() {
+        return null;
+    }
+    let Some((graph, kind)) = identity else {
+        return null;
+    };
+    let id = qualified_column(qualifier, crate::graph::ID);
+    let tag = if kind == ElementKind::Node { "n" } else { "e" };
+    let value = datafusion::functions::string::expr_fn::concat(vec![
+        lit(format!("g{graph}:{tag}:")),
+        cast(id.clone(), DataType::Utf8),
+    ]);
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(Box::new(id.is_null()), Box::new(null))],
+        Some(Box::new(value)),
+    ))
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -641,6 +771,13 @@ enum Local {
     Or(Box<Local>, Box<Local>),
     Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    ElementSelf {
+        op: Operator,
+    },
+    ElementCompare {
+        op: Operator,
+        value: ast::Expr,
+    },
     Identity {
         different: bool,
         copies: usize,
@@ -861,6 +998,13 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
                     negated: *negated,
                 });
             }
+            if matches!(expr.as_ref(), ast::Expr::ElementId { variable: name } if name.value == variable)
+            {
+                return Some(Local::Null {
+                    property: None,
+                    negated: *negated,
+                });
+            }
             let ast::Expr::NullIf { left, right } = expr.as_ref() else {
                 return None;
             };
@@ -874,7 +1018,8 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
                 negated: *negated,
             })
         }
-        other => value_coalesce_comparison(other, variable)
+        other => element_id_comparison(other, variable)
+            .or_else(|| value_coalesce_comparison(other, variable))
             .or_else(|| {
                 comparison(other, variable).map(|(property, op, value)| Local::Atom {
                     property,
@@ -967,6 +1112,16 @@ fn bind_local_value(
             different: *different,
             copies: *copies,
         }),
+        Local::ElementSelf { op } => Some(NativeAtom::ElementSelf { op: *op }),
+        Local::ElementCompare { op, value } => {
+            bind_value(session, schema, scope, value, working_row)?.map(|(value, value_type)| {
+                NativeAtom::ElementCompare {
+                    op: *op,
+                    value,
+                    value_type,
+                }
+            })
+        }
         Local::And(left, right) => match (
             bind_local_value(session, schema, scope, left, working_row)?,
             bind_local_value(session, schema, scope, right, working_row)?,
@@ -1383,6 +1538,7 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
         NativeAtom::Labeled { .. } => false,
         NativeAtom::Directed { .. } => false,
         NativeAtom::Identity { .. } => false,
+        NativeAtom::ElementSelf { .. } | NativeAtom::ElementCompare { .. } => false,
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
@@ -1499,6 +1655,7 @@ fn compile_on_fragments(
                     FragmentMeta {
                         labels: Some(&labels),
                         directed,
+                        identity: Some((binding.graph, binding.kind)),
                     },
                 )?),
             )],

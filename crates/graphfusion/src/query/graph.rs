@@ -807,6 +807,7 @@ fn scan_tables(
                     super::native::FragmentMeta {
                         labels: Some(&table.labels),
                         directed: (kind == ElementKind::Edge).then_some(directed),
+                        identity: Some((graph_id, kind)),
                     },
                 )?)?;
             }
