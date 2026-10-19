@@ -373,3 +373,38 @@ async fn match_where_waits_for_rebound_reference_schema() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn composite_order_resolves_projected_element_properties() {
+    let mut s = graph().await;
+    s.query("MATCH (n:N) RETURN n UNION ALL MATCH (n:N) RETURN n ORDER BY n.v")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn composite_reference_ordering_keeps_source_types_and_column_shape() {
+    let mut s = graph().await;
+    s.run("INSERT (:Document {v:'text'})").await.unwrap();
+    for q in [
+        "MATCH(n:N) RETURN n UNION ALL RETURN NULL AS n ORDER BY n.v+0 DESC NEXT RETURN n.v AS v",
+        "RETURN NULL AS n UNION ALL MATCH(n:N) RETURN n ORDER BY n.v+0 DESC NEXT RETURN n.v AS v",
+    ] {
+        check(&mut s, q, &[&["NULL"], &["3"], &["2"], &["1"]]).await;
+    }
+    for op in ["EXCEPT", "INTERSECT", "OTHERWISE"] {
+        let q = format!("MATCH(n:N) RETURN n {op} MATCH(n:N {{v:2}}) RETURN n ORDER BY n.v DESC NEXT RETURN n.v AS v");
+        let expected: &[&[&str]] = match op {
+            "EXCEPT" => &[&["3"], &["1"]],
+            "INTERSECT" => &[&["2"]],
+            _ => &[&["3"], &["2"], &["1"]],
+        };
+        check(&mut s, &q, expected).await;
+    }
+    let r = s
+        .query("MATCH(n:N) RETURN n UNION ALL MATCH(n:N) RETURN n ORDER BY n.v")
+        .await
+        .unwrap();
+    assert_eq!(r.schema.fields().len(), 1);
+    assert_eq!(r.schema.field(0).name(), "n");
+}

@@ -204,6 +204,9 @@
   is bound, so a start-node condition runs before a later variable-length
   expansion. A conjunct that names a later element stays pending, and a WHERE
   on a selective path still runs after selection.
+- Apply `ORDER BY`, `OFFSET`, and `LIMIT` written after the last branch of
+  `UNION`, `INTERSECT`, `EXCEPT`, or `OTHERWISE` to the combined rows. A page
+  on an earlier branch stays with that branch.
 
 ## 0.2.0 — 2026-10-05
 
