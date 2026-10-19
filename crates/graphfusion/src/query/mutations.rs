@@ -197,6 +197,7 @@ pub(super) async fn apply(
     match clause {
         ast::QueryClause::Insert(insert) => {
             for path in &insert.patterns {
+                let order_before = scope.order.len();
                 let (next, mut left) = insert_node(
                     plan,
                     scope,
@@ -254,6 +255,7 @@ pub(super) async fn apply(
                     plan = next;
                     left = right;
                 }
+                scope.order = pattern_binding_order(&scope.order, order_before, path);
             }
         }
         ast::QueryClause::Set(set) => {
@@ -637,6 +639,40 @@ fn stored_property_type(
             .ok()
             .map(|field| field.data_type().clone())
     })
+}
+
+/// `RETURN *` follows pattern order. Nodes are stored before the edge that
+/// joins them, so declaration order would otherwise list the right node first.
+fn pattern_binding_order(
+    order: &[String],
+    introduced_at: usize,
+    path: &ast::PathPattern,
+) -> Vec<String> {
+    let introduced = &order[introduced_at..];
+    let mut desired = Vec::new();
+    if let Some(name) = &path.start.variable {
+        desired.push(name.value.clone());
+    }
+    for chain in &path.chains {
+        if let Some(name) = &chain.relationship.variable {
+            desired.push(name.value.clone());
+        }
+        if let Some(name) = &chain.node.variable {
+            desired.push(name.value.clone());
+        }
+    }
+    let mut arranged = order[..introduced_at].to_vec();
+    for name in desired {
+        if introduced.contains(&name) && !arranged.contains(&name) {
+            arranged.push(name);
+        }
+    }
+    for name in introduced {
+        if !arranged.contains(name) {
+            arranged.push(name.clone());
+        }
+    }
+    arranged
 }
 
 fn property_target(expr: &ast::Expr) -> Result<(String, String)> {

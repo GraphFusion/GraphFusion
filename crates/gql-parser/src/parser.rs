@@ -7441,18 +7441,32 @@ fn result_clause_has_wildcard(result_clause: &ResultClause) -> bool {
 }
 
 fn query_clauses_have_non_unit_working_table(clauses: &[QueryClause]) -> bool {
-    clauses.iter().any(|clause| {
-        matches!(
-            clause,
-            QueryClause::NestedQuery(_)
-                | QueryClause::BindingTable(_)
-                | QueryClause::Match(_)
-                | QueryClause::OptionalMatchBlock(_)
-                | QueryClause::Let(_)
-                | QueryClause::For(_)
-                | QueryClause::Call(_)
-        )
+    clauses.iter().any(|clause| match clause {
+        QueryClause::NestedQuery(_)
+        | QueryClause::BindingTable(_)
+        | QueryClause::Match(_)
+        | QueryClause::OptionalMatchBlock(_)
+        | QueryClause::Let(_)
+        | QueryClause::For(_)
+        | QueryClause::Call(_) => true,
+        // A named INSERT element is a working-table binding. An anonymous
+        // pattern still leaves RETURN * with nothing to project.
+        QueryClause::Insert(insert) => insert.patterns.iter().any(|path| {
+            visible_node(&path.start)
+                || path.chains.iter().any(|chain| {
+                    visible_relationship(&chain.relationship) || visible_node(&chain.node)
+                })
+        }),
+        _ => false,
     })
+}
+
+fn visible_node(node: &NodePattern) -> bool {
+    node.variable.is_some() && !node.temporary
+}
+
+fn visible_relationship(edge: &RelationshipPattern) -> bool {
+    edge.variable.is_some() && !edge.temporary
 }
 
 fn validate_value_query_expression(query: &QueryStatement, offset: usize) -> Result<()> {
