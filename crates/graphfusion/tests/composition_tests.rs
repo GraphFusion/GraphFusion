@@ -1803,3 +1803,176 @@ async fn where_constant_comparisons_keep_stored_types() {
         other => panic!("expected invalid query, got {other}"),
     }
 }
+
+#[tokio::test]
+async fn where_null_tests_keep_stored_types() {
+    let mut session = social().await;
+    session
+        .run("INSERT (:Person {name: 'Cara'})")
+        .await
+        .unwrap();
+
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR n.id IS NULL
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![vec!["Ada".to_string()], vec!["Cara".to_string()]]
+    );
+
+    let present = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id IS NOT NULL AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&present), vec![vec!["Ada".to_string()]]);
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE NOT n.id IS NULL AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let others = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR NOT n.id IS NULL
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&others),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE n.id = 1 OR n.id IS NULL)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&inline),
+        vec![vec!["Ada".to_string()], vec!["Cara".to_string()]]
+    );
+
+    let element = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n IS NULL OR n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&element), vec![vec!["Ada".to_string()]]);
+
+    let element_present = session
+        .query(
+            "MATCH (n:Person|Document) WHERE NOT n IS NULL AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&element_present), vec![vec!["Ada".to_string()]]);
+
+    let missing = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.title IS NULL OR n.id = 1
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&missing),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["Cara".to_string()]
+        ]
+    );
+
+    let titled = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.title IS NOT NULL AND n.id = 'doc'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&titled), vec![vec!["Spec".to_string()]]);
+
+    let only_null = session
+        .query("MATCH (n:Person|Document) WHERE n.id IS NULL RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&only_null), vec![vec!["Cara".to_string()]]);
+
+    let empty = session
+        .query("MATCH (n:Person|Document) WHERE n.id = 1 AND n.id IS NULL RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(empty.row_count(), 0);
+
+    let joined = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id IS NULL AND m.name = 'load'
+             RETURN n.name AS name, m.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&joined),
+        vec![vec!["Cara".to_string(), "1.5".to_string()]]
+    );
+
+    let error = session
+        .query("MATCH (d:Document) WHERE d.id = 1 OR d.id IS NULL RETURN d.title AS title")
+        .await
+        .unwrap_err();
+    match error {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn null_pushdown_keeps_internal_fields_hidden_and_conditional_rows_checked() {
+    let mut s = social().await;
+    assert_eq!(
+        s.query("MATCH(n) WHERE n.__gf_id IS NULL RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        4
+    );
+    s.run("MATCH(a:Person {name:'Ada'}),(b:Person {name:'Bea'}) INSERT(a)-[:E]->(b)")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.query("MATCH(a)(-[e:E]->(b))? WHERE e IS NOT NULL RETURN e")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn inline_bound_comparison_keeps_a_null_test_conjunct() {
+    let mut s = social().await;
+    let r=s.query("LET k=1 MATCH(n:Person|Document WHERE n.id=k AND n.name IS NOT NULL) RETURN n.name AS name").await.unwrap();
+    assert_eq!(strings(&r), vec![vec!["Ada".to_string()]]);
+}

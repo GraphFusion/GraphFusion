@@ -97,6 +97,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Keep `IS NULL` and `IS NOT NULL` in `MATCH WHERE` and an inline pattern
+  `WHERE` on each fragment with the property comparison. A missing property is
+  null. A comparison no selected fragment can evaluate is still a type error.
 - Keep a closed comparison such as `1 = 1` or `2 > 0` in `MATCH WHERE` and an
   inline pattern `WHERE` on each fragment with the property comparison. A
   fragment that cannot compare stays unknown, and a comparison no selected

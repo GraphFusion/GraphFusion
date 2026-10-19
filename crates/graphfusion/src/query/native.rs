@@ -34,6 +34,10 @@ pub(super) enum NativeAtom {
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    Null {
+        property: Option<String>,
+        negated: bool,
+    },
     /// `IS [NOT] TRUE` / `IS [NOT] FALSE`. Unknown is its own category: it is
     /// not true and not false, unlike `NOT`, which leaves unknown unknown.
     Truth {
@@ -212,7 +216,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
             validate_atom(left, tables)?;
             validate_atom(right, tables)
         }
-        NativeAtom::Literal(_) | NativeAtom::Closed(_) => Ok(()),
+        NativeAtom::Literal(_) | NativeAtom::Closed(_) | NativeAtom::Null { .. } => Ok(()),
         NativeAtom::NullIfNull {
             property,
             value_type,
@@ -330,6 +334,9 @@ fn compile_in(atom: &NativeAtom, schema: &Schema, qualifier: Option<&str>) -> Re
         }
         NativeAtom::Closed(value) => value.clone(),
         NativeAtom::Not(inner) => Expr::Not(Box::new(compile_in(inner, schema, qualifier)?)),
+        NativeAtom::Null { property, negated } => {
+            null_expr(schema, property.as_deref(), *negated, qualifier)
+        }
         NativeAtom::Compare {
             property,
             op,
@@ -444,6 +451,27 @@ fn unknown() -> Expr {
     lit(ScalarValue::Boolean(None))
 }
 
+fn null_expr(
+    schema: &Schema,
+    property: Option<&str>,
+    negated: bool,
+    qualifier: Option<&str>,
+) -> Expr {
+    let name = property.unwrap_or(crate::graph::ID);
+    // Internal storage fields are not user properties.
+    if property.is_some_and(|name| name.starts_with("__gf_"))
+        || schema.field_with_name(name).is_err()
+    {
+        return lit(!negated);
+    }
+    let value = qualified_column(qualifier, name);
+    if negated {
+        value.is_not_null()
+    } else {
+        value.is_null()
+    }
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -460,6 +488,10 @@ enum Local {
     Or(Box<Local>, Box<Local>),
     Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Null {
+        property: Option<String>,
+        negated: bool,
+    },
     Truth {
         inner: Box<Local>,
         negated: bool,
@@ -616,6 +648,18 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             Box::new(predicate_or_literal(right, variable)?),
         )),
         ast::Expr::IsNull { expr, negated } if mentions(expr, variable) => {
+            if let Some(property) = property_of(expr, variable) {
+                return Some(Local::Null {
+                    property: Some(property),
+                    negated: *negated,
+                });
+            }
+            if matches!(expr.as_ref(), ast::Expr::Identifier(name) if name.value == variable) {
+                return Some(Local::Null {
+                    property: None,
+                    negated: *negated,
+                });
+            }
             let ast::Expr::NullIf { left, right } = expr.as_ref() else {
                 return None;
             };
@@ -749,6 +793,10 @@ fn bind_local_value(
                 }
             })
         }
+        Local::Null { property, negated } => Some(NativeAtom::Null {
+            property: property.clone(),
+            negated: *negated,
+        }),
         Local::Closed(expr) => {
             let Some((bound, data_type)) = bind_value(session, schema, scope, expr, working_row)?
             else {
@@ -880,6 +928,11 @@ fn bind_value(
 fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
     if let ast::Expr::Property { base, .. } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
+            names.insert(name.value.clone());
+        }
+    }
+    if let ast::Expr::IsNull { expr, .. } = expr {
+        if let ast::Expr::Identifier(name) = expr.as_ref() {
             names.insert(name.value.clone());
         }
     }
@@ -1121,7 +1174,7 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
         NativeAtom::Not(inner)
         | NativeAtom::Truth { inner, .. }
         | NativeAtom::Unknown { inner, .. } => atom_mixes(inner, tables),
-        NativeAtom::Closed(_) | NativeAtom::Literal(_) => false,
+        NativeAtom::Closed(_) | NativeAtom::Literal(_) | NativeAtom::Null { .. } => false,
         NativeAtom::Coalesce(args) => args.iter().any(|atom| atom_mixes(atom, tables)),
         NativeAtom::NullIf(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
         NativeAtom::NullIfNull { property, .. } | NativeAtom::ValueCoalesce { property, .. }
