@@ -5,15 +5,12 @@ use datafusion::{
     logical_expr::{expr::BinaryExpr, Expr, ExprSchemable, Operator},
 };
 
-pub(super) type PropertyValues = super::casefold::CaseFoldMap<super::casefold::CaseFoldMap<Expr>>;
-
 pub(super) struct Binder<'a> {
     session: &'a SessionState,
     schema: &'a DFSchema,
     bindings: Option<&'a super::graph::Bindings>,
     aggregates: bool,
     aliases: Option<&'a super::casefold::CaseFoldMap<Expr>>,
-    property_values: Option<&'a PropertyValues>,
 }
 
 impl<'a> Binder<'a> {
@@ -24,7 +21,6 @@ impl<'a> Binder<'a> {
             bindings: None,
             aggregates: false,
             aliases: None,
-            property_values: None,
         }
     }
     pub fn with_bindings(
@@ -38,7 +34,6 @@ impl<'a> Binder<'a> {
             bindings: Some(bindings),
             aggregates: false,
             aliases: None,
-            property_values: None,
         }
     }
     pub fn aggregating(mut self) -> Self {
@@ -47,10 +42,6 @@ impl<'a> Binder<'a> {
     }
     pub fn aliases(mut self, aliases: &'a super::casefold::CaseFoldMap<Expr>) -> Self {
         self.aliases = Some(aliases);
-        self
-    }
-    pub fn property_values(mut self, values: &'a PropertyValues) -> Self {
-        self.property_values = Some(values);
         self
     }
     fn element(&self, name: &str) -> Result<&super::graph::ElementBinding> {
@@ -187,15 +178,7 @@ impl<'a> Binder<'a> {
                 let E::Identifier(name) = base.as_ref() else {
                     return Err(super::unsupported("nested property access"));
                 };
-                if let Some(value) = self
-                    .property_values
-                    .and_then(|values| values.get(&name.value))
-                    .and_then(|values| values.get(&key.value))
-                {
-                    value.clone()
-                } else if let Some(element) =
-                    self.bindings.and_then(|b| b.elements.get(&name.value))
-                {
+                if let Some(element) = self.bindings.and_then(|b| b.elements.get(&name.value)) {
                     element.property(&key.value)
                 } else if let Some(reference) =
                     self.bindings.and_then(|b| b.references.get(&name.value))

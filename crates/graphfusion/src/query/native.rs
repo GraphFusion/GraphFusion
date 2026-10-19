@@ -11,6 +11,11 @@
 
 mod operators;
 
+#[derive(Clone, Default)]
+pub(super) struct OperatorCache {
+    values: BTreeMap<String, operators::Cached>,
+}
+
 use super::{
     casefold::CaseFoldMap,
     expressions::Binder,
@@ -1890,15 +1895,26 @@ pub(super) fn grouping_columns(
         .iter()
         .flat_map(|e| e.column_refs().into_iter().cloned())
         .collect();
-    scope
+    let mut columns: Vec<_> = scope
         .fragment_cache
         .iter()
         .filter(|(key, _)| groups.contains(&qualified_column(Some(&key.alias), crate::graph::ID)))
         .flat_map(|(_, fragments)| fragments.iter().flat_map(Fragment::columns))
         .filter(|expr| matches!(expr, Expr::Column(c) if referenced.contains(c)))
-        .collect()
+        .collect();
+    for (column, dependencies) in &scope.operator_dependencies {
+        let value = Expr::Column(column.clone());
+        if referenced.contains(column)
+            && dependencies
+                .iter()
+                .all(|dependency| groups.contains(&Expr::Column(dependency.clone())))
+            && !columns.contains(&value)
+        {
+            columns.push(value);
+        }
+    }
+    columns
 }
-
 fn attach_fragments(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,

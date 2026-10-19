@@ -530,6 +530,8 @@ pub(super) fn result(
     // resolve against the result scope, so keep its name counter ahead.
     result_scope.advance(outer);
     result_scope.fragment_cache = outer.fragment_cache.clone();
+    result_scope.operator_cache = outer.operator_cache.clone();
+    result_scope.operator_dependencies = outer.operator_dependencies.clone();
     let mut having = None;
     if let Some(predicate) = &body.having {
         let (next, expr, dependent) =

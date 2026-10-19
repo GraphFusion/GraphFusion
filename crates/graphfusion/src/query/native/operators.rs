@@ -1,21 +1,69 @@
-//! Evaluate mixed-property operators without replacing element metadata bindings.
-use super::super::expressions::PropertyValues;
+//! Stored operators form a typed dataflow graph. Each node combines only its
+//! immediate operands, and shared values are columns rather than expanded trees.
+use super::super::expressions::common_value_type;
 use super::*;
 
-struct Source {
-    name: String,
-    binding: ElementBinding,
-    fragments: Vec<Fragment>,
+type Origins = BTreeMap<String, BTreeSet<String>>;
+type Dependencies = BTreeSet<Column>;
+
+#[derive(Clone)]
+pub(super) struct Cached {
+    pub expression: Expr,
 }
 
-#[derive(Default)]
-struct Viability {
-    supported: bool,
-    error: Option<String>,
+#[derive(Clone)]
+struct Arm {
+    mask: Expr,
+    inputs: Vec<usize>,
+    value: Option<Expr>,
+    invalid: bool,
+}
+#[derive(Clone)]
+struct Variant {
+    ty: DataType,
+    mask: Expr,
+    origins: Origins,
+    physical: bool,
+    nonnull: bool,
+    dependencies: Dependencies,
+    arms: Vec<Arm>,
+}
+#[derive(Clone, Copy)]
+enum Lazy {
+    None,
+    Coalesce,
+    NullIf,
+    And,
+    Or,
+}
+#[derive(Clone)]
+enum Kind {
+    Base,
+    Ast {
+        expression: ast::Expr,
+        names: Vec<String>,
+        lazy: Lazy,
+    },
+    Append,
+}
+#[derive(Clone)]
+struct Node {
+    kind: Kind,
+    children: Vec<usize>,
+    variants: Vec<Variant>,
+    readable: Option<Expr>,
+}
+
+struct Compiler<'a> {
+    plan: LogicalPlanBuilder,
+    scope: &'a mut Bindings,
+    session: &'a SessionState,
+    context: BindContext<'a>,
+    nodes: Vec<Node>,
 }
 
 pub(super) fn compile(
-    mut plan: LogicalPlanBuilder,
+    plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     session: &SessionState,
     expression: &ast::Expr,
@@ -24,159 +72,723 @@ pub(super) fn compile(
     if !mixed_operator(expression, scope, false) || contains_aggregate(expression) {
         return Ok((plan, None));
     }
-    // Boolean branches have independent row-dependent operands. Keep them in
-    // the shared composition path rather than expanding a Cartesian CASE tree.
-    if matches!(
-        expression,
-        ast::Expr::Binary {
-            op: ast::BinaryOp::And | ast::BinaryOp::Or | ast::BinaryOp::Xor,
-            ..
+    let key = cache_key(expression, session, plan.schema(), scope, context)?;
+    if let Some(cached) = scope.operator_cache.values.get(&key) {
+        if cached
+            .expression
+            .column_refs()
+            .iter()
+            .all(|column| plan.schema().qualified_field_from_column(column).is_ok())
+        {
+            return Ok((plan, Some(cached.expression.clone())));
         }
-    ) {
-        return Ok((plan, None));
     }
-    let mut names = BTreeSet::new();
-    property_bases(expression, &mut names);
-    let mut sources = Vec::new();
-    for name in names {
-        let Some(binding) = fragment_binding(scope, &name) else {
-            continue;
-        };
-        let (next, fragments) = attach_fragments(plan, scope, &binding)?;
-        plan = next;
-        sources.push(Source {
-            name,
-            binding,
-            fragments,
-        });
+    let mut compiler = Compiler {
+        plan,
+        scope,
+        session,
+        context,
+        nodes: vec![],
+    };
+    let root = compiler.build(expression)?;
+    let variants = compiler.nodes[root].variants.clone();
+    let demands = variants
+        .iter()
+        .map(|variant| variant.mask.clone())
+        .collect();
+    let values = compiler.emit(root, demands)?;
+    let mut ty = DataType::Null;
+    for variant in &variants {
+        ty = common_value_type(&ty, &variant.ty)?;
     }
-    let keys = property_keys(expression);
-    let mut contexts: Vec<Vec<Option<Fragment>>> = vec![vec![]];
-    for source in &sources {
-        let mut next = Vec::new();
-        for prefix in contexts {
-            for fragment in source.fragments.iter().cloned().map(Some).chain([None]) {
-                let mut item = prefix.clone();
-                item.push(fragment);
-                next.push(item);
-            }
-        }
-        contexts = next;
-    }
-    let mut viability = BTreeMap::new();
     let mut arms = Vec::new();
-    for fragments in contexts {
-        let mut properties = PropertyValues::new();
-        let mut condition = lit(true);
-        for (source, fragment) in sources.iter().zip(&fragments) {
-            let selected = fragment.as_ref().map_or_else(
-                || source.binding.column(crate::graph::ID).is_null(),
-                |fragment| fragment.column(crate::graph::ID).is_not_null(),
-            );
-            condition = condition.and(selected);
-            let mut values = CaseFoldMap::new();
-            for (name, key) in &keys {
-                if !source.name.eq_ignore_ascii_case(name) {
-                    continue;
-                }
-                let (value, data_type) = fragment
-                    .as_ref()
-                    .and_then(|fragment| {
-                        crate::graph::property_field(&fragment.schema, key).map(|field| {
-                            (
-                                qualified_property(&fragment.schema, Some(&fragment.alias), key),
-                                field.data_type().clone(),
-                            )
-                        })
-                    })
-                    .unwrap_or_else(|| (lit(ScalarValue::Null), DataType::Null));
-                let value = source.binding.ensure_live(value, data_type);
-                values.insert(key.clone(), value);
-            }
-            properties.insert(source.name.clone(), values);
-        }
-        let binder = context
-            .binder(session, plan.schema(), scope)
-            .property_values(&properties);
-        let rewritten = rewrite(
-            expression,
-            &binder,
-            plan.schema(),
-            &sources,
-            &fragments,
-            &mut viability,
-        )?;
-        arms.push((condition, binder.bind(&rewritten)?));
+    let mut dependencies = Dependencies::new();
+    for (variant, value) in variants.iter().zip(values) {
+        dependencies.extend(variant.dependencies.iter().cloned());
+        let value = if value.get_type(compiler.plan.schema())? != ty {
+            value.cast_to(&ty, compiler.plan.schema())?
+        } else {
+            value
+        };
+        arms.push((Box::new(variant.mask.clone()), Box::new(value)));
     }
-    if let Some(failed) = viability.values().find(|item| !item.supported) {
-        return Err(Error::InvalidQuery(
-            failed
-                .error
-                .clone()
-                .unwrap_or_else(|| "operator does not match a stored type".into()),
-        ));
-    }
-    let mut data_type = DataType::Null;
-    for (_, value) in &arms {
-        let incoming = value.get_type(plan.schema())?;
-        if data_type == DataType::Null {
-            data_type = incoming;
-        } else if incoming != DataType::Null && incoming != data_type {
-            if incoming.is_numeric() && data_type.is_numeric() {
-                data_type = DataType::Float64;
-            } else {
-                return Err(Error::InvalidQuery(format!(
-                    "incompatible stored operator results {data_type} and {incoming}"
-                )));
-            }
-        }
-    }
-    let arms = arms
-        .into_iter()
-        .map(|(condition, value)| {
-            let value = if value.get_type(plan.schema())? != data_type {
-                value.cast_to(&data_type, plan.schema())?
-            } else {
-                value
-            };
-            Ok((Box::new(condition), Box::new(value)))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let otherwise = lit(ScalarValue::try_from(&data_type)?);
-    let mut value = Expr::Case(datafusion::logical_expr::expr::Case::new(
+    let value = Expr::Case(datafusion::logical_expr::expr::Case::new(
         None,
         arms,
-        Some(Box::new(otherwise)),
+        Some(Box::new(lit(ScalarValue::try_from(&ty)?))),
     ));
-    for source in &sources {
-        value = source.binding.ensure_live(value, data_type.clone());
-        if !scope.elements.contains_key(&source.name) {
-            if let Some(reference) = scope.references.get(&source.name) {
+    let value = if datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty() {
+        compiler
+            .project(vec![("value", value, dependencies)])?
+            .remove(0)
+    } else {
+        value
+    };
+    compiler.scope.operator_cache.values.insert(
+        key,
+        Cached {
+            expression: value.clone(),
+        },
+    );
+    Ok((compiler.plan, Some(value)))
+}
+
+impl Compiler<'_> {
+    fn fresh(&mut self, prefix: &str) -> String {
+        loop {
+            let name = self.scope.fresh(prefix);
+            if !self.scope.contains(&name)
+                && !self
+                    .context
+                    .aliases
+                    .is_some_and(|aliases| aliases.contains_key(&name))
+            {
+                return name;
+            }
+        }
+    }
+    fn semantic(&self, expression: &Expr) -> Dependencies {
+        let mut result = Dependencies::new();
+        for column in expression.column_refs() {
+            if let Some(dependencies) = self.scope.operator_dependencies.get(column) {
+                result.extend(dependencies.iter().cloned());
+                continue;
+            }
+            let source = column.relation.as_ref().and_then(|relation| {
+                self.scope
+                    .fragment_cache
+                    .iter()
+                    .find(|(_, fragments)| {
+                        fragments
+                            .iter()
+                            .any(|fragment| fragment.alias == relation.table())
+                    })
+                    .map(|(key, _)| key.alias.clone())
+            });
+            if let Some(alias) = source {
+                result.insert(Column::new(
+                    Some(TableReference::bare(alias)),
+                    crate::graph::ID,
+                ));
+            } else {
+                result.insert(column.clone());
+            }
+        }
+        result
+    }
+    fn project(&mut self, items: Vec<(&str, Expr, Dependencies)>) -> Result<Vec<Expr>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut projected = self
+            .plan
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect::<Vec<_>>();
+        let mut columns = Vec::new();
+        for (prefix, value, dependencies) in items {
+            let name = self.fresh(&format!("op_{prefix}"));
+            let column = Column::new_unqualified(&name);
+            projected.push(value.alias(name));
+            self.scope
+                .operator_dependencies
+                .insert(column.clone(), dependencies);
+            columns.push(Expr::Column(column));
+        }
+        self.plan = std::mem::replace(&mut self.plan, LogicalPlanBuilder::empty(false))
+            .project(projected)?;
+        Ok(columns)
+    }
+    fn finish(
+        &mut self,
+        kind: Kind,
+        children: Vec<usize>,
+        variants: Vec<Variant>,
+        readable: Option<Expr>,
+    ) -> Result<usize> {
+        let mut groups: Vec<Variant> = Vec::new();
+        for variant in variants {
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.ty == variant.ty && group.physical == variant.physical)
+            {
+                group.mask = or(group.mask.clone(), variant.mask);
+                group.nonnull &= variant.nonnull;
+                group.dependencies.extend(variant.dependencies);
+                for (name, frames) in variant.origins {
+                    group.origins.entry(name).or_default().extend(frames);
+                }
+                group.arms.extend(variant.arms);
+            } else {
+                groups.push(variant);
+            }
+        }
+        let mut definitions = Vec::new();
+        let mut indices = Vec::new();
+        for (index, group) in groups.iter().enumerate() {
+            if !literal_bool(&group.mask, true) {
+                indices.push(index);
+                definitions.push(("when", group.mask.clone(), self.semantic(&group.mask)));
+            }
+        }
+        let columns = self.project(definitions)?;
+        for (index, column) in indices.into_iter().zip(columns) {
+            groups[index].mask = column;
+        }
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            kind,
+            children,
+            variants: groups,
+            readable,
+        });
+        Ok(id)
+    }
+    fn base(&mut self, expression: Expr) -> Result<usize> {
+        let variant = Variant {
+            ty: expression.get_type(self.plan.schema())?,
+            mask: lit(true),
+            origins: Origins::new(),
+            physical: true,
+            nonnull: !expression.nullable(self.plan.schema())?,
+            dependencies: self.semantic(&expression),
+            arms: vec![Arm {
+                mask: lit(true),
+                inputs: vec![],
+                value: Some(expression),
+                invalid: false,
+            }],
+        };
+        self.finish(Kind::Base, vec![], vec![variant], None)
+    }
+    fn property(&mut self, name: &str, key: &str, original: &ast::Expr) -> Result<usize> {
+        let Some(binding) = fragment_binding(self.scope, name) else {
+            return self.base(
+                self.context
+                    .binder(self.session, self.plan.schema(), self.scope)
+                    .bind(original)?,
+            );
+        };
+        let (plan, fragments) = attach_fragments(
+            std::mem::replace(&mut self.plan, LogicalPlanBuilder::empty(false)),
+            self.scope,
+            &binding,
+        )?;
+        self.plan = plan;
+        let mut dependencies = Dependencies::new();
+        dependencies.insert(Column::new(
+            Some(TableReference::bare(binding.alias.clone())),
+            crate::graph::ID,
+        ));
+        let mut readable = binding.ensure_live(lit(true), DataType::Boolean);
+        if !self.scope.elements.contains_key(name) {
+            if let Some(reference) = self.scope.references.get(name) {
                 let scalar = Expr::Column(
-                    scope
+                    self.scope
                         .scalars
-                        .get(&source.name)
+                        .get(name)
                         .expect("reference column")
                         .clone(),
                 );
-                let live = scalar.clone().is_null().or(reference.guard(scalar));
-                value = Expr::Case(datafusion::logical_expr::expr::Case::new(
-                    None,
-                    vec![(Box::new(live), Box::new(value))],
-                    Some(Box::new(lit(ScalarValue::try_from(&data_type)?))),
-                ));
+                readable = and(
+                    readable,
+                    scalar.clone().is_null().or(reference.guard(scalar)),
+                );
             }
         }
+        let mut variants = Vec::new();
+        for fragment in &fragments {
+            let (value, ty, nonnull) = crate::graph::property_field(&fragment.schema, key)
+                .map(|field| {
+                    (
+                        qualified_property(&fragment.schema, Some(&fragment.alias), key),
+                        field.data_type().clone(),
+                        !field.is_nullable(),
+                    )
+                })
+                .unwrap_or_else(|| (lit(ScalarValue::Null), DataType::Null, false));
+            let mask = fragment.column(crate::graph::ID).is_not_null();
+            variants.push(Variant {
+                ty,
+                mask: mask.clone(),
+                origins: BTreeMap::from([(
+                    binding.alias.clone(),
+                    BTreeSet::from([fragment.alias.clone()]),
+                )]),
+                physical: true,
+                nonnull,
+                dependencies: dependencies.clone(),
+                arms: vec![Arm {
+                    mask,
+                    inputs: vec![],
+                    value: Some(value),
+                    invalid: false,
+                }],
+            });
+        }
+        let mask = binding.column(crate::graph::ID).is_null();
+        variants.push(Variant {
+            ty: DataType::Null,
+            mask: mask.clone(),
+            origins: BTreeMap::from([(binding.alias.clone(), BTreeSet::from(["\0null".into()]))]),
+            physical: fragments.is_empty(),
+            nonnull: false,
+            dependencies,
+            arms: vec![Arm {
+                mask,
+                inputs: vec![],
+                value: Some(lit(ScalarValue::Null)),
+                invalid: false,
+            }],
+        });
+        self.finish(
+            Kind::Base,
+            vec![],
+            variants,
+            (!literal_bool(&readable, true)).then_some(readable),
+        )
     }
-    Ok((plan, Some(value)))
+    fn build(&mut self, expression: &ast::Expr) -> Result<usize> {
+        use ast::Expr as E;
+        match expression {
+            E::Property { base, key } if matches!(base.as_ref(), E::Identifier(_)) => {
+                let E::Identifier(name) = base.as_ref() else {
+                    unreachable!()
+                };
+                self.property(&name.value, &key.value, expression)
+            }
+            E::Binary { left, op, right } => {
+                let a = self.build(left)?;
+                let b = self.build(right)?;
+                let lazy = match op {
+                    ast::BinaryOp::And => Lazy::And,
+                    ast::BinaryOp::Or => Lazy::Or,
+                    _ => Lazy::None,
+                };
+                self.ast(expression.clone(), vec![a, b], lazy)
+            }
+            E::Unary { expr, .. }
+            | E::IsNull { expr, .. }
+            | E::IsUnknown { expr, .. }
+            | E::IsTruth { expr, .. }
+            | E::Elements { path: expr } => {
+                let child = self.build(expr)?;
+                self.ast(expression.clone(), vec![child], Lazy::None)
+            }
+            E::Coalesce(args) if !args.is_empty() => {
+                let mut node = self.build(&args[0])?;
+                if args.len() == 1 {
+                    return self.ast(expression.clone(), vec![node], Lazy::Coalesce);
+                }
+                for arg in &args[1..] {
+                    let right = self.build(arg)?;
+                    node = self.ast(
+                        E::Coalesce(vec![E::Literal(ast::Literal::Null); 2]),
+                        vec![node, right],
+                        Lazy::Coalesce,
+                    )?;
+                }
+                Ok(node)
+            }
+            E::NullIf { left, right } => {
+                let a = self.build(left)?;
+                let b = self.build(right)?;
+                self.ast(expression.clone(), vec![a, b], Lazy::NullIf)
+            }
+            E::List(args) if !args.is_empty() => {
+                let first = self.build(&args[0])?;
+                let mut node = self.ast(
+                    E::List(vec![E::Literal(ast::Literal::Null)]),
+                    vec![first],
+                    Lazy::None,
+                )?;
+                for arg in &args[1..] {
+                    let item = self.build(arg)?;
+                    node = self.infer(Kind::Append, vec![node, item])?;
+                }
+                Ok(node)
+            }
+            E::NumericFunction { args, .. } => {
+                let children = args
+                    .iter()
+                    .map(|arg| self.build(arg))
+                    .collect::<Result<Vec<_>>>()?;
+                self.ast(expression.clone(), children, Lazy::None)
+            }
+            _ => self.base(
+                self.context
+                    .binder(self.session, self.plan.schema(), self.scope)
+                    .bind(expression)?,
+            ),
+        }
+    }
+    fn ast(
+        &mut self,
+        mut expression: ast::Expr,
+        children: Vec<usize>,
+        lazy: Lazy,
+    ) -> Result<usize> {
+        use ast::Expr as E;
+        let names = (0..children.len())
+            .map(|_| self.fresh("operand"))
+            .collect::<Vec<_>>();
+        let identifier = |index: usize| E::Identifier(ast::Identifier::new(&names[index]));
+        match &mut expression {
+            E::Binary { left, right, .. } | E::NullIf { left, right } => {
+                **left = identifier(0);
+                **right = identifier(1);
+            }
+            E::Unary { expr, .. }
+            | E::IsNull { expr, .. }
+            | E::IsUnknown { expr, .. }
+            | E::IsTruth { expr, .. }
+            | E::Elements { path: expr } => **expr = identifier(0),
+            E::Coalesce(args) | E::List(args) | E::NumericFunction { args, .. } => {
+                *args = (0..names.len()).map(identifier).collect()
+            }
+            _ => unreachable!("stored operator node"),
+        }
+        self.infer(
+            Kind::Ast {
+                expression,
+                names,
+                lazy,
+            },
+            children,
+        )
+    }
+    fn bind(&self, kind: &Kind, args: Vec<Expr>) -> Result<Expr> {
+        match kind {
+            Kind::Ast {
+                expression, names, ..
+            } => {
+                let mut aliases = self.context.aliases.cloned().unwrap_or_default();
+                for (name, value) in names.iter().zip(args) {
+                    aliases.insert(name.clone(), value);
+                }
+                self.context
+                    .binder(self.session, self.plan.schema(), self.scope)
+                    .aliases(&aliases)
+                    .bind(expression)
+            }
+            Kind::Append => {
+                let DataType::List(field) = args[0].get_type(self.plan.schema())? else {
+                    return Err(Error::InvalidQuery(
+                        "incompatible stored list elements".into(),
+                    ));
+                };
+                let element =
+                    common_value_type(field.data_type(), &args[1].get_type(self.plan.schema())?)?;
+                let list = args[0].clone().cast_to(
+                    &DataType::new_list(element.clone(), true),
+                    self.plan.schema(),
+                )?;
+                let item = args[1].clone().cast_to(&element, self.plan.schema())?;
+                Ok(datafusion::functions_nested::expr_fn::array_append(
+                    list, item,
+                ))
+            }
+            Kind::Base => unreachable!(),
+        }
+    }
+    fn infer(&mut self, kind: Kind, children: Vec<usize>) -> Result<usize> {
+        let operands = children
+            .iter()
+            .map(|id| self.nodes[*id].variants.clone())
+            .collect::<Vec<_>>();
+        let mut combinations = vec![vec![]];
+        for variants in &operands {
+            combinations = combinations
+                .into_iter()
+                .flat_map(|prefix| {
+                    (0..variants.len()).map(move |index| {
+                        let mut indices = prefix.clone();
+                        indices.push(index);
+                        indices
+                    })
+                })
+                .collect();
+        }
+        let mut variants = Vec::new();
+        let mut physical = false;
+        let mut supported = false;
+        let mut error = None;
+        for indices in combinations {
+            let mut origins = Origins::new();
+            let mut mask = lit(true);
+            let mut dependencies = Dependencies::new();
+            let mut actual = true;
+            let mut possible = true;
+            for (operand, index) in operands.iter().zip(&indices) {
+                let variant = &operand[*index];
+                if let Some(merged) = intersect(&origins, &variant.origins) {
+                    origins = merged;
+                } else {
+                    possible = false;
+                    break;
+                }
+                mask = and(mask, variant.mask.clone());
+                actual &= variant.physical;
+                dependencies.extend(variant.dependencies.iter().cloned());
+            }
+            if !possible {
+                continue;
+            }
+            physical |= actual;
+            let dummy = operands
+                .iter()
+                .zip(&indices)
+                .map(|(operand, index)| Ok(lit(ScalarValue::try_from(&operand[*index].ty)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let (ty, invalid) = match self
+                .bind(&kind, dummy)
+                .and_then(|value| value.get_type(self.plan.schema()).map_err(Error::from))
+            {
+                Ok(ty) => {
+                    supported |= actual;
+                    (ty, false)
+                }
+                Err(err @ (Error::InvalidQuery(_) | Error::UnsupportedFeature(_))) => {
+                    if error.is_none() {
+                        error = Some(err);
+                    }
+                    (DataType::Null, true)
+                }
+                Err(err) => return Err(err),
+            };
+            let nonnull = if invalid {
+                false
+            } else {
+                node_nonnull(&kind, &operands, &indices)
+            };
+            let value = invalid.then(|| lit(ScalarValue::Null));
+            variants.push(Variant {
+                ty,
+                mask: mask.clone(),
+                origins,
+                physical: actual,
+                nonnull,
+                dependencies,
+                arms: vec![Arm {
+                    mask,
+                    inputs: indices,
+                    value,
+                    invalid,
+                }],
+            });
+        }
+        if physical && !supported {
+            return Err(error.unwrap_or_else(|| {
+                Error::InvalidQuery("operator does not match a stored type".into())
+            }));
+        }
+        self.finish(kind, children, variants, None)
+    }
+    fn emit(&mut self, id: usize, demands: Vec<Expr>) -> Result<Vec<Expr>> {
+        let node = self.nodes[id].clone();
+        let mut values: Vec<Vec<Expr>> = Vec::new();
+        let lazy = match node.kind {
+            Kind::Ast { lazy, .. } => lazy,
+            _ => Lazy::None,
+        };
+        for (position, child) in node.children.iter().enumerate() {
+            let mut needed = vec![lit(false); self.nodes[*child].variants.len()];
+            for (variant, demand) in node.variants.iter().zip(&demands) {
+                for arm in &variant.arms {
+                    if arm.invalid {
+                        continue;
+                    }
+                    let mut active = and(demand.clone(), arm.mask.clone());
+                    if position == 1 && !matches!(lazy, Lazy::None) {
+                        let first = &values[0][arm.inputs[0]];
+                        let info = &self.nodes[node.children[0]].variants[arm.inputs[0]];
+                        let aggregate =
+                            !datafusion::logical_expr::utils::find_aggregate_exprs([first])
+                                .is_empty();
+                        let condition = if aggregate && !matches!(lazy, Lazy::Coalesce) {
+                            lit(true)
+                        } else {
+                            match lazy {
+                                Lazy::Coalesce if info.nonnull => lit(false),
+                                Lazy::Coalesce
+                                    if !datafusion::logical_expr::utils::find_aggregate_exprs(
+                                        [first],
+                                    )
+                                    .is_empty() =>
+                                {
+                                    lit(true)
+                                }
+                                Lazy::Coalesce => first.clone().is_null(),
+                                Lazy::NullIf => first.clone().is_not_null(),
+                                Lazy::And => first.clone().is_not_false(),
+                                Lazy::Or => first.clone().is_not_true(),
+                                Lazy::None => lit(true),
+                            }
+                        };
+                        active = and(active, condition);
+                    }
+                    let index = arm.inputs[position];
+                    needed[index] = or(needed[index].clone(), active);
+                }
+            }
+            values.push(self.emit(*child, needed)?);
+        }
+        if let Some(readable) = node.readable {
+            let active = demands.iter().cloned().fold(lit(false), or);
+            if !literal_bool(&active, false) {
+                let check = Expr::Case(datafusion::logical_expr::expr::Case::new(
+                    None,
+                    vec![(Box::new(active), Box::new(readable))],
+                    Some(Box::new(lit(true))),
+                ));
+                self.plan = std::mem::replace(&mut self.plan, LogicalPlanBuilder::empty(false))
+                    .filter(check)?;
+            }
+        }
+        let mut result = Vec::new();
+        let mut projected = Vec::new();
+        let mut indices = Vec::new();
+        for (index, (variant, demand)) in node.variants.iter().zip(demands).enumerate() {
+            let mut arms = Vec::new();
+            for arm in &variant.arms {
+                let active = and(demand.clone(), arm.mask.clone());
+                if literal_bool(&active, false) {
+                    continue;
+                }
+                let value = if let Some(value) = &arm.value {
+                    value.clone()
+                } else {
+                    let args = arm
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(child, index)| values[child][*index].clone())
+                        .collect();
+                    self.bind(&node.kind, args)?
+                };
+                arms.push((Box::new(active), Box::new(value)));
+            }
+            let null = lit(ScalarValue::try_from(&variant.ty)?);
+            let value = if arms.is_empty() {
+                null
+            } else {
+                Expr::Case(datafusion::logical_expr::expr::Case::new(
+                    None,
+                    arms,
+                    Some(Box::new(null)),
+                ))
+            };
+            if datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty() {
+                indices.push(index);
+                let mut dependencies = variant.dependencies.clone();
+                dependencies.extend(self.semantic(&demand));
+                projected.push(("typed", value, dependencies));
+                result.push(lit(ScalarValue::Null));
+            } else {
+                result.push(value);
+            }
+        }
+        for (index, column) in indices.into_iter().zip(self.project(projected)?) {
+            result[index] = column;
+        }
+        Ok(result)
+    }
 }
 
+fn node_nonnull(kind: &Kind, operands: &[Vec<Variant>], indices: &[usize]) -> bool {
+    use ast::Expr as E;
+    let all = operands
+        .iter()
+        .zip(indices)
+        .all(|(variants, index)| variants[*index].nonnull);
+    match kind {
+        Kind::Append => true,
+        Kind::Ast {
+            expression: E::IsNull { .. } | E::IsUnknown { .. } | E::IsTruth { .. } | E::List(_),
+            ..
+        } => true,
+        Kind::Ast {
+            expression: E::Coalesce(_),
+            ..
+        } => operands
+            .iter()
+            .zip(indices)
+            .any(|(variants, index)| variants[*index].nonnull),
+        Kind::Ast {
+            expression: E::NullIf { .. },
+            ..
+        } => false,
+        Kind::Ast {
+            expression:
+                E::Binary {
+                    op:
+                        ast::BinaryOp::Eq
+                        | ast::BinaryOp::Neq
+                        | ast::BinaryOp::Lt
+                        | ast::BinaryOp::Le
+                        | ast::BinaryOp::Gt
+                        | ast::BinaryOp::Ge,
+                    ..
+                },
+            ..
+        } if operands.iter().zip(indices).any(|(variants, index)| {
+            matches!(
+                variants[*index].ty,
+                DataType::List(_) | DataType::LargeList(_)
+            )
+        }) =>
+        {
+            false
+        }
+        _ => all,
+    }
+}
+fn intersect(left: &Origins, right: &Origins) -> Option<Origins> {
+    let mut result = left.clone();
+    for (name, frames) in right {
+        if let Some(current) = result.get_mut(name) {
+            *current = current.intersection(frames).cloned().collect();
+            if current.is_empty() {
+                return None;
+            }
+        } else {
+            result.insert(name.clone(), frames.clone());
+        }
+    }
+    Some(result)
+}
+fn literal_bool(expr: &Expr, expected: bool) -> bool {
+    matches!(expr,Expr::Literal(ScalarValue::Boolean(Some(value)),_) if *value==expected)
+}
+fn and(left: Expr, right: Expr) -> Expr {
+    if literal_bool(&left, false) || literal_bool(&right, false) {
+        lit(false)
+    } else if literal_bool(&left, true) {
+        right
+    } else if literal_bool(&right, true) || left == right {
+        left
+    } else {
+        left.and(right)
+    }
+}
+fn or(left: Expr, right: Expr) -> Expr {
+    if literal_bool(&left, true) || literal_bool(&right, true) {
+        lit(true)
+    } else if literal_bool(&left, false) {
+        right
+    } else if literal_bool(&right, false) || left == right {
+        left
+    } else {
+        left.or(right)
+    }
+}
 fn contains_aggregate(expr: &ast::Expr) -> bool {
     matches!(expr, ast::Expr::Function { .. }) || children(expr).into_iter().any(contains_aggregate)
 }
-
-fn mixed_operator(expr: &ast::Expr, scope: &Bindings, in_operator: bool) -> bool {
-    let in_operator = in_operator
+fn mixed_operator(expr: &ast::Expr, scope: &Bindings, inside: bool) -> bool {
+    let inside = inside
         || matches!(
             expr,
             ast::Expr::Binary {
@@ -193,16 +805,16 @@ fn mixed_operator(expr: &ast::Expr, scope: &Bindings, in_operator: bool) -> bool
         );
     if let ast::Expr::Property { base, key } = expr {
         if let ast::Expr::Identifier(name) = base.as_ref() {
-            if in_operator {
+            if inside {
                 if let Some(binding) = fragment_binding(scope, &name.value) {
                     if let Some(data) = scope.sources.get(&binding.graph) {
-                        let types: Vec<_> = element_tables(data, &binding)
+                        let types = element_tables(data, &binding)
                             .into_iter()
                             .filter_map(|table| {
                                 crate::graph::property_field(&table.schema, &key.value)
                                     .map(|field| field.data_type().clone())
                             })
-                            .collect();
+                            .collect::<Vec<_>>();
                         return types.iter().any(|ty| types.first() != Some(ty));
                     }
                 }
@@ -211,180 +823,60 @@ fn mixed_operator(expr: &ast::Expr, scope: &Bindings, in_operator: bool) -> bool
     }
     children(expr)
         .into_iter()
-        .any(|child| mixed_operator(child, scope, in_operator))
+        .any(|child| mixed_operator(child, scope, inside))
 }
-
-fn property_keys(expr: &ast::Expr) -> Vec<(String, String)> {
-    let mut keys = Vec::new();
-    fn visit(expr: &ast::Expr, keys: &mut Vec<(String, String)>) {
-        if let ast::Expr::Property { base, key } = expr {
-            if let ast::Expr::Identifier(name) = base.as_ref() {
-                if !keys.iter().any(|(n, k)| {
-                    n.eq_ignore_ascii_case(&name.value) && k.eq_ignore_ascii_case(&key.value)
-                }) {
-                    keys.push((name.value.clone(), key.value.clone()));
-                }
-            }
-        }
-        for child in children(expr) {
-            visit(child, keys);
-        }
-    }
-    visit(expr, &mut keys);
-    keys
-}
-
-fn record(
+fn cache_key(
     expr: &ast::Expr,
-    supported: bool,
-    error: String,
-    sources: &[Source],
-    fragments: &[Option<Fragment>],
-    viability: &mut BTreeMap<usize, Viability>,
-) {
-    let mut dependencies = BTreeSet::new();
-    property_bases(expr, &mut dependencies);
-    if sources.iter().zip(fragments).any(|(source, fragment)| {
-        fragment.is_none()
-            && !source.fragments.is_empty()
-            && dependencies
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&source.name))
-    }) {
-        return;
-    }
-    let entry = viability
-        .entry(expr as *const ast::Expr as usize)
-        .or_default();
-    entry.supported |= supported;
-    if !supported && entry.error.is_none() {
-        entry.error = Some(error);
-    }
-}
-
-fn rewrite(
-    expr: &ast::Expr,
-    binder: &Binder<'_>,
+    session: &SessionState,
     schema: &DFSchema,
-    sources: &[Source],
-    fragments: &[Option<Fragment>],
-    viability: &mut BTreeMap<usize, Viability>,
-) -> Result<ast::Expr> {
+    scope: &Bindings,
+    context: BindContext<'_>,
+) -> Result<String> {
     use ast::Expr as E;
-    let mut next = expr.clone();
-    match (&mut next, expr) {
-        (
-            E::Binary { left, op, right },
-            E::Binary {
-                left: original_left,
-                right: original_right,
-                ..
-            },
-        ) => {
-            **left = rewrite(original_left, binder, schema, sources, fragments, viability)?;
-            **right = rewrite(
-                original_right,
-                binder,
-                schema,
-                sources,
-                fragments,
-                viability,
-            )?;
-            let a = binder.bind(left)?.get_type(schema)?;
-            let b = binder.bind(right)?.get_type(schema)?;
-            let numeric = |ty: &DataType| ty.is_numeric() || *ty == DataType::Null;
-            let string = |ty: &DataType| {
-                matches!(
-                    ty,
-                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
-                )
-            };
-            use ast::BinaryOp as B;
-            let supported = match op {
-                B::Add | B::Sub | B::Mul | B::Div => numeric(&a) && numeric(&b),
-                B::Concat => string(&a) && string(&b),
-                B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge => comparable(&a, &b),
-                B::And | B::Or | B::Xor => {
-                    matches!(a, DataType::Boolean | DataType::Null)
-                        && matches!(b, DataType::Boolean | DataType::Null)
+    let child = |expr: &ast::Expr| cache_key(expr, session, schema, scope, context);
+    Ok(match expr {
+        E::Property { base, key } => {
+            if let E::Identifier(name) = base.as_ref() {
+                if let Some(binding) = fragment_binding(scope, &name.value) {
+                    let snapshot = scope
+                        .sources
+                        .get(&binding.graph)
+                        .map(|data| std::sync::Arc::as_ptr(data) as usize);
+                    return Ok(format!(
+                        "property:{}:{}:{binding:?}:{snapshot:?}",
+                        name.value.to_ascii_lowercase(),
+                        key.value.to_ascii_lowercase()
+                    ));
                 }
-            };
-            record(
-                expr,
-                supported,
-                format!("operator {op:?} cannot apply to stored types {a} and {b}"),
-                sources,
-                fragments,
-                viability,
-            );
-            if !supported {
-                return Ok(E::Literal(ast::Literal::Null));
             }
+            format!("{:?}", context.binder(session, schema, scope).bind(expr)?)
         }
-        (E::Unary { op, expr: child }, E::Unary { expr: original, .. }) => {
-            **child = rewrite(original, binder, schema, sources, fragments, viability)?;
-            let ty = binder.bind(child)?.get_type(schema)?;
-            let supported = match op {
-                ast::UnaryOp::Not => matches!(ty, DataType::Boolean | DataType::Null),
-                _ => ty.is_numeric() || ty == DataType::Null,
+        E::Binary { left, op, right } => {
+            format!("binary:{op:?}({},{})", child(left)?, child(right)?)
+        }
+        E::Unary { op, expr } => format!("unary:{op:?}({})", child(expr)?),
+        E::IsNull { expr, negated } => format!("null:{negated}({})", child(expr)?),
+        E::IsUnknown { expr, negated } => format!("unknown:{negated}({})", child(expr)?),
+        E::IsTruth {
+            expr,
+            negated,
+            value,
+        } => format!("truth:{negated}:{value}({})", child(expr)?),
+        E::NullIf { left, right } => format!("nullif({},{})", child(left)?, child(right)?),
+        E::Coalesce(args) | E::List(args) | E::NumericFunction { args, .. } => {
+            let values = args.iter().map(child).collect::<Result<Vec<_>>>()?;
+            let tag = match expr {
+                E::Coalesce(_) => "coalesce".into(),
+                E::List(_) => "list".into(),
+                E::NumericFunction { function, .. } => format!("numeric:{function:?}"),
+                _ => unreachable!(),
             };
-            record(
-                expr,
-                supported,
-                format!("operator {op:?} cannot apply to stored type {ty}"),
-                sources,
-                fragments,
-                viability,
-            );
-            if !supported {
-                return Ok(E::Literal(ast::Literal::Null));
-            }
+            format!("{tag}:{values:?}")
         }
-        (
-            E::IsNull { expr: child, .. }
-            | E::IsUnknown { expr: child, .. }
-            | E::IsTruth { expr: child, .. }
-            | E::Elements { path: child },
-            E::IsNull { expr: original, .. }
-            | E::IsUnknown { expr: original, .. }
-            | E::IsTruth { expr: original, .. }
-            | E::Elements { path: original },
-        ) => {
-            **child = rewrite(original, binder, schema, sources, fragments, viability)?;
-        }
-        (
-            E::Coalesce(args)
-            | E::List(args)
-            | E::Function { args, .. }
-            | E::NumericFunction { args, .. },
-            E::Coalesce(original)
-            | E::List(original)
-            | E::Function { args: original, .. }
-            | E::NumericFunction { args: original, .. },
-        ) => {
-            *args = original
-                .iter()
-                .map(|child| rewrite(child, binder, schema, sources, fragments, viability))
-                .collect::<Result<Vec<_>>>()?;
-        }
-        (
-            E::NullIf { left, right },
-            E::NullIf {
-                left: original_left,
-                right: original_right,
-            },
-        ) => {
-            **left = rewrite(original_left, binder, schema, sources, fragments, viability)?;
-            **right = rewrite(
-                original_right,
-                binder,
-                schema,
-                sources,
-                fragments,
-                viability,
-            )?;
-        }
-        _ => {}
-    }
-    Ok(next)
+        E::Elements { path } => format!("elements({})", child(path)?),
+        _ => format!(
+            "bound:{:?}",
+            context.binder(session, schema, scope).bind(expr)?
+        ),
+    })
 }

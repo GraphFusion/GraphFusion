@@ -3815,3 +3815,238 @@ async fn stored_operators_reuse_fragments_and_keep_reference_guards() {
         1
     );
 }
+
+#[tokio::test]
+async fn filter_operators_use_stored_types() {
+    let mut session = social().await;
+    let added = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id + 0 = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&added), vec![vec!["Ada".to_string()]]);
+
+    let multiplied = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id * 1 = 2
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&multiplied), vec![vec!["Bea".to_string()]]);
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document) FILTER -n.id = -1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let not_stringified = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id || '' = '1'
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_stringified.row_count(), 0);
+
+    let concatenated = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id || '!' = 'doc!'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&concatenated), vec![vec!["Spec".to_string()]]);
+
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id + 0 = 1 OR n.name = 'Bea'
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let kept = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id + 0 = 1 OR TRUE
+             RETURN n.id AS id ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&kept),
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["doc".to_string()]
+        ]
+    );
+
+    let dropped = session
+        .query(
+            "MATCH (n:Person|Document) FILTER NOT (n.id + 0 = 1)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&dropped), vec![vec!["Bea".to_string()]]);
+
+    let labeled = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id + 0 = 1 OR n:Document
+             RETURN n.id AS id ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&labeled),
+        vec![vec!["1".to_string()], vec!["doc".to_string()]]
+    );
+
+    let widened = session
+        .query(
+            "MATCH (n:Person|Metric) FILTER n.score + 0 > 1
+             RETURN n.score AS score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
+
+    let incompatible = session
+        .query("MATCH (d:Document) FILTER d.id + 0 = 1 RETURN d.title AS title")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+    let still_incompatible = session
+        .query("MATCH (d:Document) FILTER d.id + 0 = 1 OR TRUE RETURN d.title AS title")
+        .await;
+    assert!(
+        matches!(still_incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{still_incompatible:?}"
+    );
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d)",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() FILTER e.since * 1 = 1
+             RETURN e.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge), vec![vec!["1".to_string()]]);
+    let edge_text = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() FILTER e.since || '' = '1'
+             RETURN e.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge_text.row_count(), 0);
+}
+
+#[tokio::test]
+async fn filter_stored_operators_keep_optional_rows_and_unknown_classification() {
+    let mut session = social().await;
+    let result = session
+        .query("MATCH(n:Person|Document) FILTER (n.id+0=1) IS UNKNOWN RETURN n.title AS title")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["Spec".to_string()]]);
+    assert_eq!(session.query("OPTIONAL MATCH(n:Person|Document {id:'absent'}) FILTER n.id+0=1 OR TRUE RETURN 1 AS value").await.unwrap().row_count(),1);
+    assert_eq!(
+        session
+            .query("FOR flag IN [TRUE] MATCH(n:Person|Document) FILTER n.id+0=1 OR flag RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn stored_arithmetic_lists_use_recursive_numeric_widening() {
+    let mut session = social().await;
+    let result = session
+        .query("MATCH(n:Person|Document) FILTER [n.id+0]=[1.0] RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["Ada".to_string()]]);
+    let result = session
+        .query(
+            "MATCH(n:Person|Metric) RETURN n.name AS name,[n.score+0]=[1.0] AS equal ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![
+            vec!["Ada".to_string(), "true".to_string()],
+            vec!["Bea".to_string(), "false".to_string()],
+            vec!["load".to_string(), "false".to_string()]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn grouping_reuses_the_stored_arithmetic_expression() {
+    let mut session = social().await;
+    let result=session.query("MATCH(n:Person|Metric) RETURN n.score+0 AS value,COUNT(*) AS c GROUP BY value ORDER BY value").await.unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![
+            vec!["1".to_string(), "1".to_string()],
+            vec!["1.5".to_string(), "1".to_string()],
+            vec!["2".to_string(), "1".to_string()]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn several_stored_operator_sources_keep_a_bounded_plan() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    for i in 0..8 {
+        let value = match i % 3 {
+            0 => "1",
+            1 => "1.5",
+            _ => "'text'",
+        };
+        session
+            .run(&format!("INSERT (:L{i} {{name:'n{i}',v:{value}}})"))
+            .await
+            .unwrap();
+    }
+    let result=session.query("MATCH(a),(b),(c) WHERE a.name='n0' AND b.name='n0' AND c.name='n0' RETURN a.v+b.v+c.v AS total").await.unwrap();
+    assert_eq!(strings(&result), vec![vec!["3".to_string()]]);
+    assert!(
+        result.logical_plan.len() < 150000,
+        "operator planning expanded to {} bytes",
+        result.logical_plan.len()
+    );
+}

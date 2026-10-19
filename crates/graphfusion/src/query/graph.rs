@@ -218,6 +218,8 @@ pub(super) struct Bindings {
     /// the source label set instead of every fragment of the element kind.
     pub reference_sources: CaseFoldMap<Vec<ElementBinding>>,
     pub fragment_cache: super::native::FragmentCache,
+    pub operator_cache: super::native::OperatorCache,
+    pub operator_dependencies: BTreeMap<Column, BTreeSet<Column>>,
     next: usize,
 }
 impl Bindings {
