@@ -9,6 +9,8 @@ sidebar:
 
 A `FILTER` on a bound element's property compares each source fragment in its stored type, including when those fragments disagree. A fragment that cannot compare the value is unknown. A comparison that no selected fragment can evaluate is a type error.
 
+A `MATCH` `WHERE` comparison combined with `TRUE`, `FALSE`, `UNKNOWN`, or a boolean parameter is still evaluated on each fragment's stored type. `OR TRUE` keeps a row when that fragment cannot compare the other side. `OR FALSE` does not.
+
 ```gql test
 MATCH (p:Person) WHERE p.age >= 30
 FILTER p.name <> 'Bob'

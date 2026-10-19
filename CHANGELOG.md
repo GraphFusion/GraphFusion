@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Keep boolean literals on a per-fragment comparison. `WHERE n.id = 1 OR FALSE`
+  no longer fails after a multi-type scan, and `OR TRUE` keeps a row whose
+  stored value cannot be compared.
 - Compare a `FILTER` predicate on each matched fragment's stored property type.
   `FILTER n.id = 1` no longer fails after a multi-type scan has unified those
   values, and a string comparison does not match a stringified integer.
