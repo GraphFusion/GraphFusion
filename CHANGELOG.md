@@ -200,6 +200,10 @@
   still has no columns for the wildcard to expand.
 - Project `IS [NOT] TRUE` and `IS [NOT] FALSE` under `DISTINCT`. A null boolean
   is not true and not false, and the predicate no longer fails planning.
+- Apply each ordinary MATCH WHERE conjunct as soon as every variable it reads
+  is bound, so a start-node condition runs before a later variable-length
+  expansion. A conjunct that names a later element stays pending, and a WHERE
+  on a selective path still runs after selection.
 
 ## 0.2.0 — 2026-10-05
 
