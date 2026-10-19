@@ -4257,3 +4257,179 @@ mod stored_result_regressions {
             .unwrap();
     }
 }
+
+#[tokio::test]
+async fn mutation_operators_use_stored_types() {
+    let mut session = social().await;
+    session
+        .run("MATCH (n:Person|Document) SET n.extra = n.id + 0")
+        .await
+        .unwrap();
+    let added = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.extra AS extra ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(added.schema.field(1).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&added),
+        vec![
+            vec!["Ada".to_string(), "1".to_string()],
+            vec!["Bea".to_string(), "2".to_string()],
+            vec!["NULL".to_string(), "NULL".to_string()]
+        ]
+    );
+
+    session
+        .run("MATCH (n:Person|Document) SET n.copied = n.id || '!'")
+        .await
+        .unwrap();
+    let concatenated = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.copied AS copied ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(concatenated.schema.field(1).data_type(), &DataType::Utf8);
+    assert_eq!(
+        strings(&concatenated),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string()],
+            vec!["NULL".to_string(), "doc!".to_string()]
+        ]
+    );
+
+    session
+        .run("MATCH (n:Person|Metric) SET n.adjusted = n.score + 0")
+        .await
+        .unwrap();
+    let widened = session
+        .query("MATCH (n:Person|Metric) RETURN n.adjusted AS adjusted ORDER BY adjusted")
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![
+            vec!["1".to_string()],
+            vec!["1.5".to_string()],
+            vec!["2".to_string()]
+        ]
+    );
+
+    let incompatible = session
+        .run("MATCH (d:Document) SET d.extra = d.id + 1")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+
+    session
+        .run("MATCH (n:Person|Document) INSERT (:Note {copied: n.id || '!'})")
+        .await
+        .unwrap();
+    let notes = session
+        .query("MATCH (n:Note) RETURN n.copied AS copied ORDER BY copied")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&notes),
+        vec![
+            vec!["doc!".to_string()],
+            vec!["NULL".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d);
+             MATCH ()-[e:Knows|Cites]->() SET e.mark = e.since * 1",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query("MATCH ()-[e:Knows|Cites]->() RETURN e.mark AS mark ORDER BY mark")
+        .await
+        .unwrap();
+    assert_eq!(edge.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&edge),
+        vec![vec!["1".to_string()], vec!["NULL".to_string()]]
+    );
+
+    let mut replaced = social().await;
+    replaced
+        .run("MATCH (n:Person|Document) SET n = {extra: n.id + 0}")
+        .await
+        .unwrap();
+    let map = replaced
+        .query("MATCH (n:Person|Document) RETURN n.extra AS extra ORDER BY extra")
+        .await
+        .unwrap();
+    assert_eq!(map.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&map),
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+}
+
+mod stored_mutation_regressions {
+    use graphfusion::Database;
+    async fn session() -> graphfusion::Session {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:T {v:'text'})")
+            .await
+            .unwrap();
+        s
+    }
+    #[tokio::test]
+    async fn optional_mutation_uses_coalesce_fallback() {
+        let mut s = session().await;
+        s.run("INSERT (:F {v:1.5})").await.unwrap();
+        s.run("MATCH(p:P) OPTIONAL MATCH(n:P|F {v:99}) SET p.extra=COALESCE(n.v+0,99)")
+            .await
+            .unwrap();
+        let r = s
+            .query("MATCH(p:P) WHERE p.extra=99 RETURN 1 AS v")
+            .await
+            .unwrap();
+        assert_eq!(r.row_count(), 1, "{r:?}");
+    }
+    #[tokio::test]
+    async fn inserted_values_keep_optional_fallback_and_refresh_after_set() {
+        let mut s = session().await;
+        s.run("INSERT (:F {v:1.5})").await.unwrap();
+        s.run("MATCH(p:P) OPTIONAL MATCH(n:P|F {v:99}) INSERT (:Copy {v:COALESCE(n.v+0,99)})")
+            .await
+            .unwrap();
+        let result = s.query("MATCH(c:Copy) RETURN c.v AS v").await.unwrap();
+        assert_eq!(super::strings(&result), vec![vec!["99".to_owned()]]);
+        s.run("MATCH(n:P|T) SET n.before=n.v+0, n.v=n.v+1, n.after=n.v+0")
+            .await
+            .unwrap();
+        let result = s
+            .query("MATCH(n:P|T) RETURN n.before AS before, n.after AS after ORDER BY before")
+            .await
+            .unwrap();
+        assert_eq!(
+            super::strings(&result),
+            vec![
+                vec!["1".to_owned(), "2".to_owned()],
+                vec!["NULL".to_owned(), "NULL".to_owned()]
+            ]
+        );
+    }
+}

@@ -27,3 +27,5 @@ Creation requires concrete labels: names joined by `&` are accepted, while `!`, 
 A property value that is null on every inserted row does not create that property. `1 + NULL`, `NULLIF` and other null expressions leave it unset, just as a literal `NULL` does. One non-null value keeps the column and its type.
 
 A complete statement publishes atomically after its result pipeline succeeds. A later expression error rolls back that statement's inserts. Multiple semicolon-separated statements auto-commit independently unless enclosed in an [explicit transaction](/storage/transactions/).
+
+Arithmetic and concatenation in property values use each source fragment's stored type. Incompatible fragments yield null before enclosing expressions such as `COALESCE` apply their fallback.
