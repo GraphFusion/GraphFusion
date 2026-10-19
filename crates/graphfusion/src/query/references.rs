@@ -19,7 +19,7 @@ use datafusion::{
     functions::core::expr_fn::{coalesce, get_field},
     logical_expr::{
         create_udf, lit, ColumnarValue, Expr, ExprSchemable, JoinType, LogicalPlanBuilder,
-        Volatility,
+        ScalarUDF, Volatility,
     },
 };
 use std::{collections::BTreeSet, sync::Arc};
@@ -97,30 +97,9 @@ impl ReferenceBinding {
             .unwrap_or_else(|| lit(false));
         // A deleted reference must not read stale or fabricated properties. This
         // scalar check only validates join presence; it never accesses storage.
-        create_udf(
-            "gql_live_reference",
-            vec![DataType::Boolean, DataType::Boolean],
-            DataType::Boolean,
-            Volatility::Immutable,
-            Arc::new(|args| {
-                let arrays = ColumnarValue::values_to_arrays(args)?;
-                let null = arrays[0]
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .expect("boolean input");
-                let live = arrays[1]
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .expect("boolean input");
-                if (0..null.len()).any(|i| !null.value(i) && !live.value(i)) {
-                    return Err(DataFusionError::Execution(
-                        "dereference of a deleted or unavailable graph element".into(),
-                    ));
-                }
-                Ok(args[1].clone())
-            }),
-        )
-        .call(vec![reference.is_null(), present])
+        // One function value so a repeated property or predicate compares equal
+        // in DISTINCT and GROUP BY.
+        live_reference_udf().call(vec![reference.is_null(), present])
     }
     fn guarded(&self, reference: Expr, value: Expr) -> Expr {
         Expr::Case(datafusion::logical_expr::expr::Case::new(
@@ -202,34 +181,77 @@ impl ReferenceBinding {
     }
 }
 
+fn live_reference_udf() -> ScalarUDF {
+    use std::sync::OnceLock;
+    static UDF: OnceLock<ScalarUDF> = OnceLock::new();
+    UDF.get_or_init(|| {
+        create_udf(
+            "gql_live_reference",
+            vec![DataType::Boolean, DataType::Boolean],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|args| {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let null = arrays[0]
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("boolean input");
+                let live = arrays[1]
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("boolean input");
+                if (0..null.len()).any(|i| !null.value(i) && !live.value(i)) {
+                    return Err(DataFusionError::Execution(
+                        "dereference of a deleted or unavailable graph element".into(),
+                    ));
+                }
+                Ok(args[1].clone())
+            }),
+        )
+    })
+    .clone()
+}
+
 pub(super) fn kind_check(reference: Expr, expected: &'static str) -> Expr {
-    create_udf(
-        if expected == "e" {
-            "gql_require_edge"
-        } else {
-            "gql_require_node"
-        },
-        vec![DataType::Boolean],
-        DataType::Boolean,
-        Volatility::Immutable,
-        Arc::new(move |args| {
-            let arrays = ColumnarValue::values_to_arrays(args)?;
-            let values = arrays[0]
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("boolean kind");
-            if values.iter().flatten().any(|v| !v) {
-                return Err(DataFusionError::Execution(format!(
-                    "expected {} reference",
-                    if expected == "e" { "edge" } else { "node" }
-                )));
-            }
-            Ok(args[0].clone())
-        }),
-    )
-    .call(vec![
+    kind_check_udf(expected).call(vec![
         get_field(reference, path_values::KIND).eq(lit(expected))
     ])
+}
+
+fn kind_check_udf(expected: &'static str) -> ScalarUDF {
+    use std::sync::OnceLock;
+    // Direction checks compare the reference kind. A fresh closure would hide
+    // that two `IS DIRECTED` calls are the same ORDER BY expression.
+    static EDGE: OnceLock<ScalarUDF> = OnceLock::new();
+    static NODE: OnceLock<ScalarUDF> = OnceLock::new();
+    let slot = if expected == "e" { &EDGE } else { &NODE };
+    slot.get_or_init(|| {
+        create_udf(
+            if expected == "e" {
+                "gql_require_edge"
+            } else {
+                "gql_require_node"
+            },
+            vec![DataType::Boolean],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(move |args| {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let values = arrays[0]
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("boolean kind");
+                if values.iter().flatten().any(|v| !v) {
+                    return Err(DataFusionError::Execution(format!(
+                        "expected {} reference",
+                        if expected == "e" { "edge" } else { "node" }
+                    )));
+                }
+                Ok(args[0].clone())
+            }),
+        )
+    })
+    .clone()
 }
 
 pub(super) fn constraint(reference: Expr, binding: &ElementBinding) -> Expr {
