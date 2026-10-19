@@ -1115,6 +1115,11 @@ invalid_cases! {
         error_contains: "non-unit incoming working table",
     }
 
+    next_nested_return_star_is_not_the_incoming_table {
+        input: "FOR n IN [1] RETURN n NEXT { RETURN * }",
+        error_contains: "non-unit incoming working table",
+    }
+
     return_star_rejects_use_graph_only_input {
         input: "USE GRAPH social RETURN *",
         error_contains: "non-unit incoming working table",
@@ -1181,4 +1186,21 @@ fn deeply_nested_parentheses_are_rejected() {
     let input = format!("RETURN {}1{} AS x", "(".repeat(64), ")".repeat(64));
     let err = parse(&input).expect_err("deep nesting should fail");
     assert!(err.to_string().contains("nested too deeply"), "{err}");
+}
+
+#[test]
+fn next_call_does_not_import_its_working_table_into_the_body() {
+    for input in [
+        "RETURN 1 AS x NEXT CALL { RETURN * }",
+        "RETURN 1 AS x NEXT CALL () { RETURN * } RETURN x",
+        "RETURN 1 AS x NEXT OPTIONAL CALL { RETURN * } RETURN x",
+    ] {
+        let error = parse(input).expect_err(input);
+        assert!(
+            error
+                .to_string()
+                .contains("non-unit incoming working table"),
+            "{input}: {error}"
+        );
+    }
 }
