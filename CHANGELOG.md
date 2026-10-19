@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Evaluate `XOR` of property comparisons on each fragment's stored type. A
+  multi-type filter such as `n.id = 1 XOR n.id <> 1` no longer fails after the
+  scan has unified those values into one column.
 - Match every orientation in `<~[]~>` and `<~/label/~>`. The closing `>` adds
   rightward directed edges to the left-or-undirected pattern.
 - Keep working-table order when a query resolves an element reference. A
