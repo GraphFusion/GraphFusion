@@ -97,6 +97,9 @@
 - Treat a null property assignment as removal. `SET n.v = 1 + NULL` clears `v`
   the same way `SET n.v = NULL` does, and does not leave a typed null that
   blocks a later value of a different type.
+- Evaluate arithmetic and string concatenation on each fragment's stored type.
+  `n.id + 0 = 1` no longer fails when another label stores `id` as text, and
+  `n.id || '' = '1'` no longer matches an integer that was cast to a string.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

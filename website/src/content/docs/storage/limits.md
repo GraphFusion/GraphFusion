@@ -37,3 +37,5 @@ Candidate enumeration currently happens before path ranking. Dense graphs, paral
 - Typed graph data operations, property/range indexes, background sealing, automatic checkpoint scheduling, deletion-mask compaction and format migrations are not implemented.
 
 The [support matrix](/start/status/) separates these execution limits from parser coverage.
+
+Arithmetic and concatenation on mixed properties use each fragment's stored type. Incompatible operators contribute NULL before classification or coalescing, while label, identity and property-existence metadata retain their original bindings.
