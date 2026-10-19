@@ -97,6 +97,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Keep `IS LABELED` in `MATCH WHERE` and an inline pattern `WHERE` on each
+  fragment with the property comparison. The fragment's own label set decides
+  the test. A comparison no selected fragment can evaluate is still a type
+  error.
 - Keep `PROPERTY_EXISTS` in `MATCH WHERE` and an inline pattern `WHERE` on
   each fragment with the property comparison. A missing property or a null
   value is false. A comparison no selected fragment can evaluate is still a

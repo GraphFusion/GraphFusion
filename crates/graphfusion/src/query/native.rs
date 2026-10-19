@@ -34,6 +34,10 @@ pub(super) enum NativeAtom {
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    Labeled {
+        expression: ast::LabelExpression,
+        negated: bool,
+    },
     Exists {
         property: String,
     },
@@ -196,6 +200,7 @@ pub(super) fn validate<'a>(
 fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     match atom {
         NativeAtom::Exists { .. } => Ok(()),
+        NativeAtom::Labeled { .. } => Ok(()),
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => {
@@ -288,8 +293,21 @@ fn validate_comparison(
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct FragmentMeta<'a> {
+    pub labels: Option<&'a BTreeSet<String>>,
+}
+
+pub(super) fn compile_fragment(
+    atom: &NativeAtom,
+    schema: &Schema,
+    metadata: FragmentMeta<'_>,
+) -> Result<Expr> {
+    compile_in(atom, schema, None, metadata)
+}
+
 pub(super) fn compile(atom: &NativeAtom, schema: &Schema) -> Result<Expr> {
-    compile_in(atom, schema, None)
+    compile_in(atom, schema, None, FragmentMeta::default())
 }
 
 fn qualified_column(qualifier: Option<&str>, property: &str) -> Expr {
@@ -299,25 +317,32 @@ fn qualified_column(qualifier: Option<&str>, property: &str) -> Expr {
     }
 }
 
-fn compile_in(atom: &NativeAtom, schema: &Schema, qualifier: Option<&str>) -> Result<Expr> {
+fn compile_in(
+    atom: &NativeAtom,
+    schema: &Schema,
+    qualifier: Option<&str>,
+    metadata: FragmentMeta<'_>,
+) -> Result<Expr> {
     Ok(match atom {
         NativeAtom::Exists { property } => exists_expr(schema, property, qualifier),
-        NativeAtom::And(left, right) => {
-            compile_in(left, schema, qualifier)?.and(compile_in(right, schema, qualifier)?)
-        }
-        NativeAtom::Or(left, right) => {
-            compile_in(left, schema, qualifier)?.or(compile_in(right, schema, qualifier)?)
-        }
+        NativeAtom::Labeled {
+            expression,
+            negated,
+        } => labeled_expr(schema, metadata.labels, expression, *negated, qualifier),
+        NativeAtom::And(left, right) => compile_in(left, schema, qualifier, metadata)?
+            .and(compile_in(right, schema, qualifier, metadata)?),
+        NativeAtom::Or(left, right) => compile_in(left, schema, qualifier, metadata)?
+            .or(compile_in(right, schema, qualifier, metadata)?),
         NativeAtom::Xor(left, right) => xor(
-            compile_in(left, schema, qualifier)?,
-            compile_in(right, schema, qualifier)?,
+            compile_in(left, schema, qualifier, metadata)?,
+            compile_in(right, schema, qualifier, metadata)?,
         ),
         NativeAtom::Truth {
             inner,
             negated,
             value,
         } => {
-            let expr = compile_in(inner, schema, qualifier)?;
+            let expr = compile_in(inner, schema, qualifier, metadata)?;
             let truth = if *value {
                 expr.is_true()
             } else {
@@ -330,7 +355,7 @@ fn compile_in(atom: &NativeAtom, schema: &Schema, qualifier: Option<&str>) -> Re
             }
         }
         NativeAtom::Unknown { inner, negated } => {
-            let expr = compile_in(inner, schema, qualifier)?;
+            let expr = compile_in(inner, schema, qualifier, metadata)?;
             if *negated {
                 expr.is_not_null()
             } else {
@@ -338,7 +363,9 @@ fn compile_in(atom: &NativeAtom, schema: &Schema, qualifier: Option<&str>) -> Re
             }
         }
         NativeAtom::Closed(value) => value.clone(),
-        NativeAtom::Not(inner) => Expr::Not(Box::new(compile_in(inner, schema, qualifier)?)),
+        NativeAtom::Not(inner) => {
+            Expr::Not(Box::new(compile_in(inner, schema, qualifier, metadata)?))
+        }
         NativeAtom::Null { property, negated } => {
             null_expr(schema, property.as_deref(), *negated, qualifier)
         }
@@ -358,7 +385,7 @@ fn compile_in(atom: &NativeAtom, schema: &Schema, qualifier: Option<&str>) -> Re
         NativeAtom::Coalesce(args) => {
             let exprs = args
                 .iter()
-                .map(|arg| compile_in(arg, schema, qualifier))
+                .map(|arg| compile_in(arg, schema, qualifier, metadata))
                 .collect::<Result<Vec<_>>>()?;
             if exprs.is_empty() {
                 unknown()
@@ -367,8 +394,8 @@ fn compile_in(atom: &NativeAtom, schema: &Schema, qualifier: Option<&str>) -> Re
             }
         }
         NativeAtom::NullIf(left, right) => nullif(
-            compile_in(left, schema, qualifier)?,
-            compile_in(right, schema, qualifier)?,
+            compile_in(left, schema, qualifier, metadata)?,
+            compile_in(right, schema, qualifier, metadata)?,
         ),
         NativeAtom::Literal(expr) => expr.clone(),
         NativeAtom::NullIfNull {
@@ -496,6 +523,30 @@ fn exists_expr(schema: &Schema, property: &str, qualifier: Option<&str>) -> Expr
     ))
 }
 
+fn labeled_expr(
+    schema: &Schema,
+    labels: Option<&BTreeSet<String>>,
+    expression: &ast::LabelExpression,
+    negated: bool,
+    qualifier: Option<&str>,
+) -> Expr {
+    let Some(labels) = labels else {
+        return unknown();
+    };
+    if schema.field_with_name(crate::graph::ID).is_err() {
+        return unknown();
+    }
+    let holds = super::graph::label_holds(labels, expression) ^ negated;
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(qualified_column(qualifier, crate::graph::ID).is_null()),
+            Box::new(unknown()),
+        )],
+        Some(Box::new(lit(holds))),
+    ))
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -512,6 +563,10 @@ enum Local {
     Or(Box<Local>, Box<Local>),
     Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Labeled {
+        expression: ast::LabelExpression,
+        negated: bool,
+    },
     Exists {
         property: String,
     },
@@ -624,6 +679,14 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             property,
         } if name.value == variable => Some(Local::Exists {
             property: property.value.clone(),
+        }),
+        ast::Expr::IsLabeled {
+            variable: name,
+            negated,
+            label_expression,
+        } if name.value == variable => Some(Local::Labeled {
+            expression: label_expression.clone(),
+            negated: *negated,
         }),
         ast::Expr::Binary {
             left,
@@ -786,6 +849,13 @@ fn bind_local_value(
     Ok(match local {
         Local::Exists { property } => Some(NativeAtom::Exists {
             property: property.clone(),
+        }),
+        Local::Labeled {
+            expression,
+            negated,
+        } => Some(NativeAtom::Labeled {
+            expression: expression.clone(),
+            negated: *negated,
         }),
         Local::And(left, right) => match (
             bind_local_value(session, schema, scope, left, working_row)?,
@@ -1200,6 +1270,7 @@ fn property_mixes(scope: &Bindings, binding: &ElementBinding, atom: &NativeAtom)
 fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
     match atom {
         NativeAtom::Exists { .. } => false,
+        NativeAtom::Labeled { .. } => false,
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
@@ -1273,11 +1344,17 @@ fn compile_on_fragments(
         validate(atom, tables.iter().copied())?;
         tables
             .iter()
-            .map(|table| (table.schema.clone(), table.provider.clone()))
+            .map(|table| {
+                (
+                    table.schema.clone(),
+                    table.provider.clone(),
+                    table.labels.clone(),
+                )
+            })
             .collect::<Vec<_>>()
     };
     let mut parts = Vec::new();
-    for (schema, provider) in fragments {
+    for (schema, provider, labels) in fragments {
         let alias = scope.fresh("frag");
         let scan = LogicalPlanBuilder::scan(&alias, provider_as_source(provider), None)?.build()?;
         let id = Expr::Column(Column::new(
@@ -1293,7 +1370,14 @@ fn compile_on_fragments(
             None,
             vec![(
                 Box::new(id.is_not_null()),
-                Box::new(compile_in(atom, schema.as_ref(), Some(&alias))?),
+                Box::new(compile_in(
+                    atom,
+                    schema.as_ref(),
+                    Some(&alias),
+                    FragmentMeta {
+                        labels: Some(&labels),
+                    },
+                )?),
             )],
             Some(Box::new(unknown())),
         )));

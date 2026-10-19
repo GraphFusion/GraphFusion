@@ -800,7 +800,13 @@ fn scan_tables(
                 scan = scan.filter(col(graph::SOURCE).not_eq(col(graph::DESTINATION)))?;
             }
             if let Some(atom) = &native.filter {
-                scan = scan.filter(super::native::compile(atom, table.schema.as_ref())?)?;
+                scan = scan.filter(super::native::compile_fragment(
+                    atom,
+                    table.schema.as_ref(),
+                    super::native::FragmentMeta {
+                        labels: Some(&table.labels),
+                    },
+                )?)?;
             }
             let mut projections = vec![col(graph::ID)];
             if kind == ElementKind::Edge {
@@ -936,7 +942,7 @@ fn fragment_matches(labels: &BTreeSet<String>, filter: Option<LabelFilter<'_>>) 
         .all(|label| labels.contains(&label.value))
 }
 
-fn label_holds(labels: &BTreeSet<String>, expression: &ast::LabelExpression) -> bool {
+pub(super) fn label_holds(labels: &BTreeSet<String>, expression: &ast::LabelExpression) -> bool {
     match expression {
         ast::LabelExpression::Label(name) => labels.contains(&name.value),
         ast::LabelExpression::Wildcard => !labels.is_empty(),
