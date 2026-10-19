@@ -34,6 +34,9 @@ pub(super) enum NativeAtom {
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    Directed {
+        negated: bool,
+    },
     Labeled {
         expression: ast::LabelExpression,
         negated: bool,
@@ -201,6 +204,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     match atom {
         NativeAtom::Exists { .. } => Ok(()),
         NativeAtom::Labeled { .. } => Ok(()),
+        NativeAtom::Directed { .. } => Ok(()),
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => {
@@ -296,6 +300,7 @@ fn validate_comparison(
 #[derive(Clone, Copy, Default)]
 pub(super) struct FragmentMeta<'a> {
     pub labels: Option<&'a BTreeSet<String>>,
+    pub directed: Option<bool>,
 }
 
 pub(super) fn compile_fragment(
@@ -329,6 +334,9 @@ fn compile_in(
             expression,
             negated,
         } => labeled_expr(schema, metadata.labels, expression, *negated, qualifier),
+        NativeAtom::Directed { negated } => {
+            directed_expr(schema, metadata.directed, *negated, qualifier)?
+        }
         NativeAtom::And(left, right) => compile_in(left, schema, qualifier, metadata)?
             .and(compile_in(right, schema, qualifier, metadata)?),
         NativeAtom::Or(left, right) => compile_in(left, schema, qualifier, metadata)?
@@ -547,6 +555,52 @@ fn labeled_expr(
     ))
 }
 
+pub(super) fn validate_kind(atom: &NativeAtom, kind: ElementKind) -> Result<()> {
+    match atom {
+        NativeAtom::Directed { .. } if kind != ElementKind::Edge => {
+            Err(Error::InvalidQuery("IS DIRECTED requires an edge".into()))
+        }
+        NativeAtom::And(left, right)
+        | NativeAtom::Or(left, right)
+        | NativeAtom::Xor(left, right)
+        | NativeAtom::NullIf(left, right) => {
+            validate_kind(left, kind)?;
+            validate_kind(right, kind)
+        }
+        NativeAtom::Not(inner)
+        | NativeAtom::Truth { inner, .. }
+        | NativeAtom::Unknown { inner, .. } => validate_kind(inner, kind),
+        NativeAtom::Coalesce(args) => {
+            for atom in args {
+                validate_kind(atom, kind)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn directed_expr(
+    schema: &Schema,
+    directed: Option<bool>,
+    negated: bool,
+    qualifier: Option<&str>,
+) -> Result<Expr> {
+    if schema.field_with_name(crate::graph::ID).is_err() {
+        return Ok(unknown());
+    }
+    let directed =
+        directed.ok_or_else(|| Error::InvalidQuery("IS DIRECTED requires an edge".into()))?;
+    Ok(Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(qualified_column(qualifier, crate::graph::ID).is_null()),
+            Box::new(unknown()),
+        )],
+        Some(Box::new(lit(directed ^ negated))),
+    )))
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -563,6 +617,9 @@ enum Local {
     Or(Box<Local>, Box<Local>),
     Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Directed {
+        negated: bool,
+    },
     Labeled {
         expression: ast::LabelExpression,
         negated: bool,
@@ -688,6 +745,10 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             expression: label_expression.clone(),
             negated: *negated,
         }),
+        ast::Expr::IsDirected {
+            variable: name,
+            negated,
+        } if name.value == variable => Some(Local::Directed { negated: *negated }),
         ast::Expr::Binary {
             left,
             op: ast::BinaryOp::And,
@@ -857,6 +918,7 @@ fn bind_local_value(
             expression: expression.clone(),
             negated: *negated,
         }),
+        Local::Directed { negated } => Some(NativeAtom::Directed { negated: *negated }),
         Local::And(left, right) => match (
             bind_local_value(session, schema, scope, left, working_row)?,
             bind_local_value(session, schema, scope, right, working_row)?,
@@ -1271,6 +1333,7 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
     match atom {
         NativeAtom::Exists { .. } => false,
         NativeAtom::Labeled { .. } => false,
+        NativeAtom::Directed { .. } => false,
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
@@ -1341,20 +1404,30 @@ fn compile_on_fragments(
             .get(&binding.graph)
             .ok_or_else(|| Error::Corrupt("missing graph for fragment comparison".into()))?;
         let tables = element_tables(data, binding);
+        validate_kind(atom, binding.kind)?;
         validate(atom, tables.iter().copied())?;
         tables
             .iter()
             .map(|table| {
+                let directed = match binding.kind {
+                    ElementKind::Node => None,
+                    ElementKind::Edge => data
+                        .edges
+                        .iter()
+                        .find(|edge| std::ptr::eq(&edge.table, *table))
+                        .map(|edge| edge.directed),
+                };
                 (
                     table.schema.clone(),
                     table.provider.clone(),
                     table.labels.clone(),
+                    directed,
                 )
             })
             .collect::<Vec<_>>()
     };
     let mut parts = Vec::new();
-    for (schema, provider, labels) in fragments {
+    for (schema, provider, labels, directed) in fragments {
         let alias = scope.fresh("frag");
         let scan = LogicalPlanBuilder::scan(&alias, provider_as_source(provider), None)?.build()?;
         let id = Expr::Column(Column::new(
@@ -1376,6 +1449,7 @@ fn compile_on_fragments(
                     Some(&alias),
                     FragmentMeta {
                         labels: Some(&labels),
+                        directed,
                     },
                 )?),
             )],

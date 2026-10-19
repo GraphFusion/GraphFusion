@@ -97,6 +97,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Keep `IS DIRECTED` in `MATCH WHERE` and an inline pattern `WHERE` on each
+  fragment with the property comparison. The fragment's stored direction
+  decides the test. A comparison no selected fragment can evaluate is still a
+  type error.
 - Keep `IS LABELED` in `MATCH WHERE` and an inline pattern `WHERE` on each
   fragment with the property comparison. The fragment's own label set decides
   the test. A comparison no selected fragment can evaluate is still a type

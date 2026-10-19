@@ -695,6 +695,7 @@ fn scan_tables(
         graph::property_types(scanned.iter().map(|(table, _)| *table))?
     };
     if let Some(atom) = &native.filter {
+        super::native::validate_kind(atom, kind)?;
         super::native::validate(atom, scanned.iter().map(|(table, _)| *table))?;
     }
     // A refresh also reads a one-label-apart fragment so a label edit can find
@@ -805,6 +806,7 @@ fn scan_tables(
                     table.schema.as_ref(),
                     super::native::FragmentMeta {
                         labels: Some(&table.labels),
+                        directed: (kind == ElementKind::Edge).then_some(directed),
                     },
                 )?)?;
             }
