@@ -234,6 +234,49 @@ async fn writes_refresh_aliases_and_observe_previous_clauses() {
 }
 
 #[tokio::test]
+async fn null_insert_expression_does_not_pin_property_type() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(
+        &mut s,
+        "INSERT (:P {v: 1 + NULL, name: 'A'})-[:E {w: 1.5 * NULL}]->(:Q {flag: NULL AND TRUE})",
+    )
+    .await;
+    let result = run(
+        &mut s,
+        "MATCH (n:P)-[e:E]->(m:Q) RETURN PROPERTY_EXISTS(n, v) AS v, n.name AS name, PROPERTY_EXISTS(e, w) AS w, PROPERTY_EXISTS(m, flag) AS flag",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["false", "A", "false", "false"]]);
+    let result = run(&mut s, "MATCH (n:P) SET n.v = 'hi' RETURN n.v AS v").await;
+    assert_eq!(rows(&result), vec![vec!["hi"]]);
+    let result = run(&mut s, "MATCH ()-[e:E]->() SET e.w = TRUE RETURN e.w AS w").await;
+    assert_eq!(rows(&result), vec![vec!["true"]]);
+    let result = run(&mut s, "MATCH (m:Q) SET m.flag = 7 RETURN m.flag AS flag").await;
+    assert_eq!(rows(&result), vec![vec!["7"]]);
+
+    run(&mut s, "INSERT (:R {text: 'ab' || NULL})").await;
+    let result = run(
+        &mut s,
+        "MATCH (n:R) SET n.text = 4 RETURN n.text AS text, PROPERTY_EXISTS(n, text) AS before",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["4", "true"]]);
+
+    // A non-null value in the same insert still stores that type.
+    run(&mut s, "FOR n IN [1, NULL] INSERT (:Keep {v: n})").await;
+    let blocked = s.run("MATCH (n:Keep) SET n.v = 'x'").await.unwrap_err();
+    assert!(
+        blocked
+            .to_string()
+            .contains("mixed types for graph property v"),
+        "{blocked}"
+    );
+    let result = run(&mut s, "MATCH (n:Keep) RETURN n.v AS v ORDER BY v").await;
+    assert_eq!(rows(&result), vec![vec!["1"], vec!["NULL"]]);
+}
+
+#[tokio::test]
 async fn delete_restrict_detach_and_explicit_edges_enforce_endpoints() {
     let db = Database::new();
     let mut s = session(&db);

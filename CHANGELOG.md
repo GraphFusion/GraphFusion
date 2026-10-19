@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Do not store an INSERT property when its value is null on every new row.
+  `INSERT (:P {v: 1 + NULL})` leaves `v` unset, the same as omitting it, so a
+  later value of a different type is not rejected as a mixed type.
 - Compare a mixed property with a working-table value on each fragment's stored
   type. `WHERE n.id = k` no longer fails when `k` is bound, and a string value
   does not match a stringified integer.
