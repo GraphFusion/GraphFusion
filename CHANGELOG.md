@@ -218,6 +218,8 @@
   orders integers as text or treats an integer as equal to that text on another
   element. The comparison applies in WHERE, parenthesized path predicates,
   FILTER, property maps, RETURN, SELECT, HAVING, and ORDER BY.
+- Divide an integer `AVG` from the exact sum. The Float64 result is that
+  quotient rounded to the nearest value, including inputs above 2^53.
 
 ## 0.2.0 — 2026-10-05
 

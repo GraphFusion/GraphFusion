@@ -49,6 +49,143 @@ fn finite_udf_new() -> ScalarUDF {
     )
 }
 
+/// Divide an exact decimal sum by an integer count and round to Float64.
+pub(super) fn exact_ratio(sum: Expr, sum_type: DataType, count: Expr) -> Expr {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<DataType, ScalarUDF>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .entry(sum_type.clone())
+        .or_insert_with(|| exact_ratio_udf(sum_type))
+        .clone()
+        .call(vec![sum, count])
+}
+
+fn exact_ratio_udf(sum_type: DataType) -> ScalarUDF {
+    let scale = match &sum_type {
+        DataType::Decimal128(_, scale) => *scale,
+        _ => 0,
+    };
+    let name = format!("gql_exact_ratio_{sum_type:?}").to_lowercase();
+    create_udf(
+        &name,
+        vec![sum_type, DataType::Int64],
+        DataType::Float64,
+        Volatility::Immutable,
+        Arc::new(move |args| {
+            use datafusion::arrow::array::Array;
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let sums = arrays[0]
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Decimal128Array>()
+                .ok_or_else(|| DataFusionError::Internal("expected decimal sum".into()))?;
+            let counts = arrays[1]
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .ok_or_else(|| DataFusionError::Internal("expected integer count".into()))?;
+            let mut builder = datafusion::arrow::array::Float64Builder::with_capacity(sums.len());
+            for row in 0..sums.len() {
+                if sums.is_null(row) || counts.is_null(row) || counts.value(row) == 0 {
+                    builder.append_null();
+                    continue;
+                }
+                let Some(denom) = i128::from(counts.value(row)).checked_mul(scale_factor(scale))
+                else {
+                    return Err(DataFusionError::Execution(
+                        "integer average exceeds decimal range".into(),
+                    ));
+                };
+                builder.append_value(ratio_to_f64(sums.value(row), denom));
+            }
+            let output: datafusion::arrow::array::ArrayRef = Arc::new(builder.finish());
+            if args
+                .iter()
+                .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+            {
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                    &output, 0,
+                )?))
+            } else {
+                Ok(ColumnarValue::Array(output))
+            }
+        }),
+    )
+}
+
+fn scale_factor(scale: i8) -> i128 {
+    if scale <= 0 {
+        1
+    } else {
+        10i128.saturating_pow(u32::from(scale as u8))
+    }
+}
+
+/// Round the exact rational once, using a binary guard bit and remainder.
+fn ratio_to_f64(numer: i128, denom: i128) -> f64 {
+    if denom == 0 {
+        return f64::NAN;
+    }
+    let negative = (numer < 0) ^ (denom < 0);
+    let numer = numer.unsigned_abs();
+    let denom = denom.unsigned_abs();
+    if numer == 0 {
+        return if negative { -0.0 } else { 0.0 };
+    }
+    let whole = numer / denom;
+    let mut remainder = numer % denom;
+    // A remainder is below |denom| <= 2^127, so doubling cannot overflow u128.
+    let next_bit = |remainder: &mut u128| {
+        *remainder *= 2;
+        let bit = *remainder >= denom;
+        if bit {
+            *remainder -= denom;
+        }
+        u64::from(bit)
+    };
+    let mut exponent;
+    let mut mantissa;
+    let round;
+    let sticky;
+    if whole != 0 {
+        exponent = i64::from(127 - whole.leading_zeros());
+        if exponent > 52 {
+            let shift = (exponent - 52) as u32;
+            mantissa = (whole >> shift) as u64;
+            round = (whole >> (shift - 1)) & 1 != 0;
+            sticky = whole & ((1u128 << (shift - 1)) - 1) != 0 || remainder != 0;
+        } else {
+            mantissa = whole as u64;
+            for _ in 0..52 - exponent {
+                mantissa = (mantissa << 1) | next_bit(&mut remainder);
+            }
+            round = next_bit(&mut remainder) != 0;
+            sticky = remainder != 0;
+        }
+    } else {
+        exponent = -1;
+        while next_bit(&mut remainder) == 0 {
+            exponent -= 1;
+        }
+        mantissa = 1;
+        for _ in 0..52 {
+            mantissa = (mantissa << 1) | next_bit(&mut remainder);
+        }
+        round = next_bit(&mut remainder) != 0;
+        sticky = remainder != 0;
+    }
+    if round_ties_to_even(mantissa, round, sticky) {
+        mantissa += 1;
+        if mantissa == 1u64 << 53 {
+            mantissa >>= 1;
+            exponent += 1;
+        }
+    }
+    pack_normal(negative, exponent, mantissa)
+}
+
 pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType) -> Expr {
     // One function value per operator and type. A fresh closure would not compare
     // equal, so DISTINCT and GROUP BY could not recognize the same arithmetic
@@ -727,5 +864,28 @@ mod tests {
             values.iter().collect::<Vec<_>>(),
             vec![Some(2.0), None, None]
         );
+    }
+}
+
+#[cfg(test)]
+mod exact_average_tests {
+    use super::ratio_to_f64;
+
+    #[test]
+    fn ratio_rounds_exact_binary_midpoints_and_integer_extremes() {
+        for (n, d, expected) in [
+            (9007199254740994, 2, 4503599627370497.0),
+            (9007199254740995, 2199023255552, 4096.000000000002),
+            (-9007199254740995, 2199023255552, -4096.000000000002),
+            (9007199254741003, 2, 4503599627370502.0),
+            (1, i128::MIN, -2.0_f64.powi(-127)),
+            (i128::MIN, 1, -2.0_f64.powi(127)),
+            (i128::MAX, i128::MAX - 1, 1.0),
+            (4, 3, 4.0 / 3.0),
+            (-3, 2, -1.5),
+            (0, 5, 0.0),
+        ] {
+            assert_eq!(ratio_to_f64(n, d).to_bits(), expected.to_bits(), "{n}/{d}");
+        }
     }
 }
