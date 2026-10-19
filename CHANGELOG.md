@@ -97,6 +97,9 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Treat a missing property as a per-row null when an aggregate implies grouping.
+  `RETURN n.missing, COUNT(*)` on an empty match no longer invents a `(NULL, 0)`
+  group. A written constant and `GROUP BY ()` still return that one global row.
 - Keep `ELEMENT_ID` null tests and comparisons in `MATCH WHERE` and an inline
   pattern `WHERE` on each fragment with the property comparison. A comparison
   no selected fragment can evaluate is still a type error.

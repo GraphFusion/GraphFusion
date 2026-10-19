@@ -228,7 +228,7 @@ pub(super) fn result(
                 if aliases.insert(name.clone(), expr.clone()).is_some() {
                     return Err(Error::InvalidQuery("duplicate result column".into()));
                 }
-                projections.push((name.clone(), expr));
+                projections.push((name.clone(), expr, false));
             }
         } else {
             let name = item
@@ -266,7 +266,10 @@ pub(super) fn result(
                     .references
                     .insert(name.clone(), reference.clone());
             }
-            projections.push((name, expr));
+            // A missing property binds as a null literal. Remember that the
+            // source expression still reads an element, so implicit grouping
+            // does not treat it as a query constant.
+            projections.push((name, expr, reads_property(&item.expr)));
         }
     }
     if projections.is_empty() {
@@ -286,7 +289,7 @@ pub(super) fn result(
         .iter()
         .map(|o| binder.bind(&o.expr))
         .collect::<Result<Vec<_>>>()?;
-    let mut all_expressions: Vec<_> = projections.iter().map(|(_, e)| e).collect();
+    let mut all_expressions: Vec<_> = projections.iter().map(|(_, e, _)| e).collect();
     all_expressions.extend(having.iter());
     all_expressions.extend(&ordering);
     let mut aggregates = find_aggregate_exprs(all_expressions);
@@ -340,9 +343,13 @@ pub(super) fn result(
             }
         }
     } else if grouped {
-        for (_, expr) in &projections {
+        for (_, expr, property) in &projections {
+            // Property reads stay row-dependent even when every selected
+            // fragment lacks the column and the binder folds them to null.
+            // Grouping by that null keeps an empty match from inventing a
+            // (NULL, 0) group, while a written NULL or numeric constant does not.
             if find_aggregate_exprs([expr]).is_empty()
-                && !expr.column_refs().is_empty()
+                && (!expr.column_refs().is_empty() || *property)
                 && !groups.contains(expr)
             {
                 groups.push(expr.clone());
@@ -386,7 +393,7 @@ pub(super) fn result(
     }
     let projected = projections
         .into_iter()
-        .map(|(name, expr)| Ok(rewrite(expr)?.alias(name)))
+        .map(|(name, expr, _)| Ok(rewrite(expr)?.alias(name)))
         .collect::<Result<Vec<_>>>()?;
     let ordering = if body.result_clause.distinct {
         plan = plan.project(projected.clone())?.distinct()?;
@@ -432,6 +439,26 @@ pub(super) fn result(
         body.limit.as_ref(),
         None,
     )
+}
+
+fn reads_property(expr: &ast::Expr) -> bool {
+    use ast::Expr as E;
+    match expr {
+        E::Property { .. } => true,
+        E::Unary { expr, .. }
+        | E::IsNull { expr, .. }
+        | E::IsUnknown { expr, .. }
+        | E::IsTruth { expr, .. }
+        | E::Elements { path: expr } => reads_property(expr),
+        E::Binary { left, right, .. } | E::NullIf { left, right } => {
+            reads_property(left) || reads_property(right)
+        }
+        E::Coalesce(args)
+        | E::List(args)
+        | E::NumericFunction { args, .. }
+        | E::Function { args, .. } => args.iter().any(reads_property),
+        _ => false,
+    }
 }
 
 fn rebase(expr: Expr, mapping: &[(Expr, Column)]) -> Result<Expr> {
