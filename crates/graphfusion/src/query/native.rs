@@ -535,6 +535,15 @@ fn compare_property(
     if !comparable(&stored, value_type) {
         return Ok(unknown());
     }
+    if let Some(expr) = super::arithmetic::exact_numeric_compare(
+        left.clone(),
+        op,
+        value.clone(),
+        &stored,
+        value_type,
+    ) {
+        return Ok(expr);
+    }
     let mut left = left.clone();
     let mut right = value;
     if stored != *value_type && stored.is_numeric() && value_type.is_numeric() {
@@ -1392,7 +1401,7 @@ fn opaque(expr: &ast::Expr) -> bool {
     )
 }
 
-fn named_variable(expr: &ast::Expr, variable: &str) -> bool {
+pub(super) fn named_variable(expr: &ast::Expr, variable: &str) -> bool {
     match expr {
         ast::Expr::Identifier(name)
         | ast::Expr::PropertyExists { variable: name, .. }
@@ -1507,8 +1516,8 @@ pub(super) fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
 }
 
 /// Keep a working-table predicate on stored types when a property was unified
-/// across non-numeric fragments. A single stored type, including integer/float
-/// widening, stays on the unified column.
+/// across fragments. A single stored type stays on the unified column; mixed
+/// numeric comparisons retain integer precision before widening.
 pub(super) fn predicate_value(value: Expr, schema: &DFSchema) -> Result<Expr> {
     match value.get_type(schema)? {
         DataType::Boolean => Ok(value),
@@ -1821,9 +1830,7 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
                     continue;
                 };
                 let data_type = field.data_type();
-                if seen.iter().any(|previous| {
-                    *previous != data_type && !(previous.is_numeric() && data_type.is_numeric())
-                }) {
+                if seen.iter().any(|previous| *previous != data_type) {
                     return true;
                 }
                 if !seen.contains(&data_type) {
@@ -2371,7 +2378,11 @@ fn pair_needs_stored_types(
             left_types[0], right_types[0]
         )));
     }
-    Ok(comparable_pair && incompatible_pair)
+    // A unified numeric column can round a large integer before comparison.
+    let widened = [&left_types, &right_types]
+        .into_iter()
+        .any(|types| types.iter().any(|ty| types.first() != Some(ty)));
+    Ok(comparable_pair && (incompatible_pair || widened))
 }
 
 #[allow(clippy::too_many_arguments)]

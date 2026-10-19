@@ -16,6 +16,13 @@ Arithmetic uses checked kernels. Integer overflow (`integer overflow`), division
 
 `AND`, `OR`, and `XOR` decide each row before evaluating an operand that cannot change that row. A division by zero in a skipped operand does not fail the query. An operand the row still needs still raises the arithmetic error.
 
+Integer/float comparisons use the integer's exact value before widening. For example, `9007199254740993` is greater than `9007199254740992.0`. Comparisons on stored properties also retain that integer precision when other fragments store floats.
+
+```gql test
+RETURN 9007199254740993 = 9007199254740992.0 AS equal_value,
+       9007199254740993 > 9007199254740992.0 AS greater_value;
+```
+
 Comparisons require compatible families, with supported numeric widening. Null operands follow nullable semantics; `NULL = NULL` is not a test for null. Use [IS NULL](/expressions/null/) or a [truth predicate](/expressions/boolean/).
 
 List comparisons use that same numeric widening. An empty list is comparable with a typed list: `[1] = [1.0]` is true, `[1] = []` is false, and `[] < [1]` is true. A list of strings is not comparable with a list of numbers.

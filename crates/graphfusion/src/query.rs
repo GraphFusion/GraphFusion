@@ -525,18 +525,32 @@ async fn plan(
     ))
 }
 
-/// Branch-dependent scalar types cannot establish a fixed enclosing schema.
-/// Use a nullable placeholder during validation; references retain their stable
-/// identity encoding so property binding can still inspect their source layouts.
+/// Preserve known common types, including numeric widening, during validation.
+/// Only genuinely incompatible possible scalar families need a placeholder until
+/// branch selection. References retain their stable identity encoding.
 fn conditional_validation_schema(
     plan: LogicalPlan,
     trace: &execution::Trace,
 ) -> Result<LogicalPlan> {
     use datafusion::arrow::datatypes::{DataType, Schema};
-    if !plan.schema().fields().iter().any(|field| {
-        trace.output_value_types.is_deferred(field.name())
-            && !trace.output_domains.contains_key(field.name())
-    }) {
+    let uncertain = |name: &str| {
+        trace.output_value_types.is_deferred(name)
+            && !trace.output_domains.contains_key(name)
+            && trace.output_value_types.get(name).is_some_and(|types| {
+                types
+                    .iter()
+                    .try_fold(DataType::Null, |left, right| {
+                        expressions::common_value_type(&left, right)
+                    })
+                    .is_err()
+            })
+    };
+    if !plan
+        .schema()
+        .fields()
+        .iter()
+        .any(|field| uncertain(field.name()))
+    {
         return Ok(plan);
     }
     let fields = plan
@@ -544,9 +558,7 @@ fn conditional_validation_schema(
         .fields()
         .iter()
         .map(|field| {
-            if trace.output_value_types.is_deferred(field.name())
-                && !trace.output_domains.contains_key(field.name())
-            {
+            if uncertain(field.name()) {
                 field
                     .as_ref()
                     .clone()
