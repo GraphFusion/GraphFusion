@@ -14,7 +14,7 @@ RETURN a.name AS person, b.name AS friend;
 
 This finds Alice → Bob. Chain patterns to traverse a fixed number of edges, or use comma-separated patterns to constrain multiple parts of the same match. Reusing a node variable constrains its identity rather than creating another independent node scan.
 
-Labels, property maps and inline WHERE predicates restrict candidates. Ordinary MATCH predicates can refer to elements declared later in that same MATCH; a subsequent MATCH does not bring its variables into the earlier scope.
+Labels, property maps and inline WHERE predicates restrict candidates. Ordinary MATCH predicates can refer to elements declared later in that same MATCH; a subsequent MATCH does not bring its variables into the earlier scope. A predicate runs as soon as every variable it reads is bound, so a start-node filter is applied before a later variable-length expansion. A forward reference stays pending until that element is matched.
 
 ```gql test
 MATCH (a:Person)-[:Knows]->(b:Person)
