@@ -3594,3 +3594,36 @@ async fn stored_result_comparisons_preserve_an_earlier_order_and_page() {
         }
     }
 }
+
+#[tokio::test]
+async fn incompatible_property_pairs_cannot_compare_unified_strings() {
+    let mut session = Database::new().session();
+    session.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:I {v:1}), (:B {v:TRUE}), (:S {v:'1',w:'1'})").await.unwrap();
+    for query in [
+        "MATCH(n:I|B),(m:S) RETURN n.v=m.w AS eq",
+        "MATCH(n:I|B),(m:S) WHERE n.v=m.v RETURN n.v AS value",
+        "MATCH(n:I|B),(m:S) FILTER n.v=m.v RETURN n.v AS value",
+        "MATCH(m:S),(n:I|B {v:m.w}) RETURN n.v AS value",
+    ] {
+        let error = session.query(query).await.unwrap_err();
+        assert!(
+            error.to_string().contains("incomparable types"),
+            "{query}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn property_pair_joins_preserve_clause_order_and_materialized_reference_order() {
+    let mut session = social().await;
+    for query in [
+        "MATCH(n:Person|Document) ORDER BY n.name DESC NULLS LAST LET eq=n.id=n.id RETURN n.name AS name,eq LIMIT 1",
+        "MATCH(n:Person|Document) ORDER BY n.name DESC NULLS LAST FILTER n.id=n.id RETURN n.name AS name, TRUE AS eq LIMIT 1",
+        "MATCH(n:Person|Document) ORDER BY n.name DESC NULLS LAST LET r=n RETURN n.name AS name,n.id=r.id AS eq LIMIT 1",
+        "MATCH(n:Person|Document) ORDER BY n.name DESC NULLS LAST LET r=n SELECT n.name AS name,TRUE AS eq WHERE n.id=r.id LIMIT 1",
+    ] {
+        assert_eq!(strings(&session.query(query).await.unwrap()),vec![vec!["Bea".to_string(),"true".to_string()]],"{query}");
+    }
+    let result = session.query("MATCH(n:Person|Document) ORDER BY n.name DESC NULLS LAST LET eq=n.id=n.id OFFSET 1 LIMIT 1 RETURN n.name AS name").await.unwrap();
+    assert_eq!(strings(&result), vec![vec!["Ada".to_string()]]);
+}

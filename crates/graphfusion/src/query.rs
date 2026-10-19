@@ -715,8 +715,15 @@ async fn plan_body(
                         )));
                     }
                     let columns = plan.schema().columns();
-                    let (next, mixed) =
-                        native::fragment_boolean(plan, &mut scope, session, &item.value)?;
+                    let (next, mixed) = native::fragment_boolean_ordered(
+                        plan,
+                        &mut scope,
+                        session,
+                        &item.value,
+                        ctx,
+                        trace,
+                    )
+                    .await?;
                     plan = next;
                     let expression = if let Some(expr) = mixed {
                         expr
@@ -747,12 +754,16 @@ async fn plan_body(
                 }
             }
             ast::QueryClause::Filter(clause) => {
-                if let Some(filtered) = native::fragment_predicate(
+                if let Some(filtered) = native::fragment_predicate_ordered(
                     plan.clone(),
                     &mut scope,
                     session,
                     &clause.predicate,
-                )? {
+                    ctx,
+                    trace,
+                )
+                .await?
+                {
                     plan = filtered;
                 } else {
                     let expr = Binder::with_bindings(session, plan.schema(), &scope)
@@ -850,18 +861,16 @@ async fn plan_body(
     trace.sources.extend(scope.sources.clone());
     trace.output_domains = references::result_domains(body, &scope);
     trace.output_reference_sources = references::result_sources(body, &scope);
-    // Result fragment joins and SELECT WHERE may change the physical row order.
-    // Capture any earlier ordering before adding those joins.
-    let input_order = if body.order_by.is_empty() && contains_sort(plan.plan()) {
-        let name = scope.fresh("result_order");
-        plan = execution::ordinal(plan, ctx, trace, &name).await?;
-        Some(Expr::Column(Column::new_unqualified(name)))
-    } else {
-        None
-    };
     if let Some(predicate) = &body.select_where {
-        if let Some(filtered) =
-            native::fragment_predicate(plan.clone(), &mut scope, session, predicate)?
+        if let Some(filtered) = native::fragment_predicate_ordered(
+            plan.clone(),
+            &mut scope,
+            session,
+            predicate,
+            ctx,
+            trace,
+        )
+        .await?
         {
             plan = filtered;
         } else {
@@ -871,10 +880,22 @@ async fn plan_body(
         }
     }
     plan = freeze_page_before_sort(plan, !body.order_by.is_empty(), ctx, trace).await?;
-    Ok((
-        aggregates::result(plan, session, &mut scope, body, input_order)?.build()?,
-        current_graph,
-    ))
+    let initial = plan.clone();
+    let result = aggregates::result(plan, session, &mut scope, body, None)?;
+    let result = if native::added_fragment_joins(initial.plan(), result.plan()) {
+        let order = scope.fresh("result_order");
+        let input = execution::ordinal(initial, ctx, trace, &order).await?;
+        aggregates::result(
+            input,
+            session,
+            &mut scope,
+            body,
+            Some(Expr::Column(Column::new_unqualified(order))),
+        )?
+    } else {
+        result
+    };
+    Ok((result.build()?, current_graph))
 }
 
 /// A later sort must see only the rows an earlier LIMIT or OFFSET already kept.
@@ -891,10 +912,6 @@ async fn freeze_page_before_sort(
     } else {
         Ok(plan)
     }
-}
-
-fn contains_sort(plan: &LogicalPlan) -> bool {
-    matches!(plan, LogicalPlan::Sort(_)) || plan.inputs().iter().any(|input| contains_sort(input))
 }
 
 fn contains_limit(plan: &LogicalPlan) -> bool {
