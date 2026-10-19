@@ -182,30 +182,39 @@ fn percentile_fraction(value: Expr) -> Expr {
     use datafusion::{
         arrow::array::Float64Array,
         error::DataFusionError,
-        logical_expr::{create_udf, ColumnarValue, Volatility},
+        logical_expr::{create_udf, ColumnarValue, ScalarUDF, Volatility},
     };
-    create_udf(
-        "gql_percentile_fraction",
-        vec![DataType::Float64],
-        DataType::Float64,
-        Volatility::Immutable,
-        std::sync::Arc::new(|args| {
-            let arrays = ColumnarValue::values_to_arrays(args)?;
-            let values = arrays[0]
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("expected Float64 percentile fraction".into())
-                })?;
-            if values.iter().flatten().any(|v| !(0.0..=1.0).contains(&v)) {
-                return Err(DataFusionError::Execution(
-                    "percentile must be between 0 and 1".into(),
-                ));
-            }
-            Ok(args[0].clone())
-        }),
-    )
-    .call(vec![value])
+    use std::sync::OnceLock;
+    // One range check for every percentile. A fresh closure would not compare
+    // equal, so DISTINCT could not recognize the same percentile in ORDER BY.
+    fn udf() -> ScalarUDF {
+        static UDF: OnceLock<ScalarUDF> = OnceLock::new();
+        UDF.get_or_init(|| {
+            create_udf(
+                "gql_percentile_fraction",
+                vec![DataType::Float64],
+                DataType::Float64,
+                Volatility::Immutable,
+                std::sync::Arc::new(|args| {
+                    let arrays = ColumnarValue::values_to_arrays(args)?;
+                    let values = arrays[0]
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal("expected Float64 percentile fraction".into())
+                        })?;
+                    if values.iter().flatten().any(|v| !(0.0..=1.0).contains(&v)) {
+                        return Err(DataFusionError::Execution(
+                            "percentile must be between 0 and 1".into(),
+                        ));
+                    }
+                    Ok(args[0].clone())
+                }),
+            )
+        })
+        .clone()
+    }
+    udf().call(vec![value])
 }
 
 pub(super) fn result(

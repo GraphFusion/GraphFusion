@@ -606,3 +606,63 @@ async fn repeated_arithmetic_orders_by_the_same_result_expression() {
         .unwrap();
     assert_eq!(table(&result), vec![vec!["0"], vec!["2"]]);
 }
+
+#[tokio::test]
+async fn repeated_float_aggregate_orders_by_the_same_expression() {
+    let mut session = Database::new().session();
+    let result = session
+        .query("FOR n IN [1, 2, 1] RETURN DISTINCT n AS k, AVG(n) AS average ORDER BY AVG(n) DESC")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["2", "2"], vec!["1", "1"]]);
+    let result = session
+        .query("FOR n IN [4, 4] RETURN DISTINCT AVG(n) AS average ORDER BY AVG(n)")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["4"]]);
+    let result = session
+        .query(
+            "FOR n IN [1.5, 2.5, 1.5] RETURN DISTINCT n AS k, SUM(n) AS total ORDER BY SUM(n) DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["1.5", "3"], vec!["2.5", "2.5"]]);
+    let result = session
+        .query(
+            "FOR n IN [1, 2, 1] RETURN DISTINCT n AS k, STDDEV_POP(n) AS deviation ORDER BY STDDEV_POP(n), n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["1", "0"], vec!["2", "0"]]);
+    let result = session
+        .query("FOR n IN [1.5, 2.5] RETURN DISTINCT MIN(n) AS value ORDER BY MIN(n)")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["1.5"]]);
+    let result = session
+        .query(
+            "FOR n IN [10, 20, 30, 40] RETURN DISTINCT PERCENTILE_CONT(n, 0.5) AS value ORDER BY PERCENTILE_CONT(n, 0.5)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["25"]]);
+    let result = session
+        .query(
+            "FOR n IN [10, 20, 30, 40] RETURN DISTINCT PERCENTILE_DISC(n, 0.5) AS value ORDER BY PERCENTILE_DISC(n, 0.5)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["20"]]);
+    session
+        .execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run("INSERT (:N {k: 1, v: 10}), (:N {k: 1, v: 30}), (:N {k: 2, v: 5})")
+        .await
+        .unwrap();
+    let result = session
+        .query("MATCH (n:N) RETURN DISTINCT n.k AS k, AVG(n.v) AS average ORDER BY AVG(n.v) DESC")
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["1", "20"], vec!["2", "5"]]);
+}
