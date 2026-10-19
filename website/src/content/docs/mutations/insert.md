@@ -13,7 +13,7 @@ INSERT (alice)-[:Knows]->(dana:Person & Admin {name: 'Dana', age: 28})
 RETURN dana.name AS name;
 ```
 
-A bound node appears as a bare reference, such as `(alice)`. New nodes can have labels and properties; edge variables must be new. `RETURN *` projects every variable declared by the insert. An anonymous pattern such as `(:Seen)` declares none.
+A bound node appears as a bare reference, such as `(alice)`. New nodes can have labels and properties; edge variables must be new. `RETURN *` projects every variable declared by the insert. An anonymous pattern such as `(:Seen)` declares none. A new destination may read the edge that connects it, as in `(a)-[e:Knows {since: 2020}]->(b {met: e.since})`. The edge may still read both endpoints. Properties of the destination that do not mention the edge are visible to that edge.
 
 ```gql test
 INSERT (extra:Person {name: 'Eve'})
