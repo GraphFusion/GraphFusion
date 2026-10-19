@@ -555,7 +555,7 @@ async fn apply_trailing_page(
         &trailing.body.order_by,
         trailing.body.offset.as_ref(),
         trailing.body.limit.as_ref(),
-        Some(&scope),
+        Some(&mut scope),
     )?
     .project(columns.into_iter().map(Expr::Column))?
     .build()?)
@@ -769,7 +769,7 @@ async fn plan_body(
                     &clause.order_by,
                     clause.offset.as_ref(),
                     clause.limit.as_ref(),
-                    Some(&scope),
+                    Some(&mut scope),
                 )?;
             }
             clause if mutations::is_mutation(clause) => {
@@ -851,12 +851,19 @@ async fn plan_body(
     trace.output_domains = references::result_domains(body, &scope);
     trace.output_reference_sources = references::result_sources(body, &scope);
     if let Some(predicate) = &body.select_where {
-        let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
-        plan = plan.filter(expr)?;
+        if let Some(filtered) =
+            native::fragment_predicate(plan.clone(), &mut scope, session, predicate)?
+        {
+            plan = filtered;
+        } else {
+            let expr =
+                Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
+            plan = plan.filter(expr)?;
+        }
     }
     plan = freeze_page_before_sort(plan, !body.order_by.is_empty(), ctx, trace).await?;
     Ok((
-        aggregates::result(plan, session, &scope, body)?.build()?,
+        aggregates::result(plan, session, &mut scope, body)?.build()?,
         current_graph,
     ))
 }
@@ -887,26 +894,33 @@ fn order_and_page(
     ordering: &[ast::OrderByItem],
     offset: Option<&ast::UnsignedIntegerSpecification>,
     limit: Option<&ast::UnsignedIntegerSpecification>,
-    scope: Option<&graph::Bindings>,
+    mut scope: Option<&mut graph::Bindings>,
 ) -> Result<LogicalPlanBuilder> {
     if !ordering.is_empty() {
-        let binder = match scope {
-            Some(scope) => Binder::with_bindings(session, plan.schema(), scope),
-            None => Binder::new(session, plan.schema()),
-        };
-        let sorts = ordering
-            .iter()
-            .map(|item| {
-                let ascending = item.direction != Some(ast::SortDirection::Desc);
-                // Nulls sort as the greatest values unless explicitly specified.
-                let nulls_first = match item.null_ordering {
-                    Some(ast::NullOrdering::First) => true,
-                    Some(ast::NullOrdering::Last) => false,
-                    None => !ascending,
-                };
-                Ok(binder.bind(&item.expr)?.sort(ascending, nulls_first))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut sorts = Vec::new();
+        for item in ordering {
+            let (next, mixed) = if let Some(scope) = scope.as_deref_mut() {
+                native::fragment_value(plan, scope, session, &item.expr)?
+            } else {
+                (plan, None)
+            };
+            plan = next;
+            let expr = if let Some(mixed) = mixed {
+                mixed.expr
+            } else if let Some(scope) = scope.as_deref() {
+                Binder::with_bindings(session, plan.schema(), scope).bind(&item.expr)?
+            } else {
+                Binder::new(session, plan.schema()).bind(&item.expr)?
+            };
+            let ascending = item.direction != Some(ast::SortDirection::Desc);
+            // Nulls sort as the greatest values unless explicitly specified.
+            let nulls_first = match item.null_ordering {
+                Some(ast::NullOrdering::First) => true,
+                Some(ast::NullOrdering::Last) => false,
+                None => !ascending,
+            };
+            sorts.push(expr.sort(ascending, nulls_first));
+        }
         plan = plan.sort(sorts)?;
     }
     if offset.is_some() || limit.is_some() {

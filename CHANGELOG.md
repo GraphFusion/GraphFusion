@@ -210,6 +210,10 @@
 - Treat query variables, property names and parameters as the same name when
   they differ only by ASCII case. `SET n.AGE` updates `age`, and `MATCH (n)
   RETURN N.name` reads `n`. Labels and catalog names stay case-sensitive.
+- Keep that stored-type comparison in `RETURN` and `SELECT` expressions,
+  `SELECT WHERE`, `HAVING`, and `ORDER BY`. An integer property does not become
+  equal to its text form after the columns are unified, including when `AND`,
+  `OR`, `XOR`, or `NOT` combines the comparison with another boolean.
 
 ## 0.2.0 — 2026-10-05
 

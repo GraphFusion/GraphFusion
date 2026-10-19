@@ -217,6 +217,7 @@ pub(super) struct Bindings {
     /// Element a `LET` name was copied from. Resolving that reference reads
     /// the source label set instead of every fragment of the element kind.
     pub reference_sources: CaseFoldMap<Vec<ElementBinding>>,
+    pub fragment_cache: super::native::FragmentCache,
     next: usize,
 }
 impl Bindings {

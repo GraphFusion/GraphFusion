@@ -220,19 +220,20 @@ fn percentile_fraction(value: Expr) -> Expr {
 pub(super) fn result(
     mut plan: LogicalPlanBuilder,
     session: &SessionState,
-    scope: &Bindings,
+    outer: &mut Bindings,
     body: &ast::QueryBody,
 ) -> Result<LogicalPlanBuilder> {
-    let binder = Binder::with_bindings(session, plan.schema(), scope).aggregating();
     let mut aliases = CaseFoldMap::new();
-    let mut result_scope = scope.clone();
+    let mut result_scope = outer.clone();
     let mut projections = Vec::new();
+    let mut stored = Vec::new();
     for (i, item) in body.result_clause.items.iter().enumerate() {
         if matches!(item.expr, ast::Expr::Wildcard) {
             if item.alias.is_some() {
                 return Err(Error::InvalidQuery("wildcard cannot have an alias".into()));
             }
-            for name in &scope.order {
+            let binder = Binder::with_bindings(session, plan.schema(), outer).aggregating();
+            for name in &outer.order {
                 let expr = binder.bind(&ast::Expr::Identifier(ast::Identifier::new(name)))?;
                 if aliases.insert(name.clone(), expr.clone()).is_some() {
                     return Err(Error::InvalidQuery("duplicate result column".into()));
@@ -248,7 +249,14 @@ pub(super) fn result(
                     ast::Expr::Identifier(name) => name.value.clone(),
                     _ => format!("column_{}", i + 1),
                 });
-            let expr = binder.bind(&item.expr)?;
+            // Result items are simultaneous: an earlier output name is not
+            // visible to a later projection.
+            let (next, expr, dependent) =
+                bind_result_expr(plan, outer, session, &CaseFoldMap::new(), &item.expr, false)?;
+            plan = next;
+            if let Some(dependent) = dependent {
+                stored.push(dependent);
+            }
             if aliases.insert(name.clone(), expr.clone()).is_some() {
                 return Err(Error::InvalidQuery(format!(
                     "duplicate result column {name}"
@@ -264,13 +272,13 @@ pub(super) fn result(
                 ast::Expr::Identifier(source) => Some(&source.value),
                 _ => None,
             };
-            if let Some(column) = source.and_then(|source| scope.scalars.get(source)) {
+            if let Some(column) = source.and_then(|source| outer.scalars.get(source)) {
                 result_scope.scalars.insert(name.clone(), column.clone());
             }
-            if let Some(element) = source.and_then(|source| scope.elements.get(source)) {
+            if let Some(element) = source.and_then(|source| outer.elements.get(source)) {
                 result_scope.elements.insert(name.clone(), element.clone());
             }
-            if let Some(reference) = source.and_then(|source| scope.references.get(source)) {
+            if let Some(reference) = source.and_then(|source| outer.references.get(source)) {
                 result_scope
                     .references
                     .insert(name.clone(), reference.clone());
@@ -284,20 +292,41 @@ pub(super) fn result(
     if projections.is_empty() {
         return Err(Error::InvalidQuery("result has no bound columns".into()));
     }
+    // Projection comparisons allocate names on the input scope. Later clauses
+    // resolve against the result scope, so keep its name counter ahead.
+    result_scope.advance(outer);
+    result_scope.fragment_cache = outer.fragment_cache.clone();
+    let mut having = None;
+    if let Some(predicate) = &body.having {
+        let (next, expr, dependent) =
+            bind_result_expr(plan, &mut result_scope, session, &aliases, predicate, true)?;
+        plan = next;
+        if let Some(dependent) = dependent {
+            stored.push(dependent);
+        }
+        having = Some(expr);
+    }
+    let mut ordering = Vec::new();
+    for item in &body.order_by {
+        let (next, expr, dependent) = bind_result_expr(
+            plan,
+            &mut result_scope,
+            session,
+            &aliases,
+            &item.expr,
+            false,
+        )?;
+        plan = next;
+        if let Some(dependent) = dependent {
+            stored.push(dependent);
+        }
+        ordering.push(expr);
+    }
+    outer.advance(&result_scope);
     let scope = &result_scope;
     let binder = Binder::with_bindings(session, plan.schema(), scope)
         .aggregating()
         .aliases(&aliases);
-    let having = body
-        .having
-        .as_ref()
-        .map(|p| binder.predicate(p))
-        .transpose()?;
-    let ordering = body
-        .order_by
-        .iter()
-        .map(|o| binder.bind(&o.expr))
-        .collect::<Result<Vec<_>>>()?;
     let mut all_expressions: Vec<_> = projections.iter().map(|(_, e, _)| e).collect();
     all_expressions.extend(having.iter());
     all_expressions.extend(&ordering);
@@ -363,6 +392,16 @@ pub(super) fn result(
             {
                 groups.push(expr.clone());
             }
+        }
+    }
+    let dependencies = super::native::grouping_columns(
+        scope,
+        &groups,
+        &stored.iter().map(|value| &value.expr).collect::<Vec<_>>(),
+    );
+    for dependency in dependencies {
+        if !groups.contains(&dependency) {
+            groups.push(dependency);
         }
     }
     let mut mapping = Vec::new();
@@ -468,6 +507,42 @@ fn reads_property(expr: &ast::Expr) -> bool {
         | E::Function { args, .. } => args.iter().any(reads_property),
         _ => false,
     }
+}
+
+struct StoredComparison {
+    expr: Expr,
+}
+
+fn bind_result_expr(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    aliases: &CaseFoldMap<Expr>,
+    expr: &ast::Expr,
+    predicate: bool,
+) -> Result<(LogicalPlanBuilder, Expr, Option<StoredComparison>)> {
+    if let ast::Expr::Identifier(name) = expr {
+        if let Some(alias) = aliases.get(&name.value) {
+            return Ok((plan, alias.clone(), None));
+        }
+    }
+    let (plan, mixed) = super::native::fragment_value(plan, scope, session, expr)?;
+    if let Some(mixed) = mixed {
+        return Ok((
+            plan,
+            mixed.expr.clone(),
+            Some(StoredComparison { expr: mixed.expr }),
+        ));
+    }
+    let binder = Binder::with_bindings(session, plan.schema(), scope)
+        .aggregating()
+        .aliases(aliases);
+    let bound = if predicate {
+        binder.predicate(expr)?
+    } else {
+        binder.bind(expr)?
+    };
+    Ok((plan, bound, None))
 }
 
 fn rebase(expr: Expr, mapping: &[(Expr, Column)]) -> Result<Expr> {

@@ -3131,3 +3131,159 @@ async fn alternatives_align_property_values_and_presence_without_ascii_case() {
         vec![vec!["1".to_string()], vec!["2".to_string()]]
     );
 }
+
+#[tokio::test]
+async fn result_expressions_compare_mixed_properties_on_each_fragment() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:Person {name: 'Ada', id: 1}),
+                    (:Person {name: 'Bea', id: 2}),
+                    (:Document {title: 'Spec', id: '1'})",
+        )
+        .await
+        .unwrap();
+
+    let projected = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id = '1' AS text_id, n.id = 1 AS number_id
+             ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&projected),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string(), "true".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string(), "false".to_string()],
+            vec!["NULL".to_string(), "true".to_string(), "NULL".to_string()],
+        ]
+    );
+
+    let wrapped = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id = '1' OR FALSE AS eq
+             ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&wrapped),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string()],
+            vec!["NULL".to_string(), "true".to_string()],
+        ]
+    );
+
+    let selected = session
+        .query(
+            "MATCH (n:Person|Document)
+             SELECT n.name AS name WHERE n.id = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&selected), vec![vec!["NULL".to_string()]]);
+
+    let excluded = session
+        .query(
+            "MATCH (n:Person|Document)
+             SELECT n.name AS name WHERE NOT n.id = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(excluded.row_count(), 0);
+
+    let ordered = session
+        .query(
+            "MATCH (n:Person|Document)
+             ORDER BY n.id = '1', n.name
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&ordered),
+        vec![
+            vec!["NULL".to_string()],
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()]
+        ]
+    );
+
+    let grouped = session
+        .query(
+            "MATCH (n:Person|Document)
+             RETURN n.name AS name, n.id = '1' AS eq, COUNT(*) AS c
+             GROUP BY n
+             ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&grouped),
+        vec![
+            vec!["Ada".to_string(), "NULL".to_string(), "1".to_string()],
+            vec!["Bea".to_string(), "NULL".to_string(), "1".to_string()],
+            vec!["NULL".to_string(), "true".to_string(), "1".to_string()],
+        ]
+    );
+
+    let having = session
+        .query(
+            "MATCH (n:Person|Document)
+             SELECT n.name AS name GROUP BY n HAVING n.id = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&having), vec![vec!["NULL".to_string()]]);
+
+    let numeric = session
+        .query("MATCH (n:Person) RETURN n.name AS name, n.id = 1 AS eq ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&numeric),
+        vec![
+            vec!["Ada".to_string(), "true".to_string()],
+            vec!["Bea".to_string(), "false".to_string()]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn repeated_stored_comparisons_keep_distinct_ordering_and_group_checks() {
+    let mut session = social().await;
+    for query in [
+        "MATCH (n:Person|Document) RETURN DISTINCT n.id = 'doc' AS eq ORDER BY n.id = 'doc'",
+        "MATCH (n:Person|Document) RETURN DISTINCT n.id = 'doc' AS eq ORDER BY N.ID = 'doc'",
+        "MATCH (n:Person|Document) LET r=n RETURN DISTINCT r.id = 'doc' AS eq ORDER BY R.ID = 'doc'",
+    ] {
+        assert_eq!(strings(&session.query(query).await.unwrap()), vec![vec!["true".to_string()], vec!["NULL".to_string()]]);
+    }
+    let invalid = session.query("MATCH (n:Person|Document), (m:Person) LET k=m.name RETURN n.id=1 OR k IS NULL AS b, COUNT(*) AS c GROUP BY n").await;
+    assert!(invalid.is_err(), "ungrouped scalar was accepted");
+}
+
+#[tokio::test]
+async fn mixed_case_element_id_self_comparison_preserves_native_integer_filter() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run("INSERT (:I {v:9007199254740993}), (:F {v:0.0})")
+        .await
+        .unwrap();
+    for query in [
+        "MATCH(N:I|F) WHERE N.v>9007199254740992 OR ELEMENT_ID(N)<>ELEMENT_ID(N) RETURN COUNT(*) AS hits",
+        "MATCH(N:I|F) WHERE N.v>9007199254740992 OR ELEMENT_ID(n)<>ELEMENT_ID(N) RETURN COUNT(*) AS hits",
+    ] {
+        assert_eq!(strings(&session.query(query).await.unwrap()), vec![vec!["1".to_string()]]);
+    }
+}
