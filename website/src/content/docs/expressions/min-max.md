@@ -12,4 +12,4 @@ MATCH (p:Person)
 RETURN MIN(p.age) AS youngest, MAX(p.age) AS oldest;
 ```
 
-This returns 25 and 40 for the quickstart graph. Aggregate input must have a supported comparable type; arbitrary mixed families are not coerced into a common string or number. ALL/DISTINCT syntax is accepted, though duplicates do not change a minimum or maximum.
+This returns 25 and 40 for the quickstart graph. Aggregate input must have a supported comparable type; arbitrary mixed families are not coerced into a common string or number. A property stored as both a number and a string is rejected, while integers and floats still widen to float. ALL/DISTINCT syntax is accepted, though duplicates do not change a minimum or maximum.
