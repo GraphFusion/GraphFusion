@@ -859,6 +859,7 @@ impl Compiler<'_> {
             let (next, stored) =
                 super::native::fragment_boolean(plan, scope, self.session, predicate)?;
             plan = if let Some(stored) = stored {
+                let stored = super::native::predicate_value(stored, next.schema())?;
                 next.filter(stored)?
             } else {
                 let value = Binder::with_bindings(self.session, next.schema(), scope)

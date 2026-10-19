@@ -9,6 +9,8 @@
 //! closed booleans stay on that per-fragment result, so `OR FALSE` cannot
 //! compare the stringified column instead.
 
+mod operators;
+
 use super::{
     casefold::CaseFoldMap,
     expressions::Binder,
@@ -1504,6 +1506,16 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
 /// Keep a working-table predicate on stored types when a property was unified
 /// across non-numeric fragments. A single stored type, including integer/float
 /// widening, stays on the unified column.
+pub(super) fn predicate_value(value: Expr, schema: &DFSchema) -> Result<Expr> {
+    match value.get_type(schema)? {
+        DataType::Boolean => Ok(value),
+        DataType::Null => Ok(cast(value, DataType::Boolean)),
+        ty => Err(Error::InvalidQuery(format!(
+            "expected boolean predicate, got {ty}"
+        ))),
+    }
+}
+
 pub(super) fn fragment_predicate(
     plan: LogicalPlanBuilder,
     scope: &mut Bindings,
@@ -1515,6 +1527,7 @@ pub(super) fn fragment_predicate(
     let Some(expr) = expr else {
         return Ok(None);
     };
+    let expr = predicate_value(expr, plan.schema())?;
     Ok(Some(plan.filter(expr)?.project(
         columns.into_iter().map(Expr::Column).collect::<Vec<_>>(),
     )?))
@@ -1567,6 +1580,10 @@ fn fragment_boolean_in(
     predicate: &ast::Expr,
     context: BindContext<'_>,
 ) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
+    let (plan, value) = operators::compile(plan, scope, session, predicate, context)?;
+    if value.is_some() {
+        return Ok((plan, value));
+    }
     let (plan, pair) = property_pair(plan, scope, predicate)?;
     if pair.is_some() {
         return Ok((plan, pair));
@@ -1617,13 +1634,14 @@ fn fragment_boolean_in(
     Ok((plan, combined))
 }
 
+#[derive(Clone, Copy)]
 enum BooleanComposition {
     And,
     Or,
     Xor,
     Not,
     Truth { value: bool, negated: bool },
-    Null { negated: bool },
+    Null { negated: bool, boolean: bool },
     Coalesce,
     NullIf,
 }
@@ -1664,9 +1682,20 @@ fn combine_fragments(
                 negated: *negated,
             },
         ),
-        ast::Expr::IsUnknown { expr, negated } | ast::Expr::IsNull { expr, negated } => {
-            (vec![expr], C::Null { negated: *negated })
-        }
+        ast::Expr::IsUnknown { expr, negated } => (
+            vec![expr],
+            C::Null {
+                negated: *negated,
+                boolean: true,
+            },
+        ),
+        ast::Expr::IsNull { expr, negated } => (
+            vec![expr],
+            C::Null {
+                negated: *negated,
+                boolean: false,
+            },
+        ),
         ast::Expr::Coalesce(args) => (args.iter().collect(), C::Coalesce),
         ast::Expr::NullIf { left, right } => (vec![left, right], C::NullIf),
         _ => return Ok((plan, None)),
@@ -1684,6 +1713,9 @@ fn combine_fragments(
         .into_iter()
         .zip(lowered)
         .map(|(operand, value)| match value {
+            Some(value) if !matches!(composition, C::Null { boolean: false, .. }) => {
+                predicate_value(value, plan.schema())
+            }
             Some(value) => Ok(value),
             None => context
                 .binder(session, plan.schema(), scope)
@@ -1718,7 +1750,7 @@ fn combine_fragments(
                 truth
             }
         }
-        C::Null { negated } => {
+        C::Null { negated, .. } => {
             let expr = values.next().expect("operand");
             if negated {
                 expr.is_not_null()
@@ -2436,6 +2468,7 @@ pub(super) async fn fragment_predicate_ordered(
     let Some(value) = value else {
         return Ok(None);
     };
+    let value = predicate_value(value, plan.schema())?;
     Ok(Some(
         plan.filter(value)?
             .project(columns.into_iter().map(Expr::Column))?,

@@ -766,7 +766,10 @@ fn bind_result_expr(
         }
     }
     let (plan, mixed) = super::native::fragment_result_value(plan, scope, session, aliases, expr)?;
-    if let Some(mixed) = mixed {
+    if let Some(mut mixed) = mixed {
+        if predicate {
+            mixed.expr = super::native::predicate_value(mixed.expr, plan.schema())?;
+        }
         return Ok((
             plan,
             mixed.expr.clone(),

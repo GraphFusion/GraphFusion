@@ -3627,3 +3627,191 @@ async fn property_pair_joins_preserve_clause_order_and_materialized_reference_or
     let result = session.query("MATCH(n:Person|Document) ORDER BY n.name DESC NULLS LAST LET eq=n.id=n.id OFFSET 1 LIMIT 1 RETURN n.name AS name").await.unwrap();
     assert_eq!(strings(&result), vec![vec!["Ada".to_string()]]);
 }
+
+#[tokio::test]
+async fn mixed_label_operators_use_stored_types() {
+    let mut session = social().await;
+    let added = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id + 0 = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&added), vec![vec!["Ada".to_string()]]);
+
+    let multiplied = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id * 1 = 2
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&multiplied), vec![vec!["Bea".to_string()]]);
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE -n.id = -1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let not_stringified = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id || '' = '1'
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_stringified.row_count(), 0);
+
+    let concatenated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id || '!' = 'doc!'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&concatenated), vec![vec!["Spec".to_string()]]);
+
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id + 0 = 1 OR n.name = 'Bea'
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let widened = session
+        .query(
+            "MATCH (n:Person|Metric) WHERE n.score + 0 > 1
+             RETURN n.score AS score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE n.id + 0 = 1)
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&inline), vec![vec!["Ada".to_string()]]);
+
+    let incompatible = session
+        .query("MATCH (d:Document) WHERE d.id + 0 = 1 RETURN d.title AS title")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d)",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() WHERE e.since * 1 = 1
+             RETURN e.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge), vec![vec!["1".to_string()]]);
+    let edge_text = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() WHERE e.since || '' = '1'
+             RETURN e.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge_text.row_count(), 0);
+}
+
+#[tokio::test]
+async fn stored_operators_keep_metadata_and_classify_incompatible_values() {
+    let mut s = social().await;
+    for query in [
+        "MATCH(n:Person|Document) WHERE n.id+0=1 AND PROPERTY_EXISTS(n,id) RETURN n.name AS name",
+        "MATCH(n:Person|Document) WHERE n.id+0=1 AND n IS LABELED Person RETURN n.name AS name",
+    ] {
+        assert_eq!(
+            strings(&s.query(query).await.unwrap()),
+            vec![vec!["Ada".to_string()]]
+        );
+    }
+    let result = s
+        .query("MATCH(n:Person|Document) WHERE (n.id+0=1) IS UNKNOWN RETURN n.title AS title")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["Spec".to_string()]]);
+    let result=s.query("MATCH(n:Person|Document) WHERE COALESCE(n.id||'!','fallback')='fallback' RETURN n.name AS name ORDER BY name").await.unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+    assert_eq!(s.query("OPTIONAL MATCH(n:Person|Document {name:'absent'}) FILTER (n.id+0=1) IS UNKNOWN RETURN 1 AS value").await.unwrap().row_count(),1);
+    assert!(matches!(
+        s.query("MATCH(n:Person|Document) WHERE n.id+missing=1 RETURN n")
+            .await,
+        Err(Error::InvalidQuery(_))
+    ));
+    assert!(matches!(
+        s.query("MATCH(n:Person|Document) WHERE n.id+0 RETURN n")
+            .await,
+        Err(Error::InvalidQuery(_))
+    ));
+}
+
+#[tokio::test]
+async fn stored_operators_reuse_fragments_and_keep_reference_guards() {
+    let mut s = social().await;
+    for query in [
+        "MATCH(n:Person|Document) RETURN DISTINCT n.id+0 AS value ORDER BY N.ID+0",
+        "MATCH(n:Person|Document) LET r=n RETURN DISTINCT r.id+0 AS value ORDER BY R.ID+0",
+    ] {
+        assert_eq!(
+            strings(&s.query(query).await.unwrap()),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["NULL".to_string()]
+            ]
+        );
+    }
+    let result = s
+        .query(
+            "MATCH(n:Person|Document) LET r=n FILTER (r.id+0=1) IS UNKNOWN RETURN r.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["Spec".to_string()]]);
+    assert!(s
+        .run("MATCH(n:Person|Document) LET r=n FILTER n.name='Ada' DELETE n RETURN r.id+0 AS value")
+        .await
+        .is_err());
+    assert_eq!(
+        s.query("MATCH(n:Person {name:'Ada'}) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        1
+    );
+}
