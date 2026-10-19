@@ -43,9 +43,6 @@ pub(super) struct Compiler<'a> {
     pub clause_filters: BTreeMap<String, NativeAtom>,
     pub clause_push: bool,
     pub clause_hit: BTreeSet<String>,
-    /// Cross-element comparisons projected as booleans, then combined after the join.
-    pub clause_residue: Option<super::native::ClauseResidue>,
-    pub residue_hit: BTreeSet<String>,
 }
 fn narrower(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -63,6 +60,18 @@ fn empty_node() -> ast::NodePattern {
         where_clause: None,
         quantifier: None,
     }
+}
+/// An anonymous node with no label, property, or WHERE constraint adds nothing
+/// the incoming endpoint does not already say. Edge endpoints are stored node
+/// ids, so joining the node tables only copies that id.
+fn reuses_known_endpoint(node: &ast::NodePattern) -> bool {
+    node.variable.is_none()
+        && !node.temporary
+        && node.quantifier.is_none()
+        && node.labels.is_empty()
+        && node.label_expression.is_none()
+        && node.properties.is_none()
+        && node.where_clause.is_none()
 }
 fn raw_bounds(q: &ast::PathPatternQuantifier) -> Result<(u64, Option<u64>)> {
     use ast::PathPatternQuantifier as Q;
@@ -144,12 +153,6 @@ impl Compiler<'_> {
                 native.conjunct(extra.clone());
                 self.clause_hit.insert(name.value.clone());
             }
-            if let Some(residue) = &self.clause_residue {
-                if let Some(columns) = residue.columns.get(&name.value) {
-                    native.flags.extend(columns.iter().cloned());
-                    self.residue_hit.insert(name.value.clone());
-                }
-            }
         }
         Ok(native)
     }
@@ -160,6 +163,9 @@ impl Compiler<'_> {
     // V=N*(m+1) states. A walk of length >= k*V contains k disjoint cycles;
     // successively removing them gives k strictly shorter accepted walks. Thus
     // k*V-1 is a completeness bound, including every tie in the kth length group.
+    // The same cap is sound for trails: cycle removal only drops edges. It is
+    // applied under DIFFERENT EDGES as well as repeatable WALK, and narrowed by
+    // any smaller mode limit.
     fn hint(
         &self,
         path: &ast::PathPattern,
@@ -168,11 +174,11 @@ impl Compiler<'_> {
         inherited: Option<u64>,
     ) -> Result<Option<u64>> {
         let finite = narrower(inherited, self.capacity(mode));
-        if finite.is_some() || path.alternation.is_some() {
+        if path.alternation.is_some() {
             return Ok(finite);
         }
         let count = match selection {
-            Selection::All => return Ok(None),
+            Selection::All => return Ok(finite),
             Selection::Any(k) | Selection::Shortest(k) | Selection::Groups(k) => k,
         };
         let mut edge = None;
@@ -180,11 +186,11 @@ impl Compiler<'_> {
             match factor {
                 ast::PathPatternFactor::Node(node) if node.quantifier.is_none() => (),
                 ast::PathPatternFactor::Relationship(value) if edge.is_none() => edge = Some(value),
-                _ => return Ok(None),
+                _ => return Ok(finite),
             }
         }
         let Some(edge) = edge else {
-            return Ok(None);
+            return Ok(finite);
         };
         // Endpoint predicates over the group list can constrain the entire walk;
         // cycle removal is not sound for those history-dependent predicates.
@@ -200,7 +206,7 @@ impl Compiler<'_> {
                         .as_ref()
                         .is_some_and(|p| p.entries.iter().any(|(_, e)| depends_on(e, history)))
                 {
-                    return Ok(None);
+                    return Ok(finite);
                 }
             }
         }
@@ -215,14 +221,14 @@ impl Compiler<'_> {
                 .as_ref()
                 .is_some_and(|p| p.entries.iter().any(|(_, e)| depends_on(e, "\0")))
         {
-            return Ok(None);
+            return Ok(finite);
         }
         let Some(q) = edge.quantifier.as_ref() else {
-            return Ok(None);
+            return Ok(finite);
         };
         let (min, max) = raw_bounds(q)?;
         if max.is_some() {
-            return Ok(None);
+            return Ok(finite);
         }
         let nodes = self.data.node_count() as u64;
         let bound = if count == 1 {
@@ -233,7 +239,11 @@ impl Compiler<'_> {
                 .saturating_mul(count)
                 .saturating_sub(1)
         };
-        Ok(Some(bound.max(min).max(1)))
+        let bound = bound.max(min).max(1);
+        Ok(Some(match finite {
+            Some(finite) => finite.min(bound),
+            None => bound,
+        }))
     }
     fn capacity(&self, mode: ast::PathMode) -> Option<u64> {
         let mode_bound = match mode {
@@ -246,6 +256,20 @@ impl Compiler<'_> {
             mode_bound,
             self.different.then_some(self.data.edge_count() as u64),
         )
+    }
+    /// Hop cap already applied inside quantified expansion. A tighter selective
+    /// bound has to be written into the quantifier; an equal cap must stay unset
+    /// so an empty edge set does not become an illegal explicit maximum of zero.
+    fn expansion_limit(&self, mode: ast::PathMode) -> Option<u64> {
+        if self.different || mode == ast::PathMode::Trail {
+            Some(self.data.edge_count() as u64)
+        } else if mode == ast::PathMode::Acyclic {
+            Some((self.data.node_count() as u64).saturating_sub(1))
+        } else if mode == ast::PathMode::Simple {
+            Some(self.data.node_count() as u64)
+        } else {
+            None
+        }
     }
     pub(super) fn validate(
         &self,
@@ -431,45 +455,84 @@ impl Compiler<'_> {
             Some((ast::PathPatternFactor::Node(node), rest)) => (node, rest),
             _ => (&empty, factors),
         };
-        let native = self.native_for(
-            &plan,
-            scope,
-            first.variable.as_ref(),
-            first.properties.as_ref(),
-            first.where_clause.as_ref(),
-        )?;
-        let (mut plan, start) = graph::node(
-            plan,
-            scope,
-            self.graph_id,
-            self.data,
-            first,
-            endpoint,
-            &native,
-        )?;
-        self.defer_node(start.clone(), first, native);
-        let mut state = State::new(start.column(ID));
-        for factor in remaining {
+        // Keep predicates from earlier patterns pending until their variables are bound.
+        let pending = self.predicates.len();
+        // The first edge already carries both anonymous endpoint identities.
+        let opened = if endpoint.is_none() && reuses_known_endpoint(first) {
+            match remaining.split_first() {
+                Some((ast::PathPatternFactor::Relationship(edge), rest))
+                    if !edge.temporary
+                        && edge
+                            .quantifier
+                            .as_ref()
+                            .is_none_or(|q| matches!(raw_bounds(q), Ok((min, _)) if min >= 1)) =>
+                {
+                    Some((edge, rest))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (mut plan, mut state, rest) = if let Some((edge, rest)) = opened {
+            let (plan, state) = if let Some(q) = &edge.quantifier {
+                let mut edge = edge.clone();
+                let (min, max) = raw_bounds(q)?;
+                if max.is_none() {
+                    if let Some(bound) = finite.filter(|bound| {
+                        self.expansion_limit(mode)
+                            .is_none_or(|natural| *bound < natural)
+                    }) {
+                        edge.quantifier = Some(ast::PathPatternQuantifier::Range {
+                            min: Some(min),
+                            max: Some(bound.max(min).max(1)),
+                        });
+                    }
+                }
+                let native = NativePush::prepare(
+                    self.session,
+                    plan.schema(),
+                    scope,
+                    edge.variable.as_ref().map(|name| name.value.as_str()),
+                    edge.properties.as_ref(),
+                    edge.where_clause.as_ref(),
+                )?;
+                paths::expand(
+                    plan,
+                    scope,
+                    self.session,
+                    self.graph_id,
+                    self.data,
+                    &edge,
+                    None,
+                    mode,
+                    self.different,
+                    &native,
+                )?
+            } else {
+                self.open_edge(plan, scope, edge)?
+            };
+            (plan.filter(state.valid(mode, self.different))?, state, rest)
+        } else {
+            let (plan, state) = match endpoint {
+                Some(endpoint) if reuses_known_endpoint(first) => (
+                    plan.filter(endpoint.clone().is_not_null())?,
+                    State::new(endpoint),
+                ),
+                endpoint => self.bind_node(plan, scope, first, endpoint)?,
+            };
+            (plan, state, remaining)
+        };
+        plan = self.flush_ready(plan, scope, pending)?;
+        for factor in rest {
             match factor {
                 ast::PathPatternFactor::Node(node) => {
-                    let native = self.native_for(
-                        &plan,
-                        scope,
-                        node.variable.as_ref(),
-                        node.properties.as_ref(),
-                        node.where_clause.as_ref(),
-                    )?;
-                    let (next, binding) = graph::node(
-                        plan,
-                        scope,
-                        self.graph_id,
-                        self.data,
-                        node,
-                        Some(state.end()),
-                        &native,
-                    )?;
-                    plan = next;
-                    self.defer_node(binding, node, native);
+                    if reuses_known_endpoint(node) {
+                        plan = plan.filter(state.end().is_not_null())?;
+                    } else {
+                        let (next, _) = self.bind_node(plan, scope, node, Some(state.end()))?;
+                        plan = next;
+                    }
                 }
                 ast::PathPatternFactor::Relationship(edge) => {
                     if edge.temporary {
@@ -478,11 +541,19 @@ impl Compiler<'_> {
                     if let Some(q) = &edge.quantifier {
                         let mut edge = edge.clone();
                         let (min, max) = raw_bounds(q)?;
-                        if max.is_none() && mode == ast::PathMode::Walk && !self.different {
-                            edge.quantifier = Some(ast::PathPatternQuantifier::Range {
-                                min: Some(min),
-                                max: finite.map(|bound| bound.max(min).max(1)),
-                            });
+                        if max.is_none() {
+                            if let Some(bound) = finite.filter(|bound| {
+                                self.expansion_limit(mode)
+                                    .is_none_or(|natural| *bound < natural)
+                            }) {
+                                // A selective search can stop before the trail cap. Writing a
+                                // zero cap would reject a quantifier that the natural limit
+                                // still treats as unbounded.
+                                edge.quantifier = Some(ast::PathPatternQuantifier::Range {
+                                    min: Some(min),
+                                    max: Some(bound.max(min).max(1)),
+                                });
+                            }
                         }
                         let native = NativePush::prepare(
                             self.session,
@@ -499,7 +570,7 @@ impl Compiler<'_> {
                             self.graph_id,
                             self.data,
                             &edge,
-                            &state,
+                            Some(&state),
                             mode,
                             self.different,
                             &native,
@@ -583,8 +654,117 @@ impl Compiler<'_> {
                 }
             }
             plan = plan.filter(state.valid(mode, self.different))?;
+            plan = self.flush_ready(plan, scope, pending)?;
         }
         Ok((plan, state))
+    }
+    fn flush_ready(&mut self, mut plan: Plan, scope: &Bindings, start: usize) -> Result<Plan> {
+        let pending = self.predicates.split_off(start);
+        let mut deferred = Vec::new();
+        for predicate in pending {
+            if predicate_is_noop(&predicate) {
+                continue;
+            }
+            if predicate_is_ready(&predicate, scope) {
+                plan = graph::predicates_for(
+                    plan,
+                    scope,
+                    self.session,
+                    &predicate.binding,
+                    &predicate.labels,
+                    predicate.expression.as_ref(),
+                    predicate.properties.as_ref(),
+                    predicate.predicate.as_ref(),
+                    &predicate.native,
+                )?;
+            } else {
+                deferred.push(predicate);
+            }
+        }
+        self.predicates.extend(deferred);
+        Ok(plan)
+    }
+    fn open_edge(
+        &mut self,
+        mut plan: Plan,
+        scope: &mut Bindings,
+        edge: &ast::RelationshipPattern,
+    ) -> Result<(Plan, State)> {
+        let native = self.native_for(
+            &plan,
+            scope,
+            edge.variable.as_ref(),
+            edge.properties.as_ref(),
+            edge.where_clause.as_ref(),
+        )?;
+        let (scan, binding) = graph::scan_filtered(
+            scope,
+            self.graph_id,
+            self.data,
+            ElementKind::Edge,
+            Some(edge.direction),
+            graph::label_filter(edge.label_expression.as_ref(), &edge.labels),
+            &native,
+        )?;
+        let mut predicates = Vec::new();
+        if let Some(name) = &edge.variable {
+            if scope.conditional.contains(&name.value) {
+                return Err(Error::InvalidQuery(
+                    "implicit reuse of a conditional path variable".into(),
+                ));
+            }
+            if let Some(previous) = scope.elements.get(&name.value) {
+                graph::check_binding(previous, self.graph_id, ElementKind::Edge)?;
+                predicates.push(previous.column(ID).eq(binding.column(ID)));
+            } else if let Some(reference) =
+                super::references::scalar(scope, &name.value, plan.schema())?
+            {
+                predicates.push(super::references::constraint(reference, &binding));
+                scope.elements.insert(name.value.clone(), binding.clone());
+            } else {
+                graph::declare(scope, &name.value, &binding)?;
+            }
+        }
+        plan = plan.cross_join(scan)?;
+        for predicate in predicates {
+            plan = plan.filter(predicate)?;
+        }
+        self.predicates.push(Predicate {
+            binding: binding.clone(),
+            labels: edge.labels.clone(),
+            expression: edge.label_expression.clone(),
+            properties: edge.properties.clone(),
+            predicate: edge.where_clause.clone(),
+            native,
+        });
+        let state = State::new(binding.column(FROM)).append(binding.column(ID), binding.column(TO));
+        Ok((plan, state))
+    }
+    fn bind_node(
+        &mut self,
+        plan: Plan,
+        scope: &mut Bindings,
+        node: &ast::NodePattern,
+        endpoint: Option<Expr>,
+    ) -> Result<(Plan, State)> {
+        let native = self.native_for(
+            &plan,
+            scope,
+            node.variable.as_ref(),
+            node.properties.as_ref(),
+            node.where_clause.as_ref(),
+        )?;
+        let (plan, binding) = graph::node(
+            plan,
+            scope,
+            self.graph_id,
+            self.data,
+            node,
+            endpoint,
+            &native,
+        )?;
+        self.defer_node(binding.clone(), node, native);
+        Ok((plan, State::new(binding.column(ID))))
     }
     async fn group_once(
         &mut self,
@@ -605,9 +785,15 @@ impl Compiler<'_> {
             Box::pin(self.pattern(plan, scope, &group.pattern, endpoint, finite, false)).await?;
         plan = plan.filter(state.valid(mode, self.different))?;
         if let Some(predicate) = &group.where_clause {
-            let value =
-                Binder::with_bindings(self.session, plan.schema(), scope).predicate(predicate)?;
-            plan = plan.filter(value)?;
+            let (next, stored) =
+                super::native::fragment_boolean(plan, scope, self.session, predicate)?;
+            plan = if let Some(stored) = stored {
+                next.filter(stored)?
+            } else {
+                let value = Binder::with_bindings(self.session, next.schema(), scope)
+                    .predicate(predicate)?;
+                next.filter(value)?
+            };
         }
         if let Some(name) = &group.variable {
             plan = self.bind_path(plan, scope, &name.value, &state)?;
@@ -638,22 +824,30 @@ impl Compiler<'_> {
         .await?;
         scope.advance(&branch_scope);
         let mut empty_scope = scope.clone();
-        let (absent, node) = graph::node(
-            input.clone(),
-            &mut empty_scope,
-            self.graph_id,
-            self.data,
-            &empty_node(),
-            endpoint,
-            &NativePush::default(),
-        )?;
+        // An anchored optional segment already knows its endpoint. Joining that
+        // id back to a full node scan only copies the same value.
+        let (absent, absent_state) = if let Some(endpoint) = endpoint {
+            let absent = input.clone().filter(endpoint.clone().is_not_null())?;
+            (absent, State::new(endpoint))
+        } else {
+            let (absent, node) = graph::node(
+                input.clone(),
+                &mut empty_scope,
+                self.graph_id,
+                self.data,
+                &empty_node(),
+                None,
+                &NativePush::default(),
+            )?;
+            (absent, State::new(node.column(ID)))
+        };
         scope.advance(&empty_scope);
         self.merge(
             input,
             scope,
             vec![
                 (present, branch_scope, state),
-                (absent, empty_scope, State::new(node.column(ID))),
+                (absent, empty_scope, absent_state),
             ],
             ast::PathPatternAlternation::Multiset,
         )
@@ -717,5 +911,61 @@ fn depends_on(expr: &ast::Expr, name: &str) -> bool {
             variables.iter().any(|v| v.value == name)
         }
         _ => true, // A new expression kind must be audited before it enables this proof.
+    }
+}
+
+fn predicate_is_noop(predicate: &Predicate) -> bool {
+    predicate.labels.is_empty()
+        && predicate.expression.is_none()
+        && predicate
+            .properties
+            .as_ref()
+            .is_none_or(|properties| properties.entries.is_empty())
+        && predicate.predicate.is_none()
+}
+
+fn predicate_is_ready(predicate: &Predicate, scope: &Bindings) -> bool {
+    predicate.properties.as_ref().is_none_or(|properties| {
+        properties
+            .entries
+            .iter()
+            .all(|(_, value)| expr_is_ready(value, scope))
+    }) && predicate
+        .predicate
+        .as_ref()
+        .is_none_or(|predicate| expr_is_ready(predicate, scope))
+}
+
+/// A predicate can run only when every variable it reads is already bound.
+/// Unknown expression kinds stay deferred.
+fn expr_is_ready(expr: &ast::Expr, scope: &Bindings) -> bool {
+    use ast::Expr as E;
+    let bound = |name: &ast::Identifier| {
+        scope.contains(&name.value) || scope.references.contains_key(&name.value)
+    };
+    match expr {
+        E::Literal(_) | E::Parameter(_) | E::Wildcard => true,
+        E::Identifier(name) => bound(name),
+        E::Property { base, .. } => expr_is_ready(base, scope),
+        E::Unary { expr, .. }
+        | E::IsNull { expr, .. }
+        | E::IsUnknown { expr, .. }
+        | E::IsTruth { expr, .. }
+        | E::AbsoluteValue { expr }
+        | E::Elements { path: expr }
+        | E::Cast { expr, .. } => expr_is_ready(expr, scope),
+        E::Binary { left, right, .. } | E::NullIf { left, right } => {
+            expr_is_ready(left, scope) && expr_is_ready(right, scope)
+        }
+        E::NumericFunction { args, .. }
+        | E::Coalesce(args)
+        | E::List(args)
+        | E::Function { args, .. } => args.iter().all(|expr| expr_is_ready(expr, scope)),
+        E::ElementId { variable }
+        | E::PropertyExists { variable, .. }
+        | E::IsLabeled { variable, .. }
+        | E::IsDirected { variable, .. } => bound(variable),
+        E::Same { variables } | E::AllDifferent { variables } => variables.iter().all(bound),
+        _ => false,
     }
 }

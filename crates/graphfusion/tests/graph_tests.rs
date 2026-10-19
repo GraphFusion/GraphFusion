@@ -312,6 +312,41 @@ async fn directed_joins_keep_parallel_edges_and_match_incoming_paths() {
 }
 
 #[tokio::test]
+async fn closing_angle_adds_rightward_edges_to_left_or_undirected() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (a {k: 1})-[:E]->(b {k: 2}), \
+                    (c {k: 3})-[:E]->(a), \
+                    (a)~[:U]~(d {k: 4}), \
+                    (a)~[:U]~(a)",
+        )
+        .await
+        .unwrap();
+    let every = vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"]];
+    for query in [
+        "MATCH (a {k: 1})<~[e]~>(b) RETURN b.k AS k ORDER BY k",
+        "MATCH (a {k: 1})<~>(b) RETURN b.k AS k ORDER BY k",
+        "MATCH (a {k: 1})<~/E|U/~>(b) RETURN b.k AS k ORDER BY k",
+        "MATCH (a {k: 1})-[e]-(b) RETURN b.k AS k ORDER BY k",
+    ] {
+        let result = session.query(query).await.unwrap();
+        assert_eq!(strings(&result), every, "{query}");
+    }
+    let without_right = vec![vec!["1"], vec!["3"], vec!["4"]];
+    for query in [
+        "MATCH (a {k: 1})<~[e]~(b) RETURN b.k AS k ORDER BY k",
+        "MATCH (a {k: 1})<~/E|U/~(b) RETURN b.k AS k ORDER BY k",
+    ] {
+        let result = session.query(query).await.unwrap();
+        assert_eq!(strings(&result), without_right, "{query}");
+    }
+}
+
+#[tokio::test]
 async fn undirected_orientations_do_not_duplicate_self_loops() {
     let (_, mut session) = database();
     let result = session
