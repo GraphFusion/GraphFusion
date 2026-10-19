@@ -97,6 +97,10 @@
 - Compare a filter on each fragment's stored property type before a multi-type
   scan unifies those columns. An integer comparison stays numeric, and a
   fragment that cannot compare is unknown rather than a match.
+- Compare each side of a match `WHERE` that combines different elements with
+  `OR`, `XOR`, or `NOT` on that element's stored type. `n.id = 1 OR m.id = 'x'`
+  keeps a row when either stored value matches, instead of rejecting the
+  unified column as incomparable with the literal.
 - Treat a missing property as a per-row null when an aggregate implies grouping.
   `RETURN n.missing, COUNT(*)` on an empty match no longer invents a `(NULL, 0)`
   group. A written constant and `GROUP BY ()` still return that one global row.

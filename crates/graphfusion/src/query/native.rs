@@ -1471,7 +1471,7 @@ pub(super) fn fragment_boolean(
     predicate: &ast::Expr,
 ) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
     let Some(filters) = filters_with_values(session, plan.schema(), scope, predicate, true)? else {
-        return Ok((plan, None));
+        return combine_fragments(plan, scope, session, predicate);
     };
     if filters
         .keys()
@@ -1512,6 +1512,121 @@ pub(super) fn fragment_boolean(
         });
     }
     Ok((plan, combined))
+}
+
+enum BooleanComposition {
+    And,
+    Or,
+    Xor,
+    Not,
+    Truth { value: bool, negated: bool },
+    Null { negated: bool },
+    Coalesce,
+    NullIf,
+}
+
+/// Evaluate each mixed comparison on its own element's fragments, then combine
+/// the boolean values on the working row. Joining on identity preserves rows
+/// for which another element can make an OR true.
+fn combine_fragments(
+    mut plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    predicate: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
+    use BooleanComposition as C;
+    let (operands, composition): (Vec<&ast::Expr>, C) = match predicate {
+        ast::Expr::Binary { left, op, right } => {
+            let composition = match op {
+                ast::BinaryOp::And => C::And,
+                ast::BinaryOp::Or => C::Or,
+                ast::BinaryOp::Xor => C::Xor,
+                _ => return Ok((plan, None)),
+            };
+            (vec![left, right], composition)
+        }
+        ast::Expr::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => (vec![expr], C::Not),
+        ast::Expr::IsTruth {
+            expr,
+            value,
+            negated,
+        } => (
+            vec![expr],
+            C::Truth {
+                value: *value,
+                negated: *negated,
+            },
+        ),
+        ast::Expr::IsUnknown { expr, negated } | ast::Expr::IsNull { expr, negated } => {
+            (vec![expr], C::Null { negated: *negated })
+        }
+        ast::Expr::Coalesce(args) => (args.iter().collect(), C::Coalesce),
+        ast::Expr::NullIf { left, right } => (vec![left, right], C::NullIf),
+        _ => return Ok((plan, None)),
+    };
+    let mut lowered = Vec::with_capacity(operands.len());
+    for operand in &operands {
+        let (next, value) = fragment_boolean(plan, scope, session, operand)?;
+        plan = next;
+        lowered.push(value);
+    }
+    if lowered.iter().all(Option::is_none) {
+        return Ok((plan, None));
+    }
+    let mut values = operands
+        .into_iter()
+        .zip(lowered)
+        .map(|(operand, value)| match value {
+            Some(value) => Ok(value),
+            None => Binder::with_bindings(session, plan.schema(), scope).predicate(operand),
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter();
+    let expression = match composition {
+        C::And => values
+            .next()
+            .expect("left operand")
+            .and(values.next().expect("right operand")),
+        C::Or => values
+            .next()
+            .expect("left operand")
+            .or(values.next().expect("right operand")),
+        C::Xor => xor(
+            values.next().expect("left operand"),
+            values.next().expect("right operand"),
+        ),
+        C::Not => Expr::Not(Box::new(values.next().expect("operand"))),
+        C::Truth { value, negated } => {
+            let expr = values.next().expect("operand");
+            let truth = if value {
+                expr.is_true()
+            } else {
+                expr.is_false()
+            };
+            if negated {
+                Expr::Not(Box::new(truth))
+            } else {
+                truth
+            }
+        }
+        C::Null { negated } => {
+            let expr = values.next().expect("operand");
+            if negated {
+                expr.is_not_null()
+            } else {
+                expr.is_null()
+            }
+        }
+        C::Coalesce => coalesce(values.collect()),
+        C::NullIf => nullif(
+            values.next().expect("left operand"),
+            values.next().expect("right operand"),
+        ),
+    };
+    Ok((plan, Some(expression)))
 }
 
 // Multi-part references retain their existing cross-domain type validation.
