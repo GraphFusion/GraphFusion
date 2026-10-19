@@ -657,4 +657,20 @@ valid_cases! {
         input: "INSERT (n:Seen {k: 1})-[e:E]->(m:Seen {k: 2}) RETURN *",
         statement_count: 1,
     }
+
+    next_return_star_uses_the_incoming_working_table {
+        input: "FOR n IN [1, 2] RETURN n NEXT FILTER n > 1 RETURN *",
+        statement_count: 2,
+    }
+}
+
+#[test]
+fn next_call_keeps_explicit_inner_bindings_and_the_outer_continuation() {
+    for input in [
+        "RETURN 1 AS x NEXT CALL { FOR y IN [2] RETURN * } RETURN *",
+        "RETURN 1 AS x NEXT CALL () { RETURN 2 AS y } RETURN *",
+        "RETURN 1 AS x NEXT CALL { RETURN 2 AS y NEXT RETURN * } RETURN *",
+    ] {
+        gql_parser::parse(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+    }
 }

@@ -279,6 +279,8 @@
 - Reject `MIN` and `MAX` when a property's selected fragments are not one
   comparable family. Integers and floats still widen; a string fragment no
   longer makes the extreme a lexicographic value.
+- Allow `RETURN *` in a `NEXT` continuation to project the incoming working
+  table. A nested query in that continuation still needs its own bindings.
 
 ## 0.2.0 — 2026-10-05
 
