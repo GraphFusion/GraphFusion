@@ -2115,3 +2115,18 @@ async fn stored_exists_keeps_internal_fields_hidden_and_optional_misses_unknown(
     let r=s.query("MATCH(n:Person|Document) LET r=n,k=1 FILTER r.id=k AND PROPERTY_EXISTS(r,id) RETURN r.name AS name").await.unwrap();
     assert_eq!(strings(&r), vec![vec!["Ada".to_string()]]);
 }
+
+#[tokio::test]
+async fn scalar_null_tests_and_other_element_metadata_stay_on_the_working_row() {
+    let mut s = social().await;
+    for query in [
+        "LET k=1 MATCH(n:Person|Document) WHERE n.id=1 OR k IS NULL RETURN n.name AS name",
+        "LET r=NULL MATCH(n:Person|Document) WHERE n.id=1 OR PROPERTY_EXISTS(r,id) RETURN n.name AS name",
+        "MATCH(n:Person|Document) LET k=1 FILTER n.id=1 OR k IS NULL RETURN n.name AS name",
+        "LET k=1 MATCH(n:Person|Document WHERE n.id=1 OR k IS NULL) RETURN n.name AS name",
+        "MATCH(n:Person|Document),(m:Metric) FILTER n.id=1 OR PROPERTY_EXISTS(m,missing) RETURN n.name AS name",
+    ] {
+        let r=s.query(query).await.unwrap();
+        assert_eq!(strings(&r),vec![vec!["Ada".to_string()]],"{query}");
+    }
+}
