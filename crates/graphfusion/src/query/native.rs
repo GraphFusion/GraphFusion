@@ -677,7 +677,8 @@ fn element_id_comparison(expr: &ast::Expr, variable: &str) -> Option<Local> {
     };
     match (left.as_ref(), right.as_ref()) {
         (ast::Expr::ElementId { variable: left }, ast::Expr::ElementId { variable: right })
-            if left.value == variable && right.value == variable =>
+            if left.value.eq_ignore_ascii_case(variable)
+                && right.value.eq_ignore_ascii_case(variable) =>
         {
             Some(Local::ElementSelf { op })
         }
@@ -1487,6 +1488,20 @@ pub(super) fn fragment_predicate(
     )?))
 }
 
+pub(super) struct MixedValue {
+    pub expr: Expr,
+}
+
+pub(super) fn fragment_value(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    expression: &ast::Expr,
+) -> Result<(LogicalPlanBuilder, Option<MixedValue>)> {
+    let (plan, value) = fragment_boolean(plan, scope, session, expression)?;
+    Ok((plan, value.map(|expr| MixedValue { expr })))
+}
+
 /// Boolean value of a mixed-type comparison tree, or `None` when the unified
 /// column can compare it.
 pub(super) fn fragment_boolean(
@@ -1738,21 +1753,91 @@ fn element_tables<'a>(
         .collect()
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct FragmentKey {
+    alias: String,
+    graph: u64,
+    kind: ElementKind,
+    labels: Vec<BTreeSet<String>>,
+    constrained: bool,
+    snapshot: usize,
+}
+
+#[derive(Clone)]
+pub(super) struct Fragment {
+    alias: String,
+    schema: datafusion::arrow::datatypes::SchemaRef,
+    labels: BTreeSet<String>,
+    directed: Option<bool>,
+}
+impl Fragment {
+    fn column(&self, name: &str) -> Expr {
+        qualified_column(Some(&self.alias), name)
+    }
+    fn columns(&self) -> impl Iterator<Item = Expr> + '_ {
+        self.schema.fields().iter().map(|f| self.column(f.name()))
+    }
+}
+
+pub(super) type FragmentCache = BTreeMap<FragmentKey, Vec<Fragment>>;
+
+/// Add only fragment dependencies belonging to an already grouped element.
+/// Closed scalars and other elements must still pass ordinary grouping checks.
+pub(super) fn grouping_columns(
+    scope: &Bindings,
+    groups: &[Expr],
+    expressions: &[&Expr],
+) -> Vec<Expr> {
+    let referenced: BTreeSet<_> = expressions
+        .iter()
+        .flat_map(|e| e.column_refs().into_iter().cloned())
+        .collect();
+    scope
+        .fragment_cache
+        .iter()
+        .filter(|(key, _)| groups.contains(&qualified_column(Some(&key.alias), crate::graph::ID)))
+        .flat_map(|(_, fragments)| fragments.iter().flat_map(Fragment::columns))
+        .filter(|expr| matches!(expr, Expr::Column(c) if referenced.contains(c)))
+        .collect()
+}
+
 fn compile_on_fragments(
     mut plan: LogicalPlanBuilder,
     scope: &mut Bindings,
     binding: &ElementBinding,
     atom: &NativeAtom,
 ) -> Result<(LogicalPlanBuilder, Expr)> {
-    let fragments = {
-        let data = scope
-            .sources
-            .get(&binding.graph)
-            .ok_or_else(|| Error::Corrupt("missing graph for fragment comparison".into()))?;
-        let tables = element_tables(data, binding);
-        validate_kind(atom, binding.kind)?;
-        validate(atom, tables.iter().copied())?;
-        tables
+    let data = scope
+        .sources
+        .get(&binding.graph)
+        .ok_or_else(|| Error::Corrupt("missing graph for fragment comparison".into()))?;
+    let tables = element_tables(data, binding);
+    validate_kind(atom, binding.kind)?;
+    validate(atom, tables.iter().copied())?;
+    let key = FragmentKey {
+        alias: binding.alias.clone(),
+        graph: binding.graph,
+        kind: binding.kind,
+        labels: binding.source_labels.clone(),
+        constrained: binding.constrained,
+        snapshot: std::sync::Arc::as_ptr(data) as usize,
+    };
+    let cached = scope
+        .fragment_cache
+        .get(&key)
+        .filter(|fragments| {
+            fragments.iter().flat_map(Fragment::columns).all(|expr| {
+                let Expr::Column(column) = expr else {
+                    unreachable!()
+                };
+                plan.schema().qualified_field_from_column(&column).is_ok()
+            })
+        })
+        .cloned();
+    let fragments = if let Some(cached) = cached {
+        cached
+    } else {
+        let sources = tables
             .iter()
             .map(|table| {
                 let directed = match binding.kind {
@@ -1761,7 +1846,7 @@ fn compile_on_fragments(
                         .edges
                         .iter()
                         .find(|edge| std::ptr::eq(&edge.table, *table))
-                        .map(|edge| edge.directed),
+                        .map(|e| e.directed),
                 };
                 (
                     table.schema.clone(),
@@ -1770,32 +1855,43 @@ fn compile_on_fragments(
                     directed,
                 )
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let mut fragments = Vec::new();
+        for (schema, provider, labels, directed) in sources {
+            let alias = scope.fresh("frag");
+            let scan =
+                LogicalPlanBuilder::scan(&alias, provider_as_source(provider), None)?.build()?;
+            let fragment = Fragment {
+                alias,
+                schema,
+                labels,
+                directed,
+            };
+            plan = plan.join_on(
+                scan,
+                JoinType::Left,
+                [binding
+                    .column(crate::graph::ID)
+                    .eq(fragment.column(crate::graph::ID))],
+            )?;
+            fragments.push(fragment);
+        }
+        scope.fragment_cache.insert(key, fragments.clone());
+        fragments
     };
     let mut parts = Vec::new();
-    for (schema, provider, labels, directed) in fragments {
-        let alias = scope.fresh("frag");
-        let scan = LogicalPlanBuilder::scan(&alias, provider_as_source(provider), None)?.build()?;
-        let id = Expr::Column(Column::new(
-            Some(TableReference::bare(alias.as_str())),
-            crate::graph::ID,
-        ));
-        plan = plan.join_on(
-            scan,
-            JoinType::Left,
-            [binding.column(crate::graph::ID).eq(id.clone())],
-        )?;
+    for fragment in fragments {
         parts.push(Expr::Case(datafusion::logical_expr::expr::Case::new(
             None,
             vec![(
-                Box::new(id.is_not_null()),
+                Box::new(fragment.column(crate::graph::ID).is_not_null()),
                 Box::new(compile_in(
                     atom,
-                    schema.as_ref(),
-                    Some(&alias),
+                    fragment.schema.as_ref(),
+                    Some(&fragment.alias),
                     FragmentMeta {
-                        labels: Some(&labels),
-                        directed,
+                        labels: Some(&fragment.labels),
+                        directed: fragment.directed,
                         identity: Some((binding.graph, binding.kind)),
                     },
                 )?),
