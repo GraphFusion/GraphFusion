@@ -28,6 +28,14 @@ fn strings(result: &graphfusion::QueryResult) -> Vec<Vec<String>> {
         .collect()
 }
 
+// Predicate tests compare returned mixed values without imposing an invalid
+// ORDER BY across their original stored families.
+fn sorted_strings(result: &graphfusion::QueryResult) -> Vec<Vec<String>> {
+    let mut rows = strings(result);
+    rows.sort();
+    rows
+}
+
 async fn social() -> graphfusion::Session {
     let mut session = Database::new().session();
     session
@@ -110,12 +118,14 @@ async fn label_filters_scan_only_compatible_fragments() {
     );
 
     let mixed = session
-        .query("MATCH (n:Person|Document) RETURN n.id AS id ORDER BY id")
+        .query("MATCH (n:Person|Document) RETURN n.id AS id")
         .await
         .unwrap();
     assert_eq!(mixed.schema.field(0).data_type(), &DataType::Utf8);
+    let mut mixed_rows = strings(&mixed);
+    mixed_rows.sort();
     assert_eq!(
-        strings(&mixed),
+        mixed_rows,
         vec![
             vec!["1".to_string()],
             vec!["2".to_string()],
@@ -566,7 +576,7 @@ async fn mixed_label_filters_compare_stored_types() {
     let either = session
         .query(
             "MATCH (n:Person|Document) WHERE n.id = 1 OR n.title = 'Spec'
-             RETURN n.id AS id, n.title AS title ORDER BY id",
+             RETURN n.id AS id, n.title AS title ORDER BY title",
         )
         .await
         .unwrap();
@@ -574,8 +584,8 @@ async fn mixed_label_filters_compare_stored_types() {
     assert_eq!(
         strings(&either),
         vec![
-            vec!["1".to_string(), "NULL".to_string()],
-            vec!["doc".to_string(), "Spec".to_string()]
+            vec!["doc".to_string(), "Spec".to_string()],
+            vec!["1".to_string(), "NULL".to_string()]
         ]
     );
 
@@ -758,12 +768,12 @@ async fn mixed_label_where_keeps_boolean_literals() {
     let or_true = session
         .query(
             "MATCH (n:Person|Document) WHERE FALSE OR n.id = 1 OR TRUE
-             RETURN n.id AS id ORDER BY id",
+             RETURN n.id AS id",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&or_true),
+        sorted_strings(&or_true),
         vec![
             vec!["1".to_string()],
             vec!["2".to_string()],
@@ -892,13 +902,13 @@ async fn filter_clause_compares_stored_types() {
     let either = session
         .query(
             "MATCH (n:Person|Document) FILTER n.id = 1 OR n.id = 'doc'
-             RETURN n.id AS id ORDER BY id",
+             RETURN n.id AS id",
         )
         .await
         .unwrap();
     assert_eq!(either.schema.field(0).data_type(), &DataType::Utf8);
     assert_eq!(
-        strings(&either),
+        sorted_strings(&either),
         vec![vec!["1".to_string()], vec!["doc".to_string()]]
     );
 
@@ -2427,12 +2437,12 @@ async fn where_direction_tests_keep_stored_types() {
         .query(
             "MATCH ()-[e:Knows|Notes|Cites]-()
              WHERE e.id = 'doc' OR e IS NOT DIRECTED
-             RETURN e.id AS id ORDER BY id",
+             RETURN e.id AS id",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&either),
+        sorted_strings(&either),
         vec![vec!["2".to_string()], vec!["doc".to_string()]]
     );
 
@@ -2440,12 +2450,12 @@ async fn where_direction_tests_keep_stored_types() {
         .query(
             "MATCH ()-[e:Knows|Notes|Cites]-()
              WHERE e IS DIRECTED OR e.id = 2
-             RETURN e.id AS id ORDER BY id",
+             RETURN e.id AS id",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&all_directed),
+        sorted_strings(&all_directed),
         vec![
             vec!["1".to_string()],
             vec!["2".to_string()],
@@ -3054,7 +3064,7 @@ async fn next_yield_and_repeated_reference_copies_keep_source_types() {
 #[tokio::test]
 async fn next_composite_references_do_not_adopt_one_branchs_layout() {
     let mut s = social().await;
-    let r = s.query("MATCH(p:Person) RETURN p UNION ALL MATCH(d:Document) RETURN d AS p NEXT RETURN p.id AS id ORDER BY id").await.unwrap();
+    let r = s.query("MATCH(p:Person) RETURN p UNION ALL MATCH(d:Document) RETURN d AS p NEXT RETURN p.id AS id").await.unwrap();
     assert_eq!(r.schema.field(0).data_type(), &DataType::Utf8);
     assert_eq!(r.row_count(), 3);
 }
@@ -3879,12 +3889,12 @@ async fn filter_operators_use_stored_types() {
     let kept = session
         .query(
             "MATCH (n:Person|Document) FILTER n.id + 0 = 1 OR TRUE
-             RETURN n.id AS id ORDER BY id",
+             RETURN n.id AS id",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&kept),
+        sorted_strings(&kept),
         vec![
             vec!["1".to_string()],
             vec!["2".to_string()],
@@ -3904,12 +3914,12 @@ async fn filter_operators_use_stored_types() {
     let labeled = session
         .query(
             "MATCH (n:Person|Document) FILTER n.id + 0 = 1 OR n:Document
-             RETURN n.id AS id ORDER BY id",
+             RETURN n.id AS id",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&labeled),
+        sorted_strings(&labeled),
         vec![vec!["1".to_string()], vec!["doc".to_string()]]
     );
 
@@ -4497,12 +4507,12 @@ async fn select_where_operators_use_stored_types() {
     let kept = session
         .query(
             "MATCH (n:Person|Document) SELECT n.id AS id
-             WHERE n.id + 0 = 1 OR TRUE ORDER BY id",
+             WHERE n.id + 0 = 1 OR TRUE",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&kept),
+        sorted_strings(&kept),
         vec![
             vec!["1".to_string()],
             vec!["2".to_string()],
@@ -4522,12 +4532,12 @@ async fn select_where_operators_use_stored_types() {
     let labeled = session
         .query(
             "MATCH (n:Person|Document) SELECT n.id AS id
-             WHERE n.id + 0 = 1 OR n:Document ORDER BY id",
+             WHERE n.id + 0 = 1 OR n:Document",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&labeled),
+        sorted_strings(&labeled),
         vec![vec!["1".to_string()], vec!["doc".to_string()]]
     );
 
@@ -4708,12 +4718,12 @@ async fn having_operators_use_stored_types() {
     let kept = session
         .query(
             "MATCH (n:Person|Document) SELECT n.id AS id
-             GROUP BY n HAVING n.id + 0 = 1 OR TRUE ORDER BY id",
+             GROUP BY n HAVING n.id + 0 = 1 OR TRUE",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&kept),
+        sorted_strings(&kept),
         vec![
             vec!["1".to_string()],
             vec!["2".to_string()],
@@ -4733,12 +4743,12 @@ async fn having_operators_use_stored_types() {
     let labeled = session
         .query(
             "MATCH (n:Person|Document) SELECT n.id AS id
-             GROUP BY n HAVING n.id + 0 = 1 OR n:Document ORDER BY id",
+             GROUP BY n HAVING n.id + 0 = 1 OR n:Document",
         )
         .await
         .unwrap();
     assert_eq!(
-        strings(&labeled),
+        sorted_strings(&labeled),
         vec![vec!["1".to_string()], vec!["doc".to_string()]]
     );
 
@@ -5329,4 +5339,166 @@ async fn extrema_wrappers_keep_reference_types_and_numeric_results() {
         .await
         .unwrap();
     assert_eq!(strings(&result), vec![vec!["1".to_owned()]]);
+}
+
+#[tokio::test]
+async fn order_by_rejects_mixed_property_families() {
+    let mut session = social().await;
+    let alias = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS id ORDER BY id")
+        .await
+        .unwrap_err();
+    assert!(
+        alias
+            .to_string()
+            .contains("ORDER BY cannot combine Int64 and Utf8"),
+        "{alias}"
+    );
+    let shadowed = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS n ORDER BY n")
+        .await
+        .unwrap_err();
+    assert!(
+        shadowed
+            .to_string()
+            .contains("ORDER BY cannot combine Int64 and Utf8"),
+        "{shadowed}"
+    );
+    let direct = session
+        .query("MATCH (n:Person|Document) ORDER BY n.id RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        direct
+            .to_string()
+            .contains("ORDER BY cannot combine Int64 and Utf8"),
+        "{direct}"
+    );
+    let selected = session
+        .query("SELECT n.id AS id FROM g MATCH (n:Person|Document) ORDER BY id")
+        .await
+        .unwrap_err();
+    assert!(
+        selected
+            .to_string()
+            .contains("ORDER BY cannot combine Int64 and Utf8"),
+        "{selected}"
+    );
+
+    let numeric = session
+        .query("MATCH (n:Person|Metric) RETURN n.score AS score ORDER BY score DESC")
+        .await
+        .unwrap();
+    assert_eq!(numeric.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&numeric),
+        vec![
+            vec!["2".to_string()],
+            vec!["1.5".to_string()],
+            vec!["1".to_string()]
+        ]
+    );
+
+    let missing = session
+        .query("MATCH (n:Person|Metric) RETURN n.id AS id ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(missing.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&missing),
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    session
+        .run("INSERT (:Flag {v: true}), (:Count {v: 1})")
+        .await
+        .unwrap();
+    let flags = session
+        .query("MATCH (n:Flag|Count) RETURN n.v AS v ORDER BY v")
+        .await
+        .unwrap_err();
+    assert!(
+        flags
+            .to_string()
+            .contains("ORDER BY cannot combine Boolean and Int64"),
+        "{flags}"
+    );
+}
+
+mod mixed_order_regressions {
+    use graphfusion::Database;
+    async fn session() -> graphfusion::Session {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:T {v:'1'})")
+            .await
+            .unwrap();
+        s
+    }
+    #[tokio::test]
+    async fn mixed_family_provenance_is_checked_0() {
+        let mut s = session().await;
+        let r = s.query("MATCH(n) LET r=n RETURN r.v AS v ORDER BY v").await;
+        assert!(r.is_err(), "mixed families accepted: {r:?}");
+    }
+}
+
+#[tokio::test]
+async fn sorting_wrappers_resolve_simultaneous_output_aliases() {
+    let mut session = social().await;
+    for query in [
+        "MATCH(n:Person|Document),(m:Metric) RETURN COALESCE(n.id,NULL) AS m, m AS n ORDER BY m",
+        "MATCH(n:Person|Document) LET r=n RETURN COALESCE(r.id,NULL) AS n ORDER BY COALESCE(n,NULL)",
+    ] {
+        let result=session.query(query).await;
+        assert!(matches!(result,Err(graphfusion::Error::InvalidQuery(_))),"{query}: {result:?}");
+    }
+    let result=session.query("MATCH(n:Person|Metric),(m:Person) RETURN COALESCE(n.score,NULL) AS m,m AS n ORDER BY m").await.unwrap();
+    assert_eq!(result.row_count(), 6);
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+}
+
+#[tokio::test]
+async fn scalar_property_aliases_keep_stored_families_across_next() {
+    let mut session = social().await;
+    for query in [
+        "MATCH(n:Person|Document) LET x=n.id RETURN MIN(x) AS v",
+        "MATCH(n:Person|Document) LET x=n.id,y=COALESCE(x,NULL) RETURN MAX(y) AS v",
+        "MATCH(n:Person|Document) RETURN n.id AS x NEXT YIELD x AS y RETURN MIN(y) AS v",
+        "MATCH(n:Person|Document) LET x=n.id RETURN x ORDER BY x",
+        "MATCH(n:Person|Document) FOR x IN [n.id] RETURN MIN(x) AS v",
+        "MATCH(n:Person|Document) RETURN COLLECT_LIST(n.id) AS xs NEXT FOR x IN xs RETURN MIN(x) AS v",
+    ] {
+        let result = session.query(query).await;
+        assert!(
+            matches!(result, Err(graphfusion::Error::InvalidQuery(_))),
+            "{query}: {result:?}"
+        );
+    }
+    let result=session.query("MATCH(n:Person|Metric) LET x=n.score RETURN x NEXT YIELD x AS y RETURN MIN(y) AS lo, MAX(y) AS hi").await.unwrap();
+    assert_eq!(strings(&result), vec![vec!["1".to_owned(), "2".to_owned()]]);
+}
+
+#[tokio::test]
+async fn scalar_family_provenance_tracks_nested_and_chosen_composite_rows() {
+    let mut session = social().await;
+    for query in [
+        "{ MATCH(n:Person|Document) RETURN n.id AS x } RETURN MIN(x) AS v",
+        "MATCH(n:Person|Document) RETURN n.id AS x UNION ALL MATCH(n:Person|Document) RETURN n.id AS x NEXT RETURN MIN(x) AS v",
+    ] {
+        let result=session.query(query).await;
+        assert!(matches!(result,Err(graphfusion::Error::InvalidQuery(_))),"{query}: {result:?}");
+    }
+    let result = session
+        .query("{ MATCH(n:Person) RETURN n.id AS x } RETURN MIN(x) AS v")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["1".to_owned()]]);
+    let result=session.query("MATCH(d:Document) RETURN d.id AS x OTHERWISE MATCH(n:Person|Document) RETURN n.id AS x NEXT RETURN MIN(x) AS v").await.unwrap();
+    assert_eq!(strings(&result), vec![vec!["doc".to_owned()]]);
+    let result=session.query("MATCH(d:Document {id:'absent'}) RETURN d.id AS x OTHERWISE MATCH(n:Person|Document) WHERE FALSE RETURN n.id AS x NEXT RETURN MIN(x) AS v").await.unwrap();
+    assert_eq!(strings(&result), vec![vec!["NULL".to_owned()]]);
 }

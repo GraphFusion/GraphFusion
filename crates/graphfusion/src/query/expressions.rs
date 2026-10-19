@@ -763,10 +763,38 @@ pub(super) fn boolean_value(flag: Expr) -> Expr {
 }
 
 /// A value-preserving wrapper retains the stored families of its properties.
-fn stored_property_types(
+pub(super) fn stored_property_types(
     bindings: Option<&super::graph::Bindings>,
     expr: &ast::Expr,
 ) -> Option<Vec<DataType>> {
+    if let ast::Expr::Identifier(name) = expr {
+        return bindings?.value_types.get(&name.value).cloned();
+    }
+    let list_args = match expr {
+        ast::Expr::List(args) => Some(args.as_slice()),
+        ast::Expr::Function { name, args, .. }
+            if name.value.eq_ignore_ascii_case("COLLECT_LIST") =>
+        {
+            Some(args.as_slice())
+        }
+        _ => None,
+    };
+    if let Some(args) = list_args {
+        let mut result = Vec::new();
+        let mut known = false;
+        for arg in args {
+            if let Some(types) = stored_property_types(bindings, arg) {
+                known = true;
+                for ty in types {
+                    let list = DataType::new_list(ty, true);
+                    if !result.contains(&list) {
+                        result.push(list);
+                    }
+                }
+            }
+        }
+        return known.then_some(result);
+    }
     if let ast::Expr::Coalesce(args) = expr {
         let mut result = Vec::new();
         let mut known = false;
@@ -835,7 +863,9 @@ pub(super) fn ensure_one_family(
     };
     let mut families = Vec::new();
     for ty in &types {
-        let family = value_family(ty);
+        let Some(family) = value_family(ty) else {
+            continue;
+        };
         if !families.contains(&family) {
             families.push(family);
         }
@@ -843,7 +873,11 @@ pub(super) fn ensure_one_family(
     if families.len() <= 1 {
         return Ok(());
     }
-    let mut labels = types.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let mut labels = types
+        .iter()
+        .filter(|ty| value_family(ty).is_some())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     labels.sort();
     Err(Error::InvalidQuery(format!(
         "{} cannot combine {}",
@@ -852,14 +886,64 @@ pub(super) fn ensure_one_family(
     )))
 }
 
-fn value_family(ty: &DataType) -> String {
-    match ty {
+fn value_family(ty: &DataType) -> Option<String> {
+    Some(match ty {
+        DataType::Null => return None,
         ty if ty.is_numeric() => "numeric".into(),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string".into(),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytes".into(),
-        DataType::List(field) | DataType::LargeList(field) => {
-            format!("list<{}>", value_family(field.data_type()))
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            format!("list<{}>", value_family(field.data_type())?)
         }
         other => other.to_string(),
+    })
+}
+
+pub(super) type StoredTypes = super::casefold::CaseFoldMap<Vec<DataType>>;
+
+pub(super) fn merge_value_types(left: &mut StoredTypes, right: &StoredTypes) {
+    for (name, types) in right {
+        let mut values = left.get(name).cloned().unwrap_or_default();
+        for ty in types {
+            if !values.contains(ty) {
+                values.push(ty.clone());
+            }
+        }
+        left.insert(name.clone(), values);
     }
+}
+
+pub(super) fn result_value_types(
+    body: &ast::QueryBody,
+    scope: &super::graph::Bindings,
+    schema: &DFSchema,
+) -> StoredTypes {
+    let mut sources = super::casefold::CaseFoldMap::new();
+    for (i, item) in body.result_clause.items.iter().enumerate() {
+        if matches!(item.expr, ast::Expr::Wildcard) {
+            continue;
+        }
+        let name = item
+            .alias
+            .as_ref()
+            .map(|name| name.value.clone())
+            .unwrap_or_else(|| match &item.expr {
+                ast::Expr::Identifier(name) => name.value.clone(),
+                _ => format!("column_{}", i + 1),
+            });
+        sources.insert(name, &item.expr);
+    }
+    let mut result = StoredTypes::new();
+    for field in schema.fields() {
+        let types = if let Some(source) = sources.get(field.name()) {
+            stored_property_types(Some(scope), source)
+        } else {
+            scope.value_types.get(field.name()).cloned()
+        };
+        result.insert(
+            field.name().clone(),
+            types.unwrap_or_else(|| vec![field.data_type().clone()]),
+        );
+    }
+    result
 }

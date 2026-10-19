@@ -40,6 +40,8 @@ This returns 2/2.0 then 1/1.0. Sums, minimums, maximums, standard deviations and
 
 After `UNION`, `INTERSECT`, `EXCEPT`, or `OTHERWISE`, a trailing `ORDER BY` sorts the combined rows.
 
+A property read from several fragments must use one comparable family. Integers and floats stay one family and sort numerically. Boolean, string, and byte-string values do not sort as one another or as numbers. Mixing those families is an invalid query, rather than ordering the string form of each cell. A fragment that does not store the property contributes null and does not add a family.
+
 ORDER BY can also appear in the linear pipeline before the result clause. A later operation can affect row order; put the final ORDER BY with the result when ordering matters to the caller.
 
 An earlier `LIMIT` or `OFFSET` selects its window before a later `ORDER BY`. That later sort reorders only the selected rows.

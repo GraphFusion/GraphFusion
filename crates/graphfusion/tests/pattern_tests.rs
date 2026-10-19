@@ -444,13 +444,28 @@ async fn alternation_unifies_divergent_property_schemas() {
     s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {v:1}), (:B {v:true})")
         .await
         .unwrap();
-    let alternation = query(&mut s, "MATCH (n:A) | (n:B) RETURN n.v AS v ORDER BY v").await;
-    let disjunction = query(&mut s, "MATCH (n:A|B) RETURN n.v AS v ORDER BY v").await;
+    let alternation = query(&mut s, "MATCH (n:A) | (n:B) RETURN n.v AS v").await;
+    let disjunction = query(&mut s, "MATCH (n:A|B) RETURN n.v AS v").await;
     assert_eq!(
         alternation.schema.field_with_name("v").unwrap().data_type(),
         disjunction.schema.field_with_name("v").unwrap().data_type()
     );
-    assert_eq!(rows(&alternation), rows(&disjunction));
+    let mut alternation_rows = rows(&alternation);
+    let mut disjunction_rows = rows(&disjunction);
+    alternation_rows.sort();
+    disjunction_rows.sort();
+    assert_eq!(alternation_rows, disjunction_rows);
+    assert_eq!(alternation_rows, vec![vec!["1"], vec!["true"]]);
+    for query in [
+        "MATCH (n:A) | (n:B) RETURN n.v AS v ORDER BY v",
+        "MATCH (n:A|B) RETURN n.v AS v ORDER BY v",
+    ] {
+        let error = s.query(query).await.unwrap_err();
+        assert!(
+            error.to_string().contains("ORDER BY cannot combine"),
+            "{error}"
+        );
+    }
 
     let mut s = Database::new().session();
     s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:A {name:'a'}), (:B {name:'b'})")

@@ -109,7 +109,26 @@ pub(super) async fn for_clause(
     ) {
         return Err(Error::InvalidQuery("FOR requires a list value".into()));
     }
+    let source_types = super::expressions::stored_property_types(Some(scope), &clause.source);
     let variable = scope.scalar(&clause.variable.value);
+    if let Some(types) = source_types {
+        let mut elements = Vec::new();
+        for ty in types {
+            let inner = match ty {
+                DataType::List(field)
+                | DataType::LargeList(field)
+                | DataType::FixedSizeList(field, _) => field.data_type().clone(),
+                _ => continue,
+            };
+            if !elements.contains(&inner) {
+                elements.push(inner);
+            }
+        }
+        scope
+            .value_types
+            .insert(clause.variable.value.clone(), elements);
+    }
+
     if let Some(domain) = super::references::domain(&clause.source, scope) {
         scope.domains.insert(clause.variable.value.clone(), domain);
     }

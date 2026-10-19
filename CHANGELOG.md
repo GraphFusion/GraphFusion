@@ -117,6 +117,11 @@
   fragment's stored type. `WHERE n.id + 0 = 1` no longer fails when another
   label stores `id` as text, and `WHERE n.id || '' = '1'` no longer matches an
   integer that was cast to a string.
+- Reject `ORDER BY` when one property is stored as more than one comparable
+  family. Integers and floats still sort as numbers. An integer mixed with a
+  string is an invalid query (`ORDER BY cannot combine Int64 and Utf8`) instead
+  of lexicographic order of the stringified cells. A fragment that does not
+  store the property contributes null and does not add a family.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
