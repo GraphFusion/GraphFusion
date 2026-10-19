@@ -3287,3 +3287,310 @@ async fn mixed_case_element_id_self_comparison_preserves_native_integer_filter()
         assert_eq!(strings(&session.query(query).await.unwrap()), vec![vec!["1".to_string()]]);
     }
 }
+
+#[tokio::test]
+async fn mixed_property_pairs_compare_stored_types() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:P {name: 'ten', v: 10}),
+                    (:P {name: 'nine', v: 9}),
+                    (:D {name: 'doc', v: 'x'})",
+        )
+        .await
+        .unwrap();
+
+    let greater = session
+        .query(
+            "MATCH (n), (m) WHERE n.v > m.v
+             RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        )
+        .await
+        .unwrap();
+    assert!(
+        greater.logical_plan.contains("__gf_frag_"),
+        "mixed property comparison stayed on the unified column:\n{}",
+        greater.logical_plan
+    );
+    assert_eq!(
+        strings(&greater),
+        vec![vec!["ten".to_string(), "nine".to_string()]]
+    );
+    session
+        .run("MATCH (n {name: 'ten'}), (m {name: 'nine'}) INSERT (n)-[:E]->(m)")
+        .await
+        .unwrap();
+    let parenthesized = session
+        .query(
+            "MATCH ((n)-[:E]-(m) WHERE n.v > m.v)
+             RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&parenthesized),
+        vec![vec!["ten".to_string(), "nine".to_string()]]
+    );
+
+    let ten_nine = session
+        .query(
+            "MATCH (n {name: 'ten'}), (m {name: 'nine'})
+             RETURN n.v > m.v AS gt, n.v > m.v OR FALSE AS or_false, n.v > m.v XOR FALSE AS xor_false",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&ten_nine),
+        vec![vec![
+            "true".to_string(),
+            "true".to_string(),
+            "true".to_string()
+        ]]
+    );
+    let nine_ten = session
+        .query("MATCH (n {name: 'nine'}), (m {name: 'ten'}) RETURN n.v > m.v AS gt")
+        .await
+        .unwrap();
+    assert_eq!(strings(&nine_ten), vec![vec!["false".to_string()]]);
+
+    let negated = session
+        .query(
+            "MATCH (n), (m) WHERE NOT n.v = m.v
+             RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&negated),
+        vec![
+            vec!["nine".to_string(), "ten".to_string()],
+            vec!["ten".to_string(), "nine".to_string()]
+        ]
+    );
+
+    for query in [
+        "MATCH (n), (m) FILTER n.v > m.v RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        "MATCH (n), (m) LET gt = n.v > m.v FILTER gt RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        "MATCH (n), (m) SELECT n.name AS n, m.name AS m WHERE n.v > m.v ORDER BY n, m",
+        "MATCH (n), (m) ORDER BY n.v > m.v DESC NULLS LAST, n.name, m.name RETURN n.name AS n, m.name AS m LIMIT 1",
+        "MATCH (n), (m) RETURN n.name AS left_name, m.name AS right_name ORDER BY n.v > m.v DESC NULLS LAST, left_name, right_name LIMIT 1",
+    ] {
+        let result = session.query(query).await.unwrap();
+        assert_eq!(
+            strings(&result),
+            vec![vec!["ten".to_string(), "nine".to_string()]],
+            "{query}"
+        );
+    }
+
+    let grouped = session
+        .query(
+            "MATCH (n {name: 'ten'}), (m {name: 'nine'})
+             RETURN n.v > m.v AS gt, COUNT(*) AS c GROUP BY n, m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&grouped),
+        vec![vec!["true".to_string(), "1".to_string()]]
+    );
+    let having = session
+        .query(
+            "MATCH (n), (m)
+             SELECT n.name AS left_name, m.name AS right_name, COUNT(*) AS c
+             GROUP BY n, m HAVING n.v > m.v ORDER BY left_name, right_name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&having),
+        vec![vec!["ten".to_string(), "nine".to_string(), "1".to_string()]]
+    );
+
+    let same_label = session
+        .query(
+            "MATCH (n:P), (m:P) WHERE n.v > m.v
+             RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !same_label.logical_plan.contains("__gf_frag_"),
+        "same-type comparison joined fragments:\n{}",
+        same_label.logical_plan
+    );
+    assert_eq!(
+        strings(&same_label),
+        vec![vec!["ten".to_string(), "nine".to_string()]]
+    );
+
+    session
+        .run("INSERT (:D {name: 'text', v: '10'})")
+        .await
+        .unwrap();
+    let equals = session
+        .query(
+            "MATCH (n), (m) WHERE n.v = m.v
+             RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&equals),
+        vec![
+            vec!["doc".to_string(), "doc".to_string()],
+            vec!["nine".to_string(), "nine".to_string()],
+            vec!["ten".to_string(), "ten".to_string()],
+            vec!["text".to_string(), "text".to_string()]
+        ]
+    );
+    let mapped = session
+        .query(
+            "MATCH (m:D), (n {v: m.v})
+             RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&mapped),
+        vec![
+            vec!["doc".to_string(), "doc".to_string()],
+            vec!["text".to_string(), "text".to_string()]
+        ]
+    );
+    let named = session
+        .query(
+            "MATCH (n), (m) WHERE n.v = m.v AND n.name = 'ten'
+             RETURN m.name AS m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&named), vec![vec!["ten".to_string()]]);
+    let mismatch = session
+        .query("MATCH (n:P), (m:D) WHERE n.v = m.v RETURN n.name AS n")
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("incomparable types"),
+        "{mismatch}"
+    );
+
+    session
+        .run(
+            "INSERT (:P {name: 'tenw', v: 10, w: 9}),
+                    (:D {name: 'docw', v: 'x', w: 1})",
+        )
+        .await
+        .unwrap();
+    let same_element = session
+        .query(
+            "MATCH (n) WHERE n.name = 'tenw' OR n.name = 'docw'
+             RETURN n.name AS name, n.v > n.w AS gt ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&same_element),
+        vec![
+            vec!["docw".to_string(), "NULL".to_string()],
+            vec!["tenw".to_string(), "true".to_string()]
+        ]
+    );
+
+    session
+        .execute("CREATE GRAPH h ANY GRAPH; SESSION SET GRAPH h")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:P {name: 'low', score: 1}),
+                    (:M {name: 'high', score: 1.5})",
+        )
+        .await
+        .unwrap();
+    let widened = session
+        .query(
+            "MATCH (n), (m) WHERE n.score > m.score
+             RETURN n.name AS n, m.name AS m ORDER BY n, m",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !widened.logical_plan.contains("__gf_frag_"),
+        "numeric widening joined fragments:\n{}",
+        widened.logical_plan
+    );
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["high".to_string(), "low".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn repeated_property_pairs_keep_distinct_ordering_wrappers_and_references() {
+    let mut session = social().await;
+    for query in [
+        "MATCH(n),(m) RETURN DISTINCT n.id=m.id AS eq ORDER BY n.id=m.id",
+        "MATCH(n),(m) RETURN DISTINCT n.id=m.id AS eq ORDER BY N.ID=M.ID",
+        "MATCH(n),(m) LET r=n, s=m RETURN DISTINCT r.id=s.id AS eq ORDER BY R.ID=S.ID",
+        "MATCH(n),(m) RETURN DISTINCT (n.id=m.id) IS UNKNOWN AS b ORDER BY (N.ID=M.ID) IS UNKNOWN",
+    ] {
+        let result = strings(&session.query(query).await.unwrap());
+        assert!(!result.is_empty(), "{query}");
+    }
+    let result = session.query("OPTIONAL MATCH(n:Missing) MATCH(m:Person|Document) RETURN (n.id=m.id) IS UNKNOWN AS b, COALESCE(n.id=m.id,TRUE) AS c").await.unwrap();
+    assert!(strings(&result)
+        .iter()
+        .all(|r| r == &vec!["true".to_string(), "true".to_string()]));
+}
+
+#[tokio::test]
+async fn stored_result_comparisons_keep_alias_and_aggregate_binding_context() {
+    let mut session = social().await;
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN FALSE AS ok ORDER BY n.id='doc' OR ok")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["false".to_string()]; 3]);
+    let result = session.query("MATCH(n:Person|Document) SELECT n.id AS id, COUNT(*) AS c GROUP BY n HAVING n.id='doc' OR COUNT(*)>1").await.unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![vec!["doc".to_string(), "1".to_string()]]
+    );
+    let result = session.query("MATCH(n:Person|Document),(m:Person|Document) RETURN FALSE AS ok ORDER BY n.id=m.id OR ok").await.unwrap();
+    assert_eq!(strings(&result).len(), 9);
+}
+
+#[tokio::test]
+async fn stored_result_comparisons_preserve_an_earlier_order_and_page() {
+    let mut session = social().await;
+    for suffix in ["", " OFFSET 1 LIMIT 2"] {
+        let expected = strings(
+            &session
+                .query(&format!(
+                    "MATCH(n:Person|Document) ORDER BY n.name DESC{suffix} RETURN n.name AS name"
+                ))
+                .await
+                .unwrap(),
+        );
+        for result in [
+            "RETURN n.name AS name, n.id='doc' AS eq",
+            "SELECT n.name AS name WHERE n.id='doc' OR TRUE",
+        ] {
+            let rows = strings(
+                &session
+                    .query(&format!(
+                        "MATCH(n:Person|Document) ORDER BY n.name DESC{suffix} {result}"
+                    ))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                rows.iter().map(|r| vec![r[0].clone()]).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}
