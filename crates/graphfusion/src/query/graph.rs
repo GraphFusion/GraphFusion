@@ -543,7 +543,13 @@ pub(super) fn predicates_for(
                 continue;
             }
             plan = next;
-            let right = Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
+            let (next, shared) =
+                super::native::fragment_boolean(plan, &mut fragments, session, value)?;
+            plan = next;
+            let right = match shared {
+                Some(value) => value,
+                None => Binder::with_bindings(session, plan.schema(), scope).bind(value)?,
+            };
             let equality = Binder::with_bindings(session, plan.schema(), scope)
                 .equals(binding.property(&name.value), right)?;
             plan = plan.filter(equality)?;

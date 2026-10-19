@@ -227,58 +227,119 @@ fn checked_udf_new(op: Operator, data_type: DataType) -> ScalarUDF {
         Volatility::Immutable,
         Arc::new(move |args| {
             let arrays = ColumnarValue::values_to_arrays(args)?;
-            if op == Operator::Divide {
-                if let (Some(left), Some(right)) = (
-                    arrays[0].as_any().downcast_ref::<Float64Array>(),
-                    arrays[1].as_any().downcast_ref::<Float64Array>(),
-                ) {
-                    if left
-                        .iter()
-                        .zip(right.iter())
-                        .any(|(a, b)| a.is_some() && b == Some(0.0))
-                    {
-                        return Err(DataFusionError::Execution("division by zero".into()));
-                    }
-                }
-            }
-            let left = &arrays[0].as_ref();
-            let right = &arrays[1].as_ref();
-            let output = match op {
-                Operator::Plus => numeric::add(left, right),
-                Operator::Minus => numeric::sub(left, right),
-                Operator::Multiply => numeric::mul(left, right),
-                Operator::Divide => numeric::div(left, right),
-                _ => unreachable!("only arithmetic operators are bound to this UDF"),
-            };
-            // Integer kernels report these as Arrow failures. Surface the same
-            // execution errors as the float checks above, including MIN / -1.
-            let output = match output {
-                Ok(output) => output,
-                Err(datafusion::arrow::error::ArrowError::DivideByZero) => {
-                    return Err(DataFusionError::Execution("division by zero".into()));
-                }
-                Err(datafusion::arrow::error::ArrowError::ArithmeticOverflow(_)) => {
-                    return Err(DataFusionError::Execution("integer overflow".into()));
-                }
-                Err(error) => return Err(DataFusionError::from(error)),
-            };
-            if let Some(values) = output.as_any().downcast_ref::<Float64Array>() {
-                if values.iter().flatten().any(|n| !n.is_finite()) {
-                    return Err(DataFusionError::Execution(
-                        "non-finite arithmetic result".into(),
-                    ));
-                }
-            }
-            if args
+            columnar_result(args, checked_arrays(op, &arrays)?)
+        }),
+    )
+}
+
+fn checked_arrays(
+    op: Operator,
+    arrays: &[datafusion::arrow::array::ArrayRef],
+) -> Result<datafusion::arrow::array::ArrayRef, DataFusionError> {
+    if op == Operator::Divide {
+        if let (Some(left), Some(right)) = (
+            arrays[0].as_any().downcast_ref::<Float64Array>(),
+            arrays[1].as_any().downcast_ref::<Float64Array>(),
+        ) {
+            if left
                 .iter()
-                .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+                .zip(right.iter())
+                .any(|(a, b)| a.is_some() && b == Some(0.0))
             {
-                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
-                    &output, 0,
-                )?))
-            } else {
-                Ok(ColumnarValue::Array(output))
+                return Err(DataFusionError::Execution("division by zero".into()));
             }
+        }
+    }
+    let left = &arrays[0].as_ref();
+    let right = &arrays[1].as_ref();
+    let output = match op {
+        Operator::Plus => numeric::add(left, right),
+        Operator::Minus => numeric::sub(left, right),
+        Operator::Multiply => numeric::mul(left, right),
+        Operator::Divide => numeric::div(left, right),
+        _ => unreachable!("only arithmetic operators are bound to this UDF"),
+    };
+    // Integer kernels report these as Arrow failures. Surface the same
+    // execution errors as the float checks above, including MIN / -1.
+    let output = match output {
+        Ok(output) => output,
+        Err(datafusion::arrow::error::ArrowError::DivideByZero) => {
+            return Err(DataFusionError::Execution("division by zero".into()));
+        }
+        Err(datafusion::arrow::error::ArrowError::ArithmeticOverflow(_)) => {
+            return Err(DataFusionError::Execution("integer overflow".into()));
+        }
+        Err(error) => return Err(DataFusionError::from(error)),
+    };
+    if let Some(values) = output.as_any().downcast_ref::<Float64Array>() {
+        if values.iter().flatten().any(|n| !n.is_finite()) {
+            return Err(DataFusionError::Execution(
+                "non-finite arithmetic result".into(),
+            ));
+        }
+    }
+    Ok(output)
+}
+
+/// Check the pair's null mask before converting an integer to Float64. An
+/// inexact integer is an error only on rows that perform mixed arithmetic.
+pub(super) fn checked_mixed(left: Expr, op: Operator, right: Expr, integer_on_left: bool) -> Expr {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u8, bool), ScalarUDF>>> =
+        OnceLock::new();
+    let key = (
+        match op {
+            Operator::Plus => 0,
+            Operator::Minus => 1,
+            Operator::Multiply => 2,
+            Operator::Divide => 3,
+            _ => unreachable!(),
+        },
+        integer_on_left,
+    );
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .entry(key)
+        .or_insert_with(|| checked_mixed_new(op, integer_on_left))
+        .clone()
+        .call(vec![left, right])
+}
+fn checked_mixed_new(op: Operator, integer_on_left: bool) -> ScalarUDF {
+    let types = if integer_on_left {
+        vec![DataType::Int64, DataType::Float64]
+    } else {
+        vec![DataType::Float64, DataType::Int64]
+    };
+    create_udf(
+        &format!("gql_checked_mixed_{op:?}_{integer_on_left}"),
+        types,
+        DataType::Float64,
+        Volatility::Immutable,
+        Arc::new(move |args| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let index = usize::from(!integer_on_left);
+            let integers = int64_array(&arrays[index])?;
+            let floats = float64_array(&arrays[1 - index])?;
+            let mut converted = Float64Builder::with_capacity(integers.len());
+            for row in 0..integers.len() {
+                if integers.is_null(row) || floats.is_null(row) {
+                    converted.append_null();
+                    continue;
+                }
+                let integer = integers.value(row);
+                let float = exact_i64_f64(integer).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "integer {integer} is not exactly representable as float"
+                    ))
+                })?;
+                converted.append_value(float);
+            }
+            let mut numeric = arrays;
+            numeric[index] = Arc::new(converted.finish());
+            columnar_result(args, checked_arrays(op, &numeric)?)
         }),
     )
 }

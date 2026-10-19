@@ -9,6 +9,7 @@ mod graph;
 mod lists;
 mod mutations;
 mod native;
+mod optimizer;
 mod path_values;
 mod paths;
 mod patterns;
@@ -139,7 +140,16 @@ pub(crate) async fn execute_chain(
         .options_mut()
         .optimizer
         .enable_leaf_expression_pushdown = false;
-    let ctx = SessionContext::new_with_config_rt(config, std::sync::Arc::new(runtime));
+    let shared = optimizer::needs_shared(chain);
+    let state =
+        datafusion::execution::session_state::SessionStateBuilder::new_with_default_features()
+            .with_config(config)
+            .with_runtime_env(std::sync::Arc::new(runtime))
+            .with_optimizer_rules(optimizer::logical_rules(shared))
+            .with_physical_optimizer_rules(optimizer::physical_rules(shared))
+            .build();
+
+    let ctx = SessionContext::new_with_state(state);
     let mut writes = mutations::Writes::default();
     let mut trace = execution::Trace::default();
     let plan = drive_chain(

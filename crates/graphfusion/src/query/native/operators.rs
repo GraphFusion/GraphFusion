@@ -63,6 +63,8 @@ struct Compiler<'a> {
     session: &'a SessionState,
     context: BindContext<'a>,
     nodes: Vec<Node>,
+    stored: bool,
+    root: usize,
 }
 
 pub(super) fn compile(
@@ -72,7 +74,8 @@ pub(super) fn compile(
     expression: &ast::Expr,
     context: BindContext<'_>,
 ) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
-    if !mixed_operator(expression, scope, false)
+    let stored = mixed_operator(expression, scope, false);
+    if (!stored && !needs_shared_coalesce(expression))
         || (!context.aggregates && contains_aggregate(expression))
     {
         return Ok((plan, None));
@@ -94,8 +97,11 @@ pub(super) fn compile(
         session,
         context,
         nodes: vec![],
+        stored,
+        root: usize::MAX,
     };
     let root = compiler.build(expression)?;
+    compiler.root = root;
     let variants = compiler.nodes[root].variants.clone();
     let demands = variants
         .iter()
@@ -268,6 +274,13 @@ impl Compiler<'_> {
         self.finish(Kind::Base, vec![], vec![variant], None)
     }
     fn property(&mut self, name: &str, key: &str, original: &ast::Expr) -> Result<usize> {
+        if !self.stored {
+            return self.base(
+                self.context
+                    .binder(self.session, self.plan.schema(), self.scope)
+                    .bind(original)?,
+            );
+        }
         let Some(binding) = fragment_binding(self.scope, name) else {
             return self.base(
                 self.context
@@ -785,10 +798,19 @@ impl Compiler<'_> {
                 };
                 arms.push((Box::new(active), Box::new(value)));
             }
-            let value = conditional_value(arms, &variant.ty)?;
-            if !value.column_refs().is_empty()
-                && datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty()
-            {
+            let mut value = conditional_value(arms, &variant.ty)?;
+            let aggregate =
+                !datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty();
+            if value.column_refs().is_empty() && !aggregate {
+                use datafusion::optimizer::simplify_expressions::{
+                    ExprSimplifier, SimplifyContext,
+                };
+                value = ExprSimplifier::new(SimplifyContext::default()).simplify(value)?;
+            }
+            let computed = !matches!(node.kind, Kind::Base)
+                && id != self.root
+                && !matches!(value, Expr::Literal(..));
+            if (computed || !value.column_refs().is_empty()) && !aggregate {
                 indices.push(index);
                 let mut dependencies = variant.dependencies.clone();
                 dependencies.extend(self.semantic(&demand));
@@ -1005,7 +1027,7 @@ fn cache_key(
                 E::NumericFunction { function, .. } => format!("numeric:{function:?}"),
                 _ => unreachable!(),
             };
-            format!("{tag}:{values:?}")
+            format!("{tag}:{}", key_arguments(values))
         }
         E::Wildcard => "wildcard".into(),
         E::Function {
@@ -1015,7 +1037,7 @@ fn cache_key(
         } => format!(
             "aggregate:{}:{quantifier:?}:{:?}",
             name.value.to_ascii_lowercase(),
-            args.iter().map(child).collect::<Result<Vec<_>>>()?
+            key_arguments(args.iter().map(child).collect::<Result<Vec<_>>>()?)
         ),
         E::Elements { path } => format!("elements({})", child(path)?),
         _ => format!(
@@ -1023,4 +1045,14 @@ fn cache_key(
             context.binder(session, schema, scope).bind(expr)?
         ),
     })
+}
+
+// Length framing keeps recursive keys unambiguous without repeatedly escaping
+// child strings, which itself doubles their size at each nesting level.
+fn key_arguments(values: Vec<String>) -> String {
+    values
+        .into_iter()
+        .map(|value| format!("{}:{value}", value.len()))
+        .collect::<Vec<_>>()
+        .join("")
 }
