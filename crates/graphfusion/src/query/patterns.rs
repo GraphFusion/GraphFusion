@@ -963,7 +963,7 @@ fn depends_on(expr: &ast::Expr, name: &str) -> bool {
     use ast::Expr as E;
     match expr {
         E::Literal(_) | E::Parameter(_) => false,
-        E::Identifier(id) => id.value == name,
+        E::Identifier(id) => id.value.eq_ignore_ascii_case(name),
         E::Property { base, .. } => depends_on(base, name),
         E::Unary { expr, .. }
         | E::IsNull { expr, .. }
@@ -978,9 +978,9 @@ fn depends_on(expr: &ast::Expr, name: &str) -> bool {
         E::ElementId { variable }
         | E::PropertyExists { variable, .. }
         | E::IsLabeled { variable, .. }
-        | E::IsDirected { variable, .. } => variable.value == name,
+        | E::IsDirected { variable, .. } => variable.value.eq_ignore_ascii_case(name),
         E::Same { variables } | E::AllDifferent { variables } => {
-            variables.iter().any(|v| v.value == name)
+            variables.iter().any(|v| v.value.eq_ignore_ascii_case(name))
         }
         _ => true, // A new expression kind must be audited before it enables this proof.
     }

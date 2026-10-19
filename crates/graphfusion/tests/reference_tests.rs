@@ -431,3 +431,17 @@ async fn case_folded_composite_aliases_keep_reference_domains_and_layouts() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn case_folded_reference_dependency_waits_for_its_later_rebind() {
+    let mut s = graph().await;
+    s.run("INSERT(:Person {id:1}),(:Document {id:'doc'})")
+        .await
+        .unwrap();
+    check(
+        &mut s,
+        "MATCH(p) LET r=p MATCH(x:Person),(r:Person) WHERE R.id+0=1 RETURN r.id AS id",
+        &[&["1"]],
+    )
+    .await;
+}
