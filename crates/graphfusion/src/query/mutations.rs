@@ -140,12 +140,14 @@ async fn table_with_empty(
         },
     )?))
 }
-fn properties(
+async fn properties(
     map: Option<&ast::MapLiteral>,
     session: &SessionState,
-    plan: &LogicalPlanBuilder,
-    scope: &Bindings,
-) -> Result<Vec<(String, Expr)>> {
+    mut plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    ctx: &SessionContext,
+    trace: &mut Trace,
+) -> Result<(LogicalPlanBuilder, Vec<(String, Expr)>)> {
     let mut result = Vec::new();
     if let Some(map) = map {
         for (name, value) in &map.entries {
@@ -160,11 +162,29 @@ fn properties(
             {
                 return Err(Error::InvalidDefinition("duplicate property".into()));
             }
-            let value = Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
+            let (next, value) = stored_value(plan, scope, session, value, ctx, trace).await?;
+            plan = next;
             result.push((name.value.clone(), value));
         }
     }
-    Ok(result)
+    Ok((plan, result))
+}
+
+async fn stored_value(
+    plan: LogicalPlanBuilder,
+    scope: &mut Bindings,
+    session: &SessionState,
+    value: &ast::Expr,
+    ctx: &SessionContext,
+    trace: &mut Trace,
+) -> Result<(LogicalPlanBuilder, Expr)> {
+    let (plan, mixed) =
+        super::native::fragment_boolean_ordered(plan, scope, session, value, ctx, trace).await?;
+    let expression = match mixed {
+        Some(value) => value,
+        None => Binder::with_bindings(session, plan.schema(), scope).bind(value)?,
+    };
+    Ok((plan, expression))
 }
 
 fn validate_insert_labels(expression: Option<&ast::LabelExpression>) -> Result<()> {
@@ -238,7 +258,10 @@ pub(super) async fn apply(
                         ast::Direction::Undirected => (left.column(ID), right.column(ID), false),
                         _ => return Err(super::unsupported("ambiguous INSERT edge direction")),
                     };
-                    let values = properties(edge.properties.as_ref(), session, &plan, scope)?;
+                    let (next, values) =
+                        properties(edge.properties.as_ref(), session, plan, scope, ctx, trace)
+                            .await?;
+                    plan = next;
                     let (next, _) = insert_element(
                         plan,
                         scope,
@@ -266,21 +289,27 @@ pub(super) async fn apply(
                 let (name, mut edit, values) = match item {
                     ast::SetItem::Property { target, value } => {
                         let (name, property) = property_target(target)?;
-                        let expr =
-                            Binder::with_bindings(session, plan.schema(), scope).bind(value)?;
+                        let (next, expr) =
+                            stored_value(plan, scope, session, value, ctx, trace).await?;
+                        plan = next;
                         (name, Edit::default(), vec![(property, expr)])
                     }
                     ast::SetItem::AllProperties {
                         variable,
                         properties: map,
-                    } => (
-                        variable.value.clone(),
-                        Edit {
-                            replace: true,
-                            ..Edit::default()
-                        },
-                        properties(Some(map), session, &plan, scope)?,
-                    ),
+                    } => {
+                        let (next, values) =
+                            properties(Some(map), session, plan, scope, ctx, trace).await?;
+                        plan = next;
+                        (
+                            variable.value.clone(),
+                            Edit {
+                                replace: true,
+                                ..Edit::default()
+                            },
+                            values,
+                        )
+                    }
                     ast::SetItem::Label { variable, label } => (
                         variable.value.clone(),
                         Edit {
@@ -423,7 +452,8 @@ async fn insert_node(
             return Ok((plan, binding));
         }
     }
-    let values = properties(node.properties.as_ref(), session, &plan, scope)?;
+    let (plan, values) =
+        properties(node.properties.as_ref(), session, plan, scope, ctx, trace).await?;
     insert_element(
         plan,
         scope,
