@@ -281,6 +281,9 @@
   longer makes the extreme a lexicographic value.
 - Allow `RETURN *` in a `NEXT` continuation to project the incoming working
   table. A nested query in that continuation still needs its own bindings.
+- Let a newly inserted destination read the edge that connects it. The edge can
+  still read both endpoints, and the affected-element count stays the number of
+  created elements.
 
 ## 0.2.0 — 2026-10-05
 
