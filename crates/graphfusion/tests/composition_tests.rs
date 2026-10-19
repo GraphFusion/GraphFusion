@@ -5502,3 +5502,168 @@ async fn scalar_family_provenance_tracks_nested_and_chosen_composite_rows() {
     let result=session.query("MATCH(d:Document {id:'absent'}) RETURN d.id AS x OTHERWISE MATCH(n:Person|Document) WHERE FALSE RETURN n.id AS x NEXT RETURN MIN(x) AS v").await.unwrap();
     assert_eq!(strings(&result), vec![vec!["NULL".to_owned()]]);
 }
+
+#[tokio::test]
+async fn grouping_keeps_mixed_property_families_apart() {
+    let mut session = social().await;
+    let grouped = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS id, COUNT(*) AS c GROUP BY id")
+        .await
+        .unwrap_err();
+    assert!(
+        grouped
+            .to_string()
+            .contains("GROUP BY cannot combine Int64 and Utf8"),
+        "{grouped}"
+    );
+    let implicit = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS id, COUNT(*) AS c")
+        .await
+        .unwrap_err();
+    assert!(
+        implicit
+            .to_string()
+            .contains("GROUP BY cannot combine Int64 and Utf8"),
+        "{implicit}"
+    );
+    let shadowed = session
+        .query("MATCH (n:Person|Document) RETURN n.id AS n, COUNT(*) AS c GROUP BY n")
+        .await
+        .unwrap_err();
+    assert!(
+        shadowed
+            .to_string()
+            .contains("GROUP BY cannot combine Int64 and Utf8"),
+        "{shadowed}"
+    );
+    let distinct_rows = session
+        .query("MATCH (n:Person|Document) RETURN DISTINCT n.id AS id")
+        .await
+        .unwrap_err();
+    assert!(
+        distinct_rows
+            .to_string()
+            .contains("DISTINCT cannot combine Int64 and Utf8"),
+        "{distinct_rows}"
+    );
+    let distinct_values = session
+        .query("MATCH (n:Person|Document) RETURN COUNT(DISTINCT n.id) AS c")
+        .await
+        .unwrap_err();
+    assert!(
+        distinct_values
+            .to_string()
+            .contains("DISTINCT cannot combine Int64 and Utf8"),
+        "{distinct_values}"
+    );
+
+    let numeric = session
+        .query(
+            "MATCH (n:Person|Metric) RETURN n.score AS score, COUNT(*) AS c GROUP BY score ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(numeric.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&numeric),
+        vec![
+            vec!["1".to_string(), "1".to_string()],
+            vec!["1.5".to_string(), "1".to_string()],
+            vec!["2".to_string(), "1".to_string()]
+        ]
+    );
+
+    let identities = session
+        .query("MATCH (n:Person|Document) RETURN COUNT(*) AS c GROUP BY n")
+        .await
+        .unwrap();
+    assert_eq!(strings(&identities), vec![vec!["1".to_string()]; 3]);
+
+    session
+        .run("INSERT (:Flag {v: true}), (:Note {v: 'true'})")
+        .await
+        .unwrap();
+    let flags = session
+        .query("MATCH (n:Flag|Note) RETURN DISTINCT n.v AS v")
+        .await
+        .unwrap_err();
+    assert!(
+        flags
+            .to_string()
+            .contains("DISTINCT cannot combine Boolean and Utf8"),
+        "{flags}"
+    );
+}
+
+mod mixed_group_regressions {
+    use graphfusion::Database;
+    async fn session() -> graphfusion::Session {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:T {v:'1'})")
+            .await
+            .unwrap();
+        s
+    }
+    #[tokio::test]
+    async fn mixed_family_provenance_is_checked_0() {
+        let mut s = session().await;
+        let r = s
+            .query("MATCH(n) LET r=n RETURN COUNT(DISTINCT r.v) AS c")
+            .await;
+        assert!(r.is_err(), "mixed families accepted: {r:?}");
+    }
+    #[tokio::test]
+    async fn mixed_family_provenance_is_checked_1() {
+        let mut s = session().await;
+        let r = s
+            .query("MATCH(n) RETURN DISTINCT COALESCE(n.v,NULL) AS v")
+            .await;
+        assert!(r.is_err(), "mixed families accepted: {r:?}");
+    }
+}
+
+#[tokio::test]
+async fn grouping_and_distinct_check_scalar_list_and_wildcard_aliases() {
+    let mut session = social().await;
+    for query in [
+        "MATCH(n:Person|Document) LET x=n.id RETURN COUNT(*) AS c GROUP BY x",
+        "MATCH(n:Person|Document) LET x=n.id RETURN COUNT(DISTINCT x) AS c",
+        "MATCH(n:Person|Document) LET x=n.id RETURN DISTINCT *",
+        "MATCH(n:Person|Document) LET x=[n.id] RETURN DISTINCT x",
+    ] {
+        let result = session.query(query).await;
+        assert!(
+            matches!(result, Err(graphfusion::Error::InvalidQuery(_))),
+            "{query}: {result:?}"
+        );
+    }
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN DISTINCT n")
+        .await
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    let result = session
+        .query("MATCH(n:Person|Metric) LET x=n.score RETURN DISTINCT x ORDER BY x")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![
+            vec!["1".to_owned()],
+            vec!["1.5".to_owned()],
+            vec!["2".to_owned()]
+        ]
+    );
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN n.id+0 AS v,COUNT(*) AS c GROUP BY v ORDER BY v")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![
+            vec!["1".to_owned(), "1".to_owned()],
+            vec!["2".to_owned(), "1".to_owned()],
+            vec!["NULL".to_owned(), "1".to_owned()]
+        ]
+    );
+}

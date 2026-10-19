@@ -522,6 +522,13 @@ impl<'a> Binder<'a> {
                         }
                     }
                 }
+                if *quantifier == Some(ast::SetQuantifier::Distinct) {
+                    if let Some(bindings) = self.bindings {
+                        for arg in args {
+                            ensure_one_family(bindings, arg, "DISTINCT")?;
+                        }
+                    }
+                }
                 let star = args.len() == 1 && matches!(args[0], E::Wildcard);
                 let bound = if star {
                     vec![]
