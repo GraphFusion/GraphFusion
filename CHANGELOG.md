@@ -94,6 +94,9 @@
   cannot represent exactly are rejected.
 - Keep the graph focus of the `OTHERWISE` branch that produced the rows, so a
   following `NEXT` does not stay on an earlier empty branch.
+- Treat a null property assignment as removal. `SET n.v = 1 + NULL` clears `v`
+  the same way `SET n.v = NULL` does, and does not leave a typed null that
+  blocks a later value of a different type.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

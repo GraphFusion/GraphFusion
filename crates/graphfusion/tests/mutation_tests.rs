@@ -277,6 +277,60 @@ async fn null_insert_expression_does_not_pin_property_type() {
 }
 
 #[tokio::test]
+async fn null_expression_removes_property_instead_of_pinning_its_type() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (:A {k: 1, v: 1})").await;
+    let result = run(
+        &mut s,
+        "MATCH (n) SET n.v = 1 + NULL RETURN PROPERTY_EXISTS(n, v) AS exists, n.v IS NULL AS missing",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["false", "true"]]);
+    let result = run(&mut s, "MATCH (n) SET n.v = 'hi' RETURN n.v AS v").await;
+    assert_eq!(rows(&result), vec![vec!["hi"]]);
+
+    run(&mut s, "MATCH (n) REMOVE n.v").await;
+    run(&mut s, "MATCH (n) SET n.w = 1.5 * NULL").await;
+    let result = run(&mut s, "MATCH (n) RETURN PROPERTY_EXISTS(n, w) AS exists").await;
+    assert_eq!(rows(&result), vec![vec!["false"]]);
+    let result = run(&mut s, "MATCH (n) SET n.w = TRUE RETURN n.w AS w").await;
+    assert_eq!(rows(&result), vec![vec!["true"]]);
+
+    run(&mut s, "MATCH (n) SET n.flag = NULL AND TRUE").await;
+    let result = run(
+        &mut s,
+        "MATCH (n) SET n.flag = 7 RETURN n.flag AS flag, PROPERTY_EXISTS(n, w) AS kept",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["7", "true"]]);
+
+    run(&mut s, "INSERT (:B {k: 2, v: 2})").await;
+    run(&mut s, "MATCH (n:B) SET n = {k: n.k, v: n.v + NULL}").await;
+    let result = run(
+        &mut s,
+        "MATCH (n:B) RETURN n.k AS k, PROPERTY_EXISTS(n, v) AS exists",
+    )
+    .await;
+    assert_eq!(rows(&result), vec![vec!["2", "false"]]);
+    let result = run(&mut s, "MATCH (n:B) SET n.v = 'x' RETURN n.v AS v").await;
+    assert_eq!(rows(&result), vec![vec!["x"]]);
+
+    // A non-null value in the same assignment still stores that type.
+    run(&mut s, "INSERT (:C {k: 3, src: 5}), (:C {k: 4})").await;
+    run(&mut s, "MATCH (n:C) SET n.v = n.src").await;
+    let result = run(
+        &mut s,
+        "MATCH (n:C) RETURN n.k AS k, n.v AS v, PROPERTY_EXISTS(n, v) AS exists ORDER BY k",
+    )
+    .await;
+    assert_eq!(
+        rows(&result),
+        vec![vec!["3", "5", "true"], vec!["4", "NULL", "false"]]
+    );
+}
+
+#[tokio::test]
 async fn delete_restrict_detach_and_explicit_edges_enforce_endpoints() {
     let db = Database::new();
     let mut s = session(&db);
@@ -897,4 +951,68 @@ async fn case_folded_property_names_keep_internal_fields_hidden_and_reject_dupli
     s.run("MATCH(n:N) SET n.AGE=2").await.unwrap();
     let r = s.query("MATCH(n:N) LET copy=n RETURN copy.aGe AS age,PROPERTY_EXISTS(copy,__GF_ID) AS hidden ORDER BY age").await.unwrap();
     assert_eq!(rows(&r), vec![vec!["2".to_string(), "false".to_string()]]);
+}
+
+#[tokio::test]
+async fn removing_the_last_value_releases_nullable_property_layouts() {
+    for durable in [false, true] {
+        for remove in ["MATCH(n:C {k:1}) REMOVE n.v", "MATCH(n:C {k:1}) DELETE n"] {
+            let dir = Durable::new();
+            let db = if durable { dir.open() } else { Database::new() };
+            let mut s = session(&db);
+            run(&mut s, "INSERT (:C {k:1,v:1}),(:C {k:2,v:2})").await;
+            run(&mut s, "MATCH(n:C) SET n.v=NULLIF(n.v,2)").await;
+            if durable {
+                db.checkpoint().unwrap();
+            }
+            let mut old = db.session();
+            old.execute("SESSION SET GRAPH g; START TRANSACTION READ ONLY")
+                .unwrap();
+            run(&mut s, remove).await;
+            run(&mut s, "MATCH(n:C {k:2}) SET n.v='x'").await;
+            assert_eq!(
+                rows(&s.query("MATCH(n:C {k:2}) RETURN n.v AS v").await.unwrap()),
+                vec![vec!["x"]]
+            );
+            assert_eq!(
+                rows(&old.query("MATCH(n:C {k:2}) RETURN n.v AS v").await.unwrap()),
+                vec![vec!["NULL"]]
+            );
+            old.execute("ROLLBACK").unwrap();
+            drop(old);
+            drop(s);
+            drop(db);
+            if durable {
+                let reopened = dir.open();
+                let mut reader = reopened.session();
+                reader.execute("SESSION SET GRAPH g").unwrap();
+                assert_eq!(
+                    rows(
+                        &reader
+                            .query("MATCH(n:C {k:2}) RETURN n.v AS v")
+                            .await
+                            .unwrap()
+                    ),
+                    vec![vec!["x"]]
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fragment_null_assignments_do_not_inherit_another_fragments_value_type() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (:I {v:1}),(:F {v:2.0})").await;
+    run(&mut s, "MATCH(n:I|F) SET n.v=NULLIF(n.v,1.0)").await;
+    run(&mut s, "MATCH(n:I) SET n.v='new'").await;
+    assert_eq!(
+        rows(&s.query("MATCH(n:I) RETURN n.v AS v").await.unwrap()),
+        vec![vec!["new"]]
+    );
+    assert_eq!(
+        rows(&s.query("MATCH(n:F) RETURN n.v AS v").await.unwrap()),
+        vec![vec!["2"]]
+    );
 }
