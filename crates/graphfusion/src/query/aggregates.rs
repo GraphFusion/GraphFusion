@@ -178,7 +178,7 @@ fn percentile(
     let count = cast(array_length(values.clone()), DataType::Float64);
     let fraction = percentile_fraction(cast(fraction, DataType::Float64));
     let result = if continuous {
-        let position = fraction.clone() * (count - lit(1.0_f64));
+        let position = snap_near_integer(fraction.clone() * (count - lit(1.0_f64)));
         let low = floor(position.clone());
         let high = ceil(position.clone());
         let weight = position - low.clone();
@@ -193,7 +193,7 @@ fn percentile(
         }
     } else {
         let rank = datafusion::functions::core::expr_fn::greatest(vec![
-            ceil(fraction.clone() * count),
+            ceil(snap_near_integer(fraction.clone() * count)),
             lit(1.0_f64),
         ]);
         array_element(values, cast(rank, DataType::Int64))
@@ -245,6 +245,69 @@ fn percentile_fraction(value: Expr) -> Expr {
         .clone()
     }
     udf().call(vec![value])
+}
+
+/// Collapse a floating-point percentile product onto an integer it already
+/// rounds to. Multiplication of a decimal fraction by an exact count is off by
+/// at most one ULP, which is enough for `ceil` to advance a whole rank.
+fn snap_near_integer(value: Expr) -> Expr {
+    use datafusion::{
+        arrow::array::Float64Array,
+        error::DataFusionError,
+        logical_expr::{create_udf, ColumnarValue, ScalarUDF, Volatility},
+    };
+    static UDF: std::sync::OnceLock<ScalarUDF> = std::sync::OnceLock::new();
+    UDF.get_or_init(|| {
+        create_udf(
+            "gql_percentile_snap",
+            vec![DataType::Float64],
+            DataType::Float64,
+            Volatility::Immutable,
+            std::sync::Arc::new(|args| {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let values = arrays[0]
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("expected Float64 percentile product".into())
+                    })?;
+                let snapped: Float64Array = values
+                    .iter()
+                    .map(|v| v.map(snap_near_integer_value))
+                    .collect();
+                let output: datafusion::arrow::array::ArrayRef = std::sync::Arc::new(snapped);
+                if args
+                    .iter()
+                    .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+                {
+                    Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                        &output, 0,
+                    )?))
+                } else {
+                    Ok(ColumnarValue::Array(output))
+                }
+            }),
+        )
+    })
+    .call(vec![value])
+}
+
+fn snap_near_integer_value(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let nearest = value.round();
+    // A small positive percentile is meaningful even below the first rank.
+    // Multiplication by a positive row count cannot round a nonzero rank to 0.
+    if nearest == 0.0 {
+        return value;
+    }
+    let scale = nearest.abs();
+    if (value - nearest).abs() <= scale * f64::EPSILON * 4.0 {
+        nearest
+    } else {
+        value
+    }
 }
 
 pub(super) fn result(
@@ -605,4 +668,23 @@ fn rebase(expr: Expr, mapping: &[(Expr, Column)]) -> Result<Expr> {
             other => other.into(),
         })?;
     Ok(transformed.data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snap_near_integer_value;
+
+    #[test]
+    fn percentile_product_within_an_ulp_snaps_to_that_integer() {
+        assert_eq!(snap_near_integer_value(0.28 * 25.0), 7.0);
+        assert_eq!(snap_near_integer_value(0.56 * 25.0), 14.0);
+        assert_eq!(snap_near_integer_value((15.0 / 22.0) * 22.0), 15.0);
+        for tiny in [1e-16, -1e-16, f64::from_bits(1)] {
+            assert_eq!(snap_near_integer_value(tiny).to_bits(), tiny.to_bits());
+        }
+        let between = 0.29 * 25.0;
+        assert_eq!(snap_near_integer_value(between), between);
+        assert_eq!(snap_near_integer_value(2.5), 2.5);
+        assert!(snap_near_integer_value(f64::NAN).is_nan());
+    }
 }

@@ -222,6 +222,10 @@
   quotient rounded to the nearest value, including inputs above 2^53.
 - Compute an integer STDDEV_POP or STDDEV_SAMP from the exact sum and sum of
   squares, then round once to Float64.
+- Snap a percentile rank product that floating-point rounding leaves within a
+  few ULPs of an integer, so `PERCENTILE_DISC` of 25 values at 0.28 returns the
+  7th value and a continuous fraction that lands on an order statistic returns
+  that observation.
 
 ## 0.2.0 — 2026-10-05
 

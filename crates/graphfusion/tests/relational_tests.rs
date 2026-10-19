@@ -968,6 +968,29 @@ async fn percentile_nulls_extremes_distinct_and_discrete_exact_values() {
         &[&["9007199254740993"]],
     )
     .await;
+    // 0.28 * 25 is 7.000000000000001 in f64; ceil used to select the 8th value.
+    let values = (1..=25)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    check(
+        &mut s,
+        &format!("FOR x IN [{values}] RETURN PERCENTILE_DISC(x, 0.28) AS d, PERCENTILE_DISC(x, 0.29) AS next"),
+        &[&["7", "8"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23] RETURN PERCENTILE_CONT(x, 15.0 / 22.0) AS c",
+        &[&["16"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [1, 2, 3, 4] RETURN PERCENTILE_CONT(x, 0.25) AS c, PERCENTILE_DISC(x, 0.5) AS d",
+        &[&["1.75", "2"]],
+    )
+    .await;
     for sql in [
         "RETURN PERCENTILE_DISC(1, -0.1) AS d",
         "RETURN PERCENTILE_CONT(1, '0.5') AS d",
@@ -1397,4 +1420,19 @@ async fn exact_integer_standard_deviation_rounds_midpoints_and_reuses_aggregates
     .await;
     check(&mut session,"FOR x IN [0,18014398509481990] RETURN DISTINCT STDDEV_POP(x) AS value ORDER BY STDDEV_POP(x)",&[&["9007199254740996"]]).await;
     check(&mut session,"FOR x IN [0,0,18014398509481990] RETURN DISTINCT STDDEV_POP(DISTINCT x) AS value ORDER BY STDDEV_POP(DISTINCT x)",&[&["9007199254740996"]]).await;
+}
+
+#[tokio::test]
+async fn tiny_positive_percentiles_keep_their_weight_and_repeated_ordering() {
+    let mut session = fixture().await;
+    for query in [
+        "FOR x IN [0,1000000000000000000] RETURN PERCENTILE_CONT(x,1e-16) AS value",
+        "FOR x IN [0.0,1e18] RETURN PERCENTILE_CONT(x,1e-16) AS value",
+    ] {
+        check(&mut session, query, &[&["100"]]).await;
+    }
+    for query in [
+        "FOR x IN [0,1,2] RETURN DISTINCT PERCENTILE_CONT(x,0.5) AS p ORDER BY PERCENTILE_CONT(x,0.5)",
+        "FOR x IN [0,1,2] RETURN DISTINCT PERCENTILE_DISC(x,0.5) AS p ORDER BY PERCENTILE_DISC(x,0.5)",
+    ] { check(&mut session,query,&[&["1"]]).await; }
 }
