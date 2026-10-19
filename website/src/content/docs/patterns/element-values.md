@@ -27,6 +27,15 @@ LET person = p
 RETURN DISTINCT person.name AS name ORDER BY person.name;
 ```
 
+The same element value can be repeated in `ORDER BY`. This returns Alice, Bob, then Cara, one row each:
+
+```gql test
+MATCH (p:Person)
+RETURN DISTINCT p AS person, p.name AS name ORDER BY p;
+```
+
+`ELEMENTS(path)` follows the same rule when the call itself is repeated.
+
 The engine resolves references through DataFusion joins against the statement's graph snapshot. A reference does not turn into a detached copy of its properties. Updates refresh aliases before later expressions; a scalar captured earlier with LET keeps its already computed value.
 
 Deleted identities cannot be dereferenced later in the same statement. Null references behave as nulls. Driver encoding is described in [Arrow results](/rust/results/); it is not a supported way to manufacture persistent reference parameters from arbitrary client structs.
