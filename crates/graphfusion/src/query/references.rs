@@ -116,9 +116,17 @@ pub(super) fn result_sources(body: &ast::QueryBody, scope: &Bindings) -> Referen
     result
 }
 
-/// A composite result can reuse a layout only when every branch agrees.
-pub(super) fn retain_common_sources(left: &mut ReferenceSources, right: &ReferenceSources) {
+/// A composite result can reuse a layout when every non-null branch agrees.
+pub(super) fn retain_common_sources(
+    left: &mut ReferenceSources,
+    right: &ReferenceSources,
+    left_domains: &std::collections::BTreeMap<String, Domain>,
+    right_domains: &std::collections::BTreeMap<String, Domain>,
+) {
     left.retain(|name, source| {
+        if right_domains.get(name).is_some_and(Domain::is_empty) {
+            return true;
+        }
         right.get(name).is_some_and(|other| {
             source.graph == other.graph
                 && source.kind == other.kind
@@ -128,6 +136,12 @@ pub(super) fn retain_common_sources(left: &mut ReferenceSources, right: &Referen
                 && source.tombstones == other.tombstones
         })
     });
+    // A literal NULL contributes no element layouts to the result.
+    for (name, source) in right {
+        if left_domains.get(name).is_some_and(Domain::is_empty) {
+            left.insert(name.clone(), source.clone());
+        }
+    }
 }
 
 #[derive(Clone)]

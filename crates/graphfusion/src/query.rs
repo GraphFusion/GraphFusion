@@ -339,6 +339,11 @@ async fn plan(
         .set_operations
         .iter()
         .any(|op| op.operator == ast::QuerySetOperator::Otherwise);
+    // A trailing ORDER BY, OFFSET, or LIMIT belongs to the combined rows. The
+    // parser stores it on the last branch, which would page that branch alone.
+    let trailing_page = query.set_operations.last().filter(|op| {
+        !op.body.order_by.is_empty() || op.body.offset.is_some() || op.body.limit.is_some()
+    });
     if otherwise {
         // Bind every branch before execution. Empty barrier results retain their schema,
         // so a cold branch is checked without evaluating any of its expressions.
@@ -356,9 +361,12 @@ async fn plan(
             clone_working(&incoming),
         )
         .await?;
-        for op in &query.set_operations {
+        let mut checked_domains = validation.output_domains.clone();
+        let mut checked_sources = validation.output_reference_sources.clone();
+        for (index, op) in query.set_operations.iter().enumerate() {
+            let body = without_trailing_page(query, index, &op.body);
             let (right, _) = plan_body(
-                &op.body,
+                &body,
                 &context,
                 tx,
                 ctx,
@@ -367,18 +375,33 @@ async fn plan(
                 clone_working(&incoming),
             )
             .await?;
+            merge_result_metadata(&mut checked_domains, &mut checked_sources, &validation);
             checked =
                 relational::set_operation(checked, right, ast::QuerySetOperator::Union, true)?;
         }
+        validation.output_domains = checked_domains;
+        validation.output_reference_sources = checked_sources;
         let schema = checked.schema().clone();
         if trace.validate_only {
+            let checked =
+                apply_trailing_page(checked, &context, trailing_page, ctx, &mut validation).await?;
+            trace.sources.extend(validation.sources);
+            trace.output_domains = validation.output_domains;
+            trace.output_reference_sources = validation.output_reference_sources;
             return Ok((checked, graph));
         }
-        for (body, context) in std::iter::once((&query.body, &first_context))
+        for (index, (body, context)) in std::iter::once((&query.body, &first_context))
             .chain(query.set_operations.iter().map(|op| (&op.body, &context)))
+            .enumerate()
         {
+            // Index 0 is the leading query. Later indexes are set-operation branches.
+            let body = if index == 0 {
+                std::borrow::Cow::Borrowed(body)
+            } else {
+                without_trailing_page(query, index - 1, body)
+            };
             let (branch, branch_graph) = plan_body(
-                body,
+                &body,
                 context,
                 tx,
                 ctx,
@@ -390,13 +413,17 @@ async fn plan(
             let branch = relational::coerce(branch, &schema)?;
             let (schema, batches) = trace.collect(ctx, &branch).await?;
             if batches.iter().any(|b| b.num_rows() > 0) {
-                // Keep the graph focus of the branch that produced the rows.
-                // An empty earlier branch must not leave NEXT on its graph.
-                return Ok((execution::memory(schema, batches)?.build()?, branch_graph));
+                let chosen = execution::memory(schema, batches)?.build()?;
+                return Ok((
+                    apply_trailing_page(chosen, context, trailing_page, ctx, trace).await?,
+                    branch_graph,
+                ));
             }
         }
+        let empty =
+            execution::memory(std::sync::Arc::new(schema.as_arrow().clone()), vec![])?.build()?;
         return Ok((
-            execution::memory(std::sync::Arc::new(schema.as_arrow().clone()), vec![])?.build()?,
+            apply_trailing_page(empty, &context, trailing_page, ctx, trace).await?,
             graph,
         ));
     }
@@ -412,9 +439,10 @@ async fn plan(
     .await?;
     let mut domains = trace.output_domains.clone();
     let mut reference_sources = trace.output_reference_sources.clone();
-    for op in &query.set_operations {
+    for (index, op) in query.set_operations.iter().enumerate() {
+        let body = without_trailing_page(query, index, &op.body);
         let (right, _) = plan_body(
-            &op.body,
+            &body,
             &context,
             tx,
             ctx,
@@ -424,18 +452,7 @@ async fn plan(
         )
         .await?;
         if op.operator == ast::QuerySetOperator::Union {
-            domains.retain(|name, domain| {
-                if let Some(right) = trace.output_domains.get(name) {
-                    domain.extend(right.iter().copied());
-                    true
-                } else {
-                    false
-                }
-            });
-            references::retain_common_sources(
-                &mut reference_sources,
-                &trace.output_reference_sources,
-            );
+            merge_result_metadata(&mut domains, &mut reference_sources, trace);
         }
         result = relational::set_operation(
             result,
@@ -446,7 +463,91 @@ async fn plan(
     }
     trace.output_domains = domains;
     trace.output_reference_sources = reference_sources;
-    Ok((result, graph))
+    Ok((
+        apply_trailing_page(result, &context, trailing_page, ctx, trace).await?,
+        graph,
+    ))
+}
+
+fn merge_result_metadata(
+    domains: &mut BTreeMap<String, references::Domain>,
+    sources: &mut references::ReferenceSources,
+    right: &execution::Trace,
+) {
+    references::retain_common_sources(
+        sources,
+        &right.output_reference_sources,
+        domains,
+        &right.output_domains,
+    );
+    domains.retain(|name, domain| {
+        if let Some(right) = right.output_domains.get(name) {
+            domain.extend(right.iter().copied());
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn without_trailing_page<'a>(
+    query: &ast::QueryStatement,
+    set_index: usize,
+    body: &'a ast::QueryBody,
+) -> std::borrow::Cow<'a, ast::QueryBody> {
+    if set_index + 1 != query.set_operations.len()
+        || (body.order_by.is_empty() && body.offset.is_none() && body.limit.is_none())
+    {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut body = body.clone();
+    body.order_by.clear();
+    body.offset = None;
+    body.limit = None;
+    std::borrow::Cow::Owned(body)
+}
+
+async fn apply_trailing_page(
+    plan: LogicalPlan,
+    session: &SessionState,
+    trailing: Option<&ast::QuerySetOperation>,
+    ctx: &SessionContext,
+    trace: &mut execution::Trace,
+) -> Result<LogicalPlan> {
+    let Some(trailing) = trailing else {
+        return Ok(plan);
+    };
+    if trailing.body.order_by.is_empty() {
+        return Ok(order_and_page(
+            LogicalPlanBuilder::from(plan),
+            session,
+            &[],
+            trailing.body.offset.as_ref(),
+            trailing.body.limit.as_ref(),
+            None,
+        )?
+        .build()?);
+    }
+    let columns = plan.schema().columns();
+    let mut scope = graph::Bindings::default();
+    for column in &columns {
+        scope.scalars.insert(column.name.clone(), column.clone());
+        scope.order.push(column.name.clone());
+    }
+    scope.sources = trace.sources.clone();
+    scope.domains = trace.output_domains.clone();
+    scope.reference_sources = trace.output_reference_sources.clone();
+    let plan = references::prepare(LogicalPlanBuilder::from(plan), &mut scope, ctx, trace).await?;
+    Ok(order_and_page(
+        plan,
+        session,
+        &trailing.body.order_by,
+        trailing.body.offset.as_ref(),
+        trailing.body.limit.as_ref(),
+        Some(&scope),
+    )?
+    .project(columns.into_iter().map(Expr::Column))?
+    .build()?)
 }
 
 pub(crate) fn has_mutations(query: &ast::QueryStatement) -> bool {

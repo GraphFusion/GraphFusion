@@ -38,6 +38,8 @@ RETURN DISTINCT n AS k, AVG(n) AS average ORDER BY AVG(n) DESC;
 
 This returns 2/2.0 then 1/1.0. Sums, minimums, maximums, standard deviations and percentiles follow the same rule.
 
+After `UNION`, `INTERSECT`, `EXCEPT`, or `OTHERWISE`, a trailing `ORDER BY` sorts the combined rows.
+
 ORDER BY can also appear in the linear pipeline before the result clause. A later operation can affect row order; put the final ORDER BY with the result when ordering matters to the caller.
 
 An earlier `LIMIT` or `OFFSET` selects its window before a later `ORDER BY`. That later sort reorders only the selected rows.

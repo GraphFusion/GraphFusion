@@ -696,6 +696,22 @@ impl Compiler<'_> {
                 .keys()
                 .any(|name| !scope.elements.contains_key(name) && depends_on(&expr, name));
             if expr_is_ready(&expr, scope) && !unrebound {
+                let enforced = if self.clause_push {
+                    super::native::clause_filters(self.session, plan.schema(), scope, &expr)?
+                        .is_some_and(|filters| {
+                            !filters.is_empty()
+                                && filters.keys().all(|name| {
+                                    self.clause_hit.contains(name)
+                                        && !scope.conditional.contains(name)
+                                        && !scope.groups.contains(name)
+                                })
+                        })
+                } else {
+                    false
+                };
+                if enforced {
+                    continue;
+                }
                 if let Some(filtered) =
                     super::native::fragment_predicate(plan.clone(), scope, self.session, &expr)?
                 {
