@@ -11,7 +11,7 @@ A linear query passes its result binding table to the next statement. `NEXT` kee
 RETURN 1 AS n, 2 AS m NEXT YIELD n AS kept RETURN kept * 3 AS value;
 ```
 
-`FILTER`, `MATCH`, `LET` and `RETURN` in the continuation read those columns. The current graph carries from one statement in the chain to the next. Semicolon-separated statements stay independent.
+`FILTER`, `MATCH`, `LET` and `RETURN` in the continuation read those columns. An element reference stays attached to its graph, so the continuation can read its properties and labels or match through it. A null reference stays null. The current graph carries from one statement in the chain to the next. Semicolon-separated statements stay independent.
 
 ```gql test
 MATCH (p:Person) RETURN p.name AS name NEXT FILTER name = 'Alice' RETURN name;

@@ -184,16 +184,23 @@ async fn drive_chain(
     }
     let mut carried_graph = session.current_graph;
     let mut carried_domains = BTreeMap::new();
+    let mut carried_sources = BTreeMap::new();
     let mut working = None;
     let last = chain.len() - 1;
     for (index, (yield_clause, query)) in chain.iter().enumerate() {
         let mut step = session.clone();
         step.current_graph = carried_graph;
         let incoming = if let Some(plan) = working.take() {
-            let plan = apply_yield(plan, yield_clause.as_ref(), &mut carried_domains)?;
+            let plan = apply_yield(
+                plan,
+                yield_clause.as_ref(),
+                &mut carried_domains,
+                &mut carried_sources,
+            )?;
             Some(WorkingTable {
                 plan,
                 domains: carried_domains.clone(),
+                reference_sources: carried_sources.clone(),
             })
         } else if yield_clause.is_some() {
             return Err(Error::InvalidQuery(
@@ -206,6 +213,7 @@ async fn drive_chain(
             plan(query, &step, tx, ctx, writes, trace, allow_writes, incoming).await?;
         carried_graph = graph.or(carried_graph);
         carried_domains = trace.output_domains.clone();
+        carried_sources = trace.output_reference_sources.clone();
         if index == last {
             return Ok(plan);
         }
@@ -219,6 +227,7 @@ fn apply_yield(
     plan: LogicalPlan,
     yield_clause: Option<&ast::YieldClause>,
     domains: &mut BTreeMap<String, references::Domain>,
+    reference_sources: &mut references::ReferenceSources,
 ) -> Result<LogicalPlan> {
     let Some(yield_clause) = yield_clause else {
         return Ok(plan);
@@ -267,6 +276,14 @@ fn apply_yield(
             next_domains.insert(output.clone(), domain.clone());
         }
     }
+    *reference_sources = renamed
+        .iter()
+        .filter_map(|(output, source)| {
+            reference_sources
+                .get(source)
+                .map(|binding| (output.clone(), binding.clone()))
+        })
+        .collect();
     *domains = next_domains;
     Ok(LogicalPlanBuilder::from(plan)
         .project(projections)?
@@ -280,12 +297,14 @@ fn unsupported(feature: &str) -> Error {
 struct WorkingTable {
     plan: LogicalPlan,
     domains: BTreeMap<String, references::Domain>,
+    reference_sources: references::ReferenceSources,
 }
 
 fn clone_working(table: &Option<WorkingTable>) -> Option<WorkingTable> {
     table.as_ref().map(|table| WorkingTable {
         plan: table.plan.clone(),
         domains: table.domains.clone(),
+        reference_sources: table.reference_sources.clone(),
     })
 }
 
@@ -390,6 +409,7 @@ async fn plan(
     )
     .await?;
     let mut domains = trace.output_domains.clone();
+    let mut reference_sources = trace.output_reference_sources.clone();
     for op in &query.set_operations {
         let (right, _) = plan_body(
             &op.body,
@@ -409,6 +429,7 @@ async fn plan(
                 false
             }
         });
+        references::retain_common_sources(&mut reference_sources, &trace.output_reference_sources);
         result = relational::set_operation(
             result,
             right,
@@ -417,6 +438,7 @@ async fn plan(
         )?;
     }
     trace.output_domains = domains;
+    trace.output_reference_sources = reference_sources;
     Ok((result, graph))
 }
 
@@ -461,6 +483,23 @@ async fn plan_body(
             scope.order.push(name);
         }
         scope.domains = incoming.domains;
+        scope.reference_sources = incoming.reference_sources;
+        // NEXT materializes the working table, so the next statement no longer
+        // has the previous MATCH bindings. Element references still name rows
+        // in the graphs that statement read or wrote; without those snapshots
+        // a live element looks deleted.
+        scope.sources.extend(trace.sources.clone());
+        let mut missing = Vec::new();
+        for domain in scope.domains.values() {
+            for (id, _) in domain {
+                if !scope.sources.contains_key(id) && !missing.contains(id) {
+                    missing.push(*id);
+                }
+            }
+        }
+        for id in missing {
+            scope.sources.insert(id, writes.data(tx, id)?);
+        }
         references::prepare(plan, &mut scope, ctx, trace).await?
     } else {
         LogicalPlanBuilder::empty(true)
@@ -684,11 +723,13 @@ async fn plan_body(
     }
     if body.result_clause.kind == ast::ResultKind::Finish {
         trace.output_domains.clear();
+        trace.output_reference_sources.clear();
         trace.collect(ctx, &plan.build()?).await?;
         return Ok((LogicalPlanBuilder::empty(false).build()?, current_graph));
     }
     trace.sources.extend(scope.sources.clone());
     trace.output_domains = references::result_domains(body, &scope);
+    trace.output_reference_sources = references::result_sources(body, &scope);
     if let Some(predicate) = &body.select_where {
         let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
         plan = plan.filter(expr)?;

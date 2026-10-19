@@ -20,6 +20,7 @@ pub(super) struct Trace {
     pub validate_only: bool,
     pub sources: std::collections::BTreeMap<crate::catalog::ObjectId, Arc<crate::graph::GraphData>>,
     pub output_domains: std::collections::BTreeMap<String, super::references::Domain>,
+    pub output_reference_sources: super::references::ReferenceSources,
 }
 impl Trace {
     pub async fn collect(
