@@ -615,6 +615,30 @@ async fn otherwise_uses_first_nonempty_branch_and_skips_cold_runtime_errors() {
 }
 
 #[tokio::test]
+async fn otherwise_keeps_the_graph_of_the_branch_that_produced_rows() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g1 ANY; CREATE GRAPH g2 ANY; SESSION SET GRAPH g1; INSERT (:N {name:'one'}); SESSION SET GRAPH g2; INSERT (:N {name:'two'})").await.unwrap();
+    check(
+        &mut s,
+        "USE g1 MATCH (n) WHERE n.name = 'zzz' RETURN n.name AS name OTHERWISE USE g2 MATCH (n) RETURN n.name AS name NEXT MATCH (m) RETURN name AS prev, m.name AS m",
+        &[&["two", "two"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "USE g1 MATCH (n) RETURN n.name AS name OTHERWISE USE g2 MATCH (n) RETURN n.name AS name NEXT MATCH (m) RETURN name AS prev, m.name AS m",
+        &[&["one", "one"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "USE g1 MATCH (n) WHERE n.name = 'zzz' RETURN 'fallback' AS name OTHERWISE USE g2 RETURN 'from2' AS name NEXT MATCH (m) RETURN name AS prev, m.name AS m",
+        &[&["from2", "two"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn select_from_graphs_and_derived_composites() {
     let mut s = fixture().await;
     check(
@@ -1093,4 +1117,19 @@ async fn later_order_by_sorts_only_the_earlier_page() {
         &[&["2"], &["3"]],
     )
     .await;
+}
+
+#[tokio::test]
+async fn otherwise_unset_focus_does_not_inherit_an_empty_branch_graph() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g1 ANY; USE GRAPH g1 INSERT (:N {name:'one'}); SESSION RESET GRAPH")
+        .await
+        .unwrap();
+    assert!(s.query("MATCH (n) RETURN COUNT(*) AS c").await.is_err());
+    let error = s.query("USE g1 FILTER FALSE RETURN 0 AS v OTHERWISE RETURN 1 AS v NEXT MATCH (m) RETURN m.name AS name")
+        .await.expect_err("empty branch graph leaked into the continuation");
+    assert!(
+        error.to_string().contains("current graph is unset"),
+        "{error}"
+    );
 }
