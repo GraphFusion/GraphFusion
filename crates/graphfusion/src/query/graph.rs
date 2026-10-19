@@ -509,9 +509,18 @@ pub(super) fn predicates_for(
         }
     }
     if let Some(predicate) = predicate.filter(|_| !native.pushed_where) {
-        let expression =
-            Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
-        plan = plan.filter(expression)?;
+        // Auxiliary fragment columns are projected away by fragment_predicate,
+        // so this local allocation does not change the caller's bindings.
+        let mut fragments = scope.clone();
+        if let Some(filtered) =
+            super::native::fragment_predicate(plan.clone(), &mut fragments, session, predicate)?
+        {
+            plan = filtered;
+        } else {
+            let expression =
+                Binder::with_bindings(session, plan.schema(), scope).predicate(predicate)?;
+            plan = plan.filter(expression)?;
+        }
     }
     Ok(plan)
 }

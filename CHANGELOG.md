@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Compare a mixed property with a working-table value on each fragment's stored
+  type. `WHERE n.id = k` no longer fails when `k` is bound, and a string value
+  does not match a stringified integer.
 - Keep boolean literals on a per-fragment comparison. `WHERE n.id = 1 OR FALSE`
   no longer fails after a multi-type scan, and `OR TRUE` keeps a row whose
   stored value cannot be compared.
