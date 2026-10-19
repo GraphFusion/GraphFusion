@@ -600,6 +600,42 @@ fn float_at(result: &QueryResult, row: usize, column: usize) -> f64 {
 }
 
 #[tokio::test]
+async fn distinct_standard_deviation_ignores_repeated_numbers() {
+    let mut s = Database::new().session();
+    check(
+        &mut s,
+        "FOR x IN [1, 2, 2, 1] RETURN STDDEV_POP(DISTINCT x) AS p, STDDEV_SAMP(DISTINCT x) AS s, STDDEV_POP(ALL x) AS all_p",
+        &[&["0.5", "0.7071067811865476", "0.5"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [10, 30, 20, 10, NULL] RETURN STDDEV_POP(DISTINCT x) AS p, STDDEV_SAMP(DISTINCT x) AS s",
+        &[&["8.16496580927726", "10"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [4, 4, NULL] RETURN STDDEV_POP(DISTINCT x) AS p, STDDEV_SAMP(DISTINCT x) AS s",
+        &[&["0", "NULL"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR x IN [NULL, NULL] RETURN STDDEV_POP(DISTINCT x) AS p, STDDEV_SAMP(DISTINCT x) AS s",
+        &[&["NULL", "NULL"]],
+    )
+    .await;
+    s.run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {k:'a', v:1}), (:N {k:'a', v:1}), (:N {k:'a', v:3}), (:N {k:'b', v:10}), (:N {k:'b', v:20}), (:N {k:'b', v:30}), (:N {k:'b', v:10})").await.unwrap();
+    check(
+        &mut s,
+        "MATCH (n) RETURN n.k AS k, STDDEV_POP(DISTINCT n.v) AS p GROUP BY k ORDER BY k",
+        &[&["a", "1"], &["b", "8.16496580927726"]],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn composite_all_counts_each_null_and_duplicate_occurrence() {
     let mut s = Database::new().session();
     for (op, expected) in [
@@ -1464,4 +1500,31 @@ async fn percentile_rank_keeps_a_legitimate_offset_above_an_integer() {
         &[&["8"]],
     )
     .await;
+}
+
+#[tokio::test]
+async fn distinct_deviation_keeps_exact_integers_and_repeated_float_expressions() {
+    let mut session = fixture().await;
+    for query in [
+        "FOR x IN [9007199254740992,9007199254740993] RETURN STDDEV_SAMP(DISTINCT x) AS value",
+        "FOR x IN [9007199254740992,9007199254740992,9007199254740993] RETURN DISTINCT STDDEV_SAMP(DISTINCT x) AS value ORDER BY STDDEV_SAMP(DISTINCT x)",
+    ] { check(&mut session,query,&[&["0.7071067811865476"]]).await; }
+    for query in [
+        "FOR x IN [1e16,1e16+2.0,1e16] RETURN DISTINCT STDDEV_POP(DISTINCT x) AS value ORDER BY STDDEV_POP(DISTINCT x)",
+        "FOR x IN [0.0,2.0,0.0] RETURN DISTINCT STDDEV_POP(DISTINCT x) AS value ORDER BY STDDEV_POP(DISTINCT x)",
+    ] { check(&mut session,query,&[&["1"]]).await; }
+    let result = query(
+        &mut session,
+        "FOR x IN [-1e308,1e308] RETURN STDDEV_POP(DISTINCT x) AS value",
+    )
+    .await;
+    assert_eq!(
+        result.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap()
+            .value(0),
+        1e308
+    );
 }

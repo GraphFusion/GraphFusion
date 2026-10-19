@@ -225,6 +225,9 @@
 - Correct exact decimal integer percentile ranks without discarding nearby
   fractional weights, so `PERCENTILE_DISC` of 25 values at 0.28 returns the
   7th value while nearby fractions retain their interpolation weight.
+- Compute `STDDEV_POP(DISTINCT)` and `STDDEV_SAMP(DISTINCT)` from each distinct
+  number. Repeated inputs do not change the deviation; one distinct value has
+  population deviation 0 and a null sample deviation.
 
 ## 0.2.0 — 2026-10-05
 
