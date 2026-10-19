@@ -107,6 +107,35 @@ impl Fixture {
 }
 
 #[test]
+fn null_cells_and_list_elements_stay_distinct() {
+    let fixture = Fixture::new();
+    let output = fixture.interactive(
+        &[
+            "run",
+            "--query",
+            "RETURN [NULL] AS absent, [] AS empty, [1, NULL] AS mixed, NULL AS cell, '' AS blank",
+        ],
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        "\
++--------+-------+-----------+------+-------+
+| absent | empty | mixed     | cell | blank |
++--------+-------+-----------+------+-------+
+| [NULL] | []    | [1, NULL] | NULL |       |
++--------+-------+-----------+------+-------+
+"
+    );
+}
+
+#[test]
 fn run_dump_ast_accepts_queries_and_files_without_executing() {
     let fixture = Fixture::new();
     let input =

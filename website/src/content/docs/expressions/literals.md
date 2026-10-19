@@ -12,7 +12,7 @@ RETURN 1_000 AS count, 0xFF AS hex, 0o755 AS octal,
        0b1010 AS binary, .5 AS fraction, 1. AS decimal;
 ```
 
-Integer literals use Int64 and approximate values use Float64 in query execution. `M`, `F` and `D` suffixes are parsed, but an `M` literal is not an exact-decimal runtime value: decimal literals are currently represented as f64.
+Integer literals use Int64 and approximate values use Float64 in query execution. `M`, `F` and `D` suffixes are parsed, but an `M` literal is not an exact-decimal runtime value: decimal literals are currently represented as f64. A decimal literal must be finite: `1e308` is accepted, and an overflow such as `1e999` is a bad number rather than the value infinity.
 
 Character strings support backslash escapes, newline-separated chunks and no-escape literal forms. Use single quotes for strings in examples to avoid ambiguity with delimited names.
 
