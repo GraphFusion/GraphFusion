@@ -1113,3 +1113,237 @@ fn apply_order(op: Operator, order: Option<std::cmp::Ordering>) -> bool {
         _ => false,
     }
 }
+
+/// `NULLIF` for an Int64/Float64 pair. Equality uses the integer's exact value,
+/// and the result keeps the left operand's original type.
+pub(super) fn exact_nullif(
+    left: Expr,
+    right: Expr,
+    left_type: &DataType,
+    right_type: &DataType,
+) -> Option<Expr> {
+    let return_type = match (left_type, right_type) {
+        (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64) => {
+            left_type.clone()
+        }
+        _ => return None,
+    };
+    let integer_on_left = return_type == DataType::Int64;
+    Some(exact_nullif_udf(integer_on_left).call(vec![left, right]))
+}
+fn exact_nullif_udf(integer_on_left: bool) -> ScalarUDF {
+    use std::sync::OnceLock;
+    static FUNCTIONS: OnceLock<[ScalarUDF; 2]> = OnceLock::new();
+    FUNCTIONS.get_or_init(|| [exact_nullif_udf_new(false), exact_nullif_udf_new(true)])
+        [usize::from(integer_on_left)]
+    .clone()
+}
+fn exact_nullif_udf_new(integer_on_left: bool) -> ScalarUDF {
+    let (left_type, right_type) = if integer_on_left {
+        (DataType::Int64, DataType::Float64)
+    } else {
+        (DataType::Float64, DataType::Int64)
+    };
+    create_udf(
+        if integer_on_left {
+            "gql_exact_nullif_int_float"
+        } else {
+            "gql_exact_nullif_float_int"
+        },
+        vec![left_type.clone(), right_type],
+        left_type,
+        Volatility::Immutable,
+        Arc::new(move |args| {
+            let arrays = ColumnarValue::values_to_arrays(args)?;
+            let output: datafusion::arrow::array::ArrayRef = if integer_on_left {
+                Arc::new(nullif_int_float(
+                    int64_array(&arrays[0])?,
+                    float64_array(&arrays[1])?,
+                ))
+            } else {
+                Arc::new(nullif_float_int(
+                    float64_array(&arrays[0])?,
+                    int64_array(&arrays[1])?,
+                ))
+            };
+            columnar_result(args, output)
+        }),
+    )
+}
+fn nullif_int_float(
+    integers: &datafusion::arrow::array::Int64Array,
+    floats: &datafusion::arrow::array::Float64Array,
+) -> datafusion::arrow::array::Int64Array {
+    (0..integers.len())
+        .map(|row| {
+            if integers.is_null(row) {
+                return None;
+            }
+            let value = integers.value(row);
+            if !floats.is_null(row) && i64_eq_f64(value, floats.value(row)) {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .collect()
+}
+
+fn nullif_float_int(
+    floats: &datafusion::arrow::array::Float64Array,
+    integers: &datafusion::arrow::array::Int64Array,
+) -> datafusion::arrow::array::Float64Array {
+    (0..floats.len())
+        .map(|row| {
+            if floats.is_null(row) {
+                return None;
+            }
+            let value = floats.value(row);
+            if !integers.is_null(row) && i64_eq_f64(integers.value(row), value) {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .collect()
+}
+
+fn int64_array(
+    array: &datafusion::arrow::array::ArrayRef,
+) -> Result<&datafusion::arrow::array::Int64Array, DataFusionError> {
+    array
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| DataFusionError::Internal("expected Int64 NULLIF operand".into()))
+}
+
+fn float64_array(
+    array: &datafusion::arrow::array::ArrayRef,
+) -> Result<&datafusion::arrow::array::Float64Array, DataFusionError> {
+    array
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| DataFusionError::Internal("expected Float64 NULLIF operand".into()))
+}
+
+fn columnar_result(
+    args: &[ColumnarValue],
+    output: datafusion::arrow::array::ArrayRef,
+) -> Result<ColumnarValue, DataFusionError> {
+    if args
+        .iter()
+        .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+    {
+        Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+            &output, 0,
+        )?))
+    } else {
+        Ok(ColumnarValue::Array(output))
+    }
+}
+
+/// `Some` only when `integer` is an exact `f64`. `i64::MIN` is exact; `i64::MAX` is not.
+fn exact_i64_f64(integer: i64) -> Option<f64> {
+    let as_float = integer as f64;
+    // Values that round to 2^63 saturate when cast back to i64, so a round trip
+    // alone would accept integers that float cannot store.
+    if as_float < 9223372036854775808.0 && as_float as i64 == integer {
+        Some(as_float)
+    } else {
+        None
+    }
+}
+
+fn i64_eq_f64(integer: i64, float: f64) -> bool {
+    cmp_i64_f64(integer, float) == Some(Ordering::Equal)
+}
+
+pub(super) fn exact_float(value: Expr) -> Expr {
+    use std::sync::OnceLock;
+    static FUNCTION: OnceLock<ScalarUDF> = OnceLock::new();
+    FUNCTION
+        .get_or_init(|| {
+            create_udf(
+                "gql_exact_int_to_float",
+                vec![DataType::Int64],
+                DataType::Float64,
+                Volatility::Immutable,
+                Arc::new(|args| {
+                    let arrays = ColumnarValue::values_to_arrays(args)?;
+                    let values = int64_array(&arrays[0])?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .map(|value| {
+                                    exact_i64_f64(value).ok_or_else(|| {
+                                        DataFusionError::Execution(format!(
+                                            "integer {value} is not exactly representable as float"
+                                        ))
+                                    })
+                                })
+                                .transpose()
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    columnar_result(args, Arc::new(Float64Array::from(values)))
+                }),
+            )
+        })
+        .call(vec![value])
+}
+
+/// CASE evaluates each fallback only on the rows that still need it. Integer
+/// conversion belongs inside the selected arm, preserving exactness and laziness.
+pub(super) fn lazy_coalesce(
+    args: Vec<Expr>,
+    types: &[DataType],
+    return_type: DataType,
+) -> Result<Expr, DataFusionError> {
+    use datafusion::logical_expr::{cast, expr::Case, lit};
+    let boolean = return_type == DataType::Boolean;
+    let flag_type = if boolean {
+        DataType::Int64
+    } else {
+        return_type.clone()
+    };
+    let mut result = lit(ScalarValue::try_from(&flag_type)?);
+    for (arg, ty) in args.into_iter().zip(types).rev() {
+        let value = if return_type == DataType::Float64 && *ty == DataType::Int64 {
+            exact_float(arg.clone())
+        } else if *ty != return_type {
+            cast(arg.clone(), return_type.clone())
+        } else {
+            arg.clone()
+        };
+        let value = if boolean {
+            cast(value, DataType::Int64)
+        } else {
+            value
+        };
+        result = Expr::Case(Case::new(
+            None,
+            vec![(Box::new(arg.is_not_null()), Box::new(value))],
+            Some(Box::new(result)),
+        ));
+    }
+    Ok(if boolean {
+        super::expressions::boolean_value(result)
+    } else {
+        result
+    })
+}
+
+pub(super) fn exact_coalesce(
+    args: Vec<Expr>,
+    types: &[DataType],
+) -> Result<Option<Expr>, DataFusionError> {
+    if types.contains(&DataType::Int64)
+        && types.contains(&DataType::Float64)
+        && types
+            .iter()
+            .all(|ty| matches!(ty, DataType::Int64 | DataType::Float64 | DataType::Null))
+    {
+        Ok(Some(lazy_coalesce(args, types, DataType::Float64)?))
+    } else {
+        Ok(None)
+    }
+}

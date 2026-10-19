@@ -5788,3 +5788,18 @@ async fn nested_otherwise_keeps_known_numeric_and_incompatible_constraints() {
     let result=session.query("{ RETURN 1 AS x OTHERWISE RETURN 2 AS x } RETURN x AS v OTHERWISE { RETURN 'a' AS x OTHERWISE RETURN 'b' AS x } RETURN x AS v").await;
     assert!(matches!(result, Err(Error::InvalidQuery(_))), "{result:?}");
 }
+
+#[tokio::test]
+async fn stored_boolean_coalesce_skips_an_unneeded_error() {
+    let mut session = social().await;
+    let result = session
+        .query("MATCH(n:Person|Metric) RETURN COALESCE(n.score=1,1/0>0) AS v")
+        .await
+        .unwrap();
+    assert_eq!(result.row_count(), 3);
+    let result = session
+        .query("MATCH(n:Person|Metric) WHERE COALESCE(n.score=1,1/0>0) RETURN n")
+        .await
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+}

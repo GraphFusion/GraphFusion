@@ -505,7 +505,13 @@ impl<'a> Binder<'a> {
                         Some(Box::new(left)),
                     ))
                 } else {
-                    datafusion::functions::core::expr_fn::nullif(left, right)
+                    super::arithmetic::exact_nullif(
+                        left.clone(),
+                        right.clone(),
+                        &left_type,
+                        &right_type,
+                    )
+                    .unwrap_or_else(|| datafusion::functions::core::expr_fn::nullif(left, right))
                 }
             }
             E::NumericFunction {
@@ -624,7 +630,11 @@ impl<'a> Binder<'a> {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(datafusion::functions::core::expr_fn::coalesce(args))
+        let types = args
+            .iter()
+            .map(|arg| arg.get_type(self.schema))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(super::arithmetic::lazy_coalesce(args, &types, element)?)
     }
 
     fn align_list_pair(&self, left: Expr, right: Expr) -> Result<(Expr, Expr)> {

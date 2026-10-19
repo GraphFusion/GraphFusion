@@ -477,7 +477,7 @@ fn compile_in(
             if exprs.is_empty() {
                 unknown()
             } else {
-                coalesce(exprs)
+                boolean_coalesce(exprs)?
             }
         }
         NativeAtom::NullIf(left, right) => nullif(
@@ -514,6 +514,15 @@ fn compile_in(
             qualifier,
         )?,
     })
+}
+
+fn boolean_coalesce(args: Vec<Expr>) -> Result<Expr> {
+    let types = vec![DataType::Boolean; args.len()];
+    Ok(super::arithmetic::lazy_coalesce(
+        args,
+        &types,
+        DataType::Boolean,
+    )?)
 }
 
 fn xor(left: Expr, right: Expr) -> Expr {
@@ -1770,7 +1779,7 @@ fn combine_fragments(
                 expr.is_null()
             }
         }
-        C::Coalesce => coalesce(values.collect()),
+        C::Coalesce => boolean_coalesce(values.collect())?,
         C::NullIf => nullif(
             values.next().expect("left operand"),
             values.next().expect("right operand"),
@@ -2017,22 +2026,25 @@ fn compile_on_fragments(
             None,
             vec![(
                 Box::new(fragment.column(crate::graph::ID).is_not_null()),
-                Box::new(compile_in(
-                    atom,
-                    fragment.schema.as_ref(),
-                    Some(&fragment.alias),
-                    FragmentMeta {
-                        labels: Some(&fragment.labels),
-                        directed: fragment.directed,
-                        identity: Some((binding.graph, binding.kind)),
-                    },
-                )?),
+                Box::new(cast(
+                    compile_in(
+                        atom,
+                        fragment.schema.as_ref(),
+                        Some(&fragment.alias),
+                        FragmentMeta {
+                            labels: Some(&fragment.labels),
+                            directed: fragment.directed,
+                            identity: Some((binding.graph, binding.kind)),
+                        },
+                    )?,
+                    DataType::Int64,
+                )),
             )],
-            Some(Box::new(unknown())),
+            Some(Box::new(lit(ScalarValue::Int64(None)))),
         )));
     }
     let expr = match parts.len() {
-        0 => unknown(),
+        0 => lit(ScalarValue::Int64(None)),
         1 => parts.pop().expect("fragment comparison"),
         _ => coalesce(parts),
     };
@@ -2040,10 +2052,11 @@ fn compile_on_fragments(
         None,
         vec![(
             Box::new(binding.column(crate::graph::ID).is_null()),
-            Box::new(compile(atom, &Schema::empty())?),
+            Box::new(cast(compile(atom, &Schema::empty())?, DataType::Int64)),
         )],
         Some(Box::new(expr)),
     ));
+    let expr = super::expressions::boolean_value(expr);
     Ok((plan, binding.ensure_live(expr, DataType::Boolean)))
 }
 
@@ -2064,7 +2077,17 @@ fn nullif_is_null(
     if !comparable(&stored, value_type) {
         return Ok(unknown());
     }
-    let mut left = qualified_property(schema, qualifier, property);
+    let left = qualified_property(schema, qualifier, property);
+    if let Some(compared) =
+        super::arithmetic::exact_nullif(left.clone(), value.clone(), &stored, value_type)
+    {
+        return Ok(if negated {
+            compared.is_not_null()
+        } else {
+            compared.is_null()
+        });
+    }
+    let mut left = left;
     let mut right = value;
     if *value_type == DataType::Null {
         right = cast(right, stored);
@@ -2095,21 +2118,36 @@ fn value_coalesce(
         return Ok(unknown());
     };
     let mut args = Vec::new();
+    let mut types = Vec::new();
     if let Some(stored) = &stored {
-        args.push(cast_to(
-            qualified_property(schema, qualifier, property),
-            stored,
-            &unified,
-        ));
+        args.push(qualified_property(schema, qualifier, property));
+        types.push(stored.clone());
     }
-    for (expr, data_type) in fallbacks {
-        args.push(cast_to(expr.clone(), data_type, &unified));
+    for (expr, ty) in fallbacks {
+        args.push(expr.clone());
+        types.push(ty.clone());
     }
     if args.is_empty() {
         return Ok(unknown());
     }
+    let value_type = types.iter().try_fold(DataType::Null, |left, right| {
+        super::expressions::common_value_type(&left, right)
+    })?;
+    let value = match super::arithmetic::exact_coalesce(args.clone(), &types)? {
+        Some(value) => value,
+        None => super::arithmetic::lazy_coalesce(args, &types, value_type.clone())?,
+    };
+    if let Some(compared) = super::arithmetic::exact_numeric_compare(
+        value.clone(),
+        op,
+        right.clone(),
+        &value_type,
+        right_type,
+    ) {
+        return Ok(compared);
+    }
     Ok(apply_compare(
-        coalesce(args),
+        cast_to(value, &value_type, &unified),
         cast_to(right, right_type, &unified),
         op,
     ))
