@@ -34,6 +34,10 @@ pub(super) enum NativeAtom {
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    Identity {
+        different: bool,
+        copies: usize,
+    },
     Directed {
         negated: bool,
     },
@@ -205,6 +209,7 @@ fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
         NativeAtom::Exists { .. } => Ok(()),
         NativeAtom::Labeled { .. } => Ok(()),
         NativeAtom::Directed { .. } => Ok(()),
+        NativeAtom::Identity { .. } => Ok(()),
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => {
@@ -336,6 +341,9 @@ fn compile_in(
         } => labeled_expr(schema, metadata.labels, expression, *negated, qualifier),
         NativeAtom::Directed { negated } => {
             directed_expr(schema, metadata.directed, *negated, qualifier)?
+        }
+        NativeAtom::Identity { different, copies } => {
+            identity_expr(schema, *different, *copies, qualifier)
         }
         NativeAtom::And(left, right) => compile_in(left, schema, qualifier, metadata)?
             .and(compile_in(right, schema, qualifier, metadata)?),
@@ -601,6 +609,22 @@ fn directed_expr(
     )))
 }
 
+fn identity_expr(schema: &Schema, different: bool, copies: usize, qualifier: Option<&str>) -> Expr {
+    if copies < 2 {
+        return lit(true);
+    }
+    if schema.field_with_name(crate::graph::ID).is_err() {
+        return unknown();
+    }
+    let id = qualified_column(qualifier, crate::graph::ID);
+    let same = id.clone().eq(id);
+    if different {
+        Expr::Not(Box::new(same))
+    } else {
+        same
+    }
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -617,6 +641,10 @@ enum Local {
     Or(Box<Local>, Box<Local>),
     Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Identity {
+        different: bool,
+        copies: usize,
+    },
     Directed {
         negated: bool,
     },
@@ -749,6 +777,22 @@ fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
             variable: name,
             negated,
         } if name.value == variable => Some(Local::Directed { negated: *negated }),
+        ast::Expr::Same { variables }
+            if !variables.is_empty() && variables.iter().all(|name| name.value == variable) =>
+        {
+            Some(Local::Identity {
+                different: false,
+                copies: variables.len(),
+            })
+        }
+        ast::Expr::AllDifferent { variables }
+            if !variables.is_empty() && variables.iter().all(|name| name.value == variable) =>
+        {
+            Some(Local::Identity {
+                different: true,
+                copies: variables.len(),
+            })
+        }
         ast::Expr::Binary {
             left,
             op: ast::BinaryOp::And,
@@ -919,6 +963,10 @@ fn bind_local_value(
             negated: *negated,
         }),
         Local::Directed { negated } => Some(NativeAtom::Directed { negated: *negated }),
+        Local::Identity { different, copies } => Some(NativeAtom::Identity {
+            different: *different,
+            copies: *copies,
+        }),
         Local::And(left, right) => match (
             bind_local_value(session, schema, scope, left, working_row)?,
             bind_local_value(session, schema, scope, right, working_row)?,
@@ -1334,6 +1382,7 @@ fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
         NativeAtom::Exists { .. } => false,
         NativeAtom::Labeled { .. } => false,
         NativeAtom::Directed { .. } => false,
+        NativeAtom::Identity { .. } => false,
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),

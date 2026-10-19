@@ -2422,3 +2422,110 @@ async fn direction_kind_is_checked_before_an_empty_fragment_scan() {
     let r=s.query("LET r=NULL MATCH(n:Person|Document) WHERE n.id=1 OR r IS DIRECTED RETURN n.name AS name").await.unwrap();
     assert_eq!(strings(&r), vec![vec!["Ada".to_string()]]);
 }
+
+#[tokio::test]
+async fn where_identity_tests_keep_stored_types() {
+    let mut session = social().await;
+
+    let same = session
+        .query(
+            "MATCH (n:Person|Document) WHERE SAME(n, n) AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&same), vec![vec!["Ada".to_string()]]);
+
+    let repeated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE SAME(n, n, n) AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&repeated), vec![vec!["Ada".to_string()]]);
+
+    let different = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR ALL_DIFFERENT(n, n)
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&different), vec![vec!["Ada".to_string()]]);
+
+    let everyone = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR SAME(n, n)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&everyone),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document) WHERE NOT SAME(n, n) OR n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let document = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 'doc' OR ALL_DIFFERENT(n, n, n)
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&document), vec![vec!["Spec".to_string()]]);
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE SAME(n, n) AND n.id = 1)
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&inline), vec![vec!["Ada".to_string()]]);
+
+    let error = session
+        .query("MATCH (d:Document) WHERE d.id = 1 OR SAME(d, d) RETURN d.title AS title")
+        .await
+        .unwrap_err();
+    match error {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn identity_metadata_keeps_scalar_nulls_and_conditional_types() {
+    let mut s = social().await;
+    let r = s
+        .query(
+            "LET r=NULL MATCH(n:Person|Document) WHERE n.id=1 OR SAME(r,r) RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&r), vec![vec!["Ada".to_string()]]);
+    assert_eq!(
+        s.query("MATCH(a)(-[e]->(b))?(c) WHERE ALL_DIFFERENT(b,b) RETURN c")
+            .await
+            .unwrap()
+            .row_count(),
+        0
+    );
+    assert!(s
+        .query("MATCH(a)((x)-[:E]->(y)){1}(b) WHERE SAME(x,x) RETURN b")
+        .await
+        .is_err());
+}
