@@ -185,6 +185,8 @@
   `-/E F/->{2}` repeats the E-then-F sequence, `-/L|R/->{1,2}` can mix labels
   between repetitions, and a quantifier on one label no longer discards the
   outer one.
+- Apply an earlier `LIMIT` or `OFFSET` before a later `ORDER BY`, so the later
+  sort reorders only that window.
 
 ## 0.2.0 — 2026-10-05
 
