@@ -384,6 +384,7 @@ async fn plan(
             clone_working(&incoming),
         )
         .await?;
+        checked = conditional_validation_schema(checked, &validation)?;
         let mut checked_domains = validation.output_domains.clone();
         let mut checked_sources = validation.output_reference_sources.clone();
         let mut checked_types = validation.output_value_types.clone();
@@ -399,6 +400,7 @@ async fn plan(
                 clone_working(&incoming),
             )
             .await?;
+            let right = conditional_validation_schema(right, &validation)?;
             merge_result_metadata(
                 &mut checked_domains,
                 &mut checked_sources,
@@ -423,6 +425,9 @@ async fn plan(
             return Ok((checked, graph));
         }
         let mut first_types = expressions::StoredTypes::new();
+        let mut first_domains = references::Domains::new();
+        let mut first_sources = references::ReferenceSources::new();
+        let mut runtime_schema = schema.clone();
         for (index, (body, context)) in std::iter::once((&query.body, &first_context))
             .chain(query.set_operations.iter().map(|op| (&op.body, &context)))
             .enumerate()
@@ -445,8 +450,12 @@ async fn plan(
             .await?;
             if index == 0 {
                 first_types = trace.output_value_types.clone();
+                first_domains = trace.output_domains.clone();
+                first_sources = trace.output_reference_sources.clone();
             }
-            let branch = relational::coerce(branch, &schema)?;
+            runtime_schema =
+                std::sync::Arc::new(selected_result_schema(&runtime_schema, branch.schema())?);
+            let branch = relational::coerce(branch, &runtime_schema)?;
             let (schema, batches) = trace.collect(ctx, &branch).await?;
             if batches.iter().any(|b| b.num_rows() > 0) {
                 let chosen = execution::memory(schema, batches)?.build()?;
@@ -457,6 +466,9 @@ async fn plan(
             }
         }
         trace.output_value_types = first_types;
+        trace.output_domains = first_domains;
+        trace.output_reference_sources = first_sources;
+        let schema = runtime_schema;
         let empty =
             execution::memory(std::sync::Arc::new(schema.as_arrow().clone()), vec![])?.build()?;
         return Ok((
@@ -511,6 +523,74 @@ async fn plan(
         apply_trailing_page(result, &context, trailing_page, ctx, trace).await?,
         graph,
     ))
+}
+
+/// Branch-dependent scalar types cannot establish a fixed enclosing schema.
+/// Use a nullable placeholder during validation; references retain their stable
+/// identity encoding so property binding can still inspect their source layouts.
+fn conditional_validation_schema(
+    plan: LogicalPlan,
+    trace: &execution::Trace,
+) -> Result<LogicalPlan> {
+    use datafusion::arrow::datatypes::{DataType, Schema};
+    if !plan.schema().fields().iter().any(|field| {
+        trace.output_value_types.is_deferred(field.name())
+            && !trace.output_domains.contains_key(field.name())
+    }) {
+        return Ok(plan);
+    }
+    let fields = plan
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            if trace.output_value_types.is_deferred(field.name())
+                && !trace.output_domains.contains_key(field.name())
+            {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Null)
+                    .with_nullable(true)
+            } else {
+                field.as_ref().clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    execution::memory(std::sync::Arc::new(Schema::new(fields)), vec![])?
+        .build()
+        .map_err(Into::into)
+}
+
+fn selected_result_schema(
+    target: &datafusion::common::DFSchema,
+    selected: &datafusion::common::DFSchema,
+) -> Result<datafusion::common::DFSchema> {
+    use datafusion::{arrow::datatypes::Schema, common::DFSchema};
+    let fields = target
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let Some(actual) = selected.fields().get(index) else {
+                return Ok(field.as_ref().clone());
+            };
+            let ty = expressions::common_value_type(field.data_type(), actual.data_type())
+                .map_err(|_| {
+                    Error::InvalidQuery(format!(
+                        "incompatible composite column types {} and {}",
+                        actual.data_type(),
+                        field.data_type()
+                    ))
+                })?;
+            Ok(field
+                .as_ref()
+                .clone()
+                .with_data_type(ty)
+                .with_nullable(field.is_nullable() || actual.is_nullable()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DFSchema::try_from(Schema::new(fields))?)
 }
 
 fn merge_result_metadata(

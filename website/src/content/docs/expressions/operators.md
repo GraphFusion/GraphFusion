@@ -14,6 +14,8 @@ RETURN 6 * 7 AS answer, 7 / 2 AS quotient,
 
 Arithmetic uses checked kernels. Integer overflow (`integer overflow`), division by zero (`division by zero`) and non-finite floating results raise execution errors in both constant expressions and batch evaluation. Dividing the minimum integer by `-1` overflows. A null dividend divided by zero is null. A decimal literal that overflows to infinity is rejected as a bad number before execution. The binder rejects implicit text-to-number and boolean-to-number conversions.
 
+`AND`, `OR`, and `XOR` decide each row before evaluating an operand that cannot change that row. A division by zero in a skipped operand does not fail the query. An operand the row still needs still raises the arithmetic error.
+
 Comparisons require compatible families, with supported numeric widening. Null operands follow nullable semantics; `NULL = NULL` is not a test for null. Use [IS NULL](/expressions/null/) or a [truth predicate](/expressions/boolean/).
 
 List comparisons use that same numeric widening. An empty list is comparable with a typed list: `[1] = [1.0]` is true, `[1] = []` is false, and `[] < [1]` is true. A list of strings is not comparable with a list of numbers.

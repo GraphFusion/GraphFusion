@@ -284,6 +284,10 @@
 - Let a newly inserted destination read the edge that connects it. The edge can
   still read both endpoints, and the affected-element count stays the number of
   created elements.
+- Evaluate `AND`, `OR`, and `XOR` per row. An operand that cannot change that
+  row is skipped, so a guarded division by zero no longer fails because other
+  rows in the batch still need the quotient. A row that needs the operand still
+  reports the arithmetic error.
 
 ## 0.2.0 — 2026-10-05
 

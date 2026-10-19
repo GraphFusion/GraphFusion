@@ -591,6 +591,8 @@ impl Parser {
 
     fn parse_data_modifying_statement_or_query(&mut self) -> Result<Statement> {
         let mut trial = self.clone();
+        // Lookahead must not lend NEXT's input to subqueries in write values.
+        trial.linear_input = false;
         let statement = match trial.peek_kind() {
             TokenKind::Insert => Statement::Insert(trial.parse_insert_statement()?),
             TokenKind::Delete | TokenKind::Detach | TokenKind::Nodetach => {
