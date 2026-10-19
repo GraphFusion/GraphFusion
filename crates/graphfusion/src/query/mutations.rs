@@ -992,29 +992,21 @@ async fn without_null_properties(
         provider_as_source(table.provider.clone()),
         None,
     )?;
-    let (_, batches) = trace
-        .collect(
-            ctx,
-            &scan
-                .clone()
-                .project(
-                    candidates
-                        .iter()
-                        .map(|name| Expr::Column(Column::new_unqualified(name))),
-                )?
-                .build()?,
-        )
-        .await?;
-    let absent: BTreeSet<_> = candidates
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, name)| {
-            batches
-                .iter()
-                .all(|batch| batch.column(index).null_count() == batch.num_rows())
-                .then_some(name)
-        })
-        .collect();
+    let mut absent = BTreeSet::new();
+    for name in candidates {
+        // Stop on the first actual value; an ordinary row update must not
+        // materialize all nullable property buffers of the surviving fragment.
+        let present = scan
+            .clone()
+            .filter(Expr::Column(Column::new_unqualified(&name)).is_not_null())?
+            .limit(0, Some(1))?
+            .project([lit(1_i64)])?
+            .build()?;
+        let (_, rows) = trace.collect(ctx, &present).await?;
+        if rows.iter().all(|batch| batch.num_rows() == 0) {
+            absent.insert(name);
+        }
+    }
     if absent.is_empty() {
         return Ok(table);
     }
