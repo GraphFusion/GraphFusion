@@ -45,6 +45,7 @@ enum Kind {
         lazy: Lazy,
     },
     Append,
+    Unified,
 }
 #[derive(Clone)]
 struct Node {
@@ -69,7 +70,9 @@ pub(super) fn compile(
     expression: &ast::Expr,
     context: BindContext<'_>,
 ) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
-    if !mixed_operator(expression, scope, false) || contains_aggregate(expression) {
+    if !mixed_operator(expression, scope, false)
+        || (!context.aggregates && contains_aggregate(expression))
+    {
         return Ok((plan, None));
     }
     let key = cache_key(expression, session, plan.schema(), scope, context)?;
@@ -410,6 +413,16 @@ impl Compiler<'_> {
                 }
                 Ok(node)
             }
+            E::Function { args, .. }
+                if self.context.aggregates
+                    && args
+                        .first()
+                        .is_some_and(|arg| mixed_operator(arg, self.scope, false)) =>
+            {
+                let child = self.build(&args[0])?;
+                let child = self.unified(child)?;
+                self.ast(expression.clone(), vec![child], Lazy::None)
+            }
             E::NumericFunction { args, .. } => {
                 let children = args
                     .iter()
@@ -423,6 +436,30 @@ impl Compiler<'_> {
                     .bind(expression)?,
             ),
         }
+    }
+    /// Aggregate arguments span rows, so collapse their stored variants before
+    /// binding the aggregate rather than aggregating each fragment separately.
+    fn unified(&mut self, child: usize) -> Result<usize> {
+        let mut ty = DataType::Null;
+        let mut dependencies = Dependencies::new();
+        for variant in &self.nodes[child].variants {
+            ty = common_value_type(&ty, &variant.ty)?;
+            dependencies.extend(variant.dependencies.iter().cloned());
+        }
+        self.finish(
+            Kind::Unified,
+            vec![child],
+            vec![Variant {
+                ty,
+                mask: lit(true),
+                origins: Origins::new(),
+                physical: true,
+                nonnull: false,
+                dependencies,
+                arms: vec![],
+            }],
+            None,
+        )
     }
     fn ast(
         &mut self,
@@ -445,6 +482,7 @@ impl Compiler<'_> {
             | E::IsUnknown { expr, .. }
             | E::IsTruth { expr, .. }
             | E::Elements { path: expr } => **expr = identifier(0),
+            E::Function { args, .. } => args[0] = identifier(0),
             E::Coalesce(args) | E::List(args) | E::NumericFunction { args, .. } => {
                 *args = (0..names.len()).map(identifier).collect()
             }
@@ -490,7 +528,7 @@ impl Compiler<'_> {
                     list, item,
                 ))
             }
-            Kind::Base => unreachable!(),
+            Kind::Base | Kind::Unified => unreachable!(),
         }
     }
     fn infer(&mut self, kind: Kind, children: Vec<usize>) -> Result<usize> {
@@ -588,6 +626,41 @@ impl Compiler<'_> {
     }
     fn emit(&mut self, id: usize, demands: Vec<Expr>) -> Result<Vec<Expr>> {
         let node = self.nodes[id].clone();
+        if matches!(node.kind, Kind::Unified) {
+            let child = node.children[0];
+            let variants = self.nodes[child].variants.clone();
+            let needed = variants
+                .iter()
+                .map(|variant| and(demands[0].clone(), variant.mask.clone()))
+                .collect();
+            let values = self.emit(child, needed)?;
+            let ty = &node.variants[0].ty;
+            let arms = variants
+                .iter()
+                .zip(values)
+                .map(|(variant, value)| {
+                    Ok((
+                        Box::new(variant.mask.clone()),
+                        Box::new(value.cast_to(ty, self.plan.schema())?),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let value = Expr::Case(datafusion::logical_expr::expr::Case::new(
+                None,
+                arms,
+                Some(Box::new(lit(ScalarValue::try_from(ty)?))),
+            ));
+            let value =
+                if datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty() {
+                    let mut dependencies = node.variants[0].dependencies.clone();
+                    dependencies.extend(self.semantic(&demands[0]));
+                    self.project(vec![("argument", value, dependencies)])?
+                        .remove(0)
+                } else {
+                    value
+                };
+            return Ok(vec![value]);
+        }
         let mut values: Vec<Vec<Expr>> = Vec::new();
         let lazy = match node.kind {
             Kind::Ast { lazy, .. } => lazy,
@@ -691,7 +764,9 @@ impl Compiler<'_> {
                     Some(Box::new(null)),
                 ))
             };
-            if datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty() {
+            if !value.column_refs().is_empty()
+                && datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty()
+            {
                 indices.push(index);
                 let mut dependencies = variant.dependencies.clone();
                 dependencies.extend(self.semantic(&demand));
@@ -883,6 +958,16 @@ fn cache_key(
             };
             format!("{tag}:{values:?}")
         }
+        E::Wildcard => "wildcard".into(),
+        E::Function {
+            name,
+            quantifier,
+            args,
+        } => format!(
+            "aggregate:{}:{quantifier:?}:{:?}",
+            name.value.to_ascii_lowercase(),
+            args.iter().map(child).collect::<Result<Vec<_>>>()?
+        ),
         E::Elements { path } => format!("elements({})", child(path)?),
         _ => format!(
             "bound:{:?}",
