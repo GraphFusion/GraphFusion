@@ -98,8 +98,15 @@ pub(super) fn call(
         "AVG" => agg::expr_fn::avg(value),
         "MIN" => agg::expr_fn::min(value),
         "MAX" => agg::expr_fn::max(value),
-        "STDDEV_POP" => agg::expr_fn::stddev_pop(value),
-        "STDDEV_SAMP" => agg::expr_fn::stddev(value),
+        "STDDEV_POP" | "STDDEV_SAMP" => {
+            if data_type == DataType::Int64 {
+                super::stddev::integer_stddev(value, name == "STDDEV_POP")
+            } else if name == "STDDEV_POP" {
+                agg::expr_fn::stddev_pop(value)
+            } else {
+                agg::expr_fn::stddev(value)
+            }
+        }
         "COLLECT_LIST" => {
             collect = true;
             let mut expression = agg::expr_fn::array_agg(value.clone());

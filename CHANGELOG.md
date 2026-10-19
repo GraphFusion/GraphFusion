@@ -220,6 +220,8 @@
   FILTER, property maps, RETURN, SELECT, HAVING, and ORDER BY.
 - Divide an integer `AVG` from the exact sum. The Float64 result is that
   quotient rounded to the nearest value, including inputs above 2^53.
+- Compute an integer STDDEV_POP or STDDEV_SAMP from the exact sum and sum of
+  squares, then round once to Float64.
 
 ## 0.2.0 — 2026-10-05
 
