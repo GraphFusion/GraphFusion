@@ -178,7 +178,7 @@ fn percentile(
     let count = cast(array_length(values.clone()), DataType::Float64);
     let fraction = percentile_fraction(cast(fraction, DataType::Float64));
     let result = if continuous {
-        let position = fraction.clone() * (count - lit(1.0_f64));
+        let position = percentile_product(fraction.clone(), count - lit(1.0_f64));
         let low = floor(position.clone());
         let high = ceil(position.clone());
         let weight = position - low.clone();
@@ -193,7 +193,7 @@ fn percentile(
         }
     } else {
         let rank = datafusion::functions::core::expr_fn::greatest(vec![
-            ceil(fraction.clone() * count),
+            ceil(percentile_product(fraction.clone(), count)),
             lit(1.0_f64),
         ]);
         array_element(values, cast(rank, DataType::Int64))
@@ -245,6 +245,105 @@ fn percentile_fraction(value: Expr) -> Expr {
         .clone()
     }
     udf().call(vec![value])
+}
+
+/// Correct products that are exactly integer ranks in the fraction's shortest
+/// decimal representation (for example 0.28 * 25). Nearby non-integer ranks
+/// retain their weight instead of being absorbed by an epsilon tolerance.
+fn percentile_product(fraction: Expr, count: Expr) -> Expr {
+    use datafusion::{
+        arrow::array::Float64Array,
+        error::DataFusionError,
+        logical_expr::{create_udf, ColumnarValue, ScalarUDF, Volatility},
+    };
+    static UDF: std::sync::OnceLock<ScalarUDF> = std::sync::OnceLock::new();
+    UDF.get_or_init(|| {
+        create_udf(
+            "gql_percentile_product",
+            vec![DataType::Float64; 2],
+            DataType::Float64,
+            Volatility::Immutable,
+            std::sync::Arc::new(|args| {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let fractions = arrays[0]
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("expected Float64 percentile fraction".into())
+                    })?;
+                let counts = arrays[1]
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("expected Float64 percentile count".into())
+                    })?;
+                let products: Float64Array = fractions
+                    .iter()
+                    .zip(counts.iter())
+                    .map(|(fraction, count)| {
+                        fraction
+                            .zip(count)
+                            .map(|(fraction, count)| percentile_product_value(fraction, count))
+                    })
+                    .collect();
+                let output: datafusion::arrow::array::ArrayRef = std::sync::Arc::new(products);
+                if args
+                    .iter()
+                    .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+                {
+                    Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                        &output, 0,
+                    )?))
+                } else {
+                    Ok(ColumnarValue::Array(output))
+                }
+            }),
+        )
+    })
+    .call(vec![fraction, count])
+}
+
+fn percentile_product_value(fraction: f64, count: f64) -> f64 {
+    exact_decimal_integer_product(fraction, count).unwrap_or(fraction * count)
+}
+
+fn exact_decimal_integer_product(fraction: f64, count: f64) -> Option<f64> {
+    if !fraction.is_finite()
+        || !(0.0..=1.0).contains(&fraction)
+        || !count.is_finite()
+        || count < 0.0
+        || count.fract() != 0.0
+        || count >= u64::MAX as f64
+    {
+        return None;
+    }
+    let text = fraction.to_string();
+    let (mantissa, exponent) = text.split_once(['e', 'E']).map_or(
+        Some((text.as_str(), 0_i32)),
+        |(mantissa, exponent)| {
+            exponent
+                .parse::<i32>()
+                .ok()
+                .map(|exponent| (mantissa, exponent))
+        },
+    )?;
+    let decimals = mantissa
+        .split_once('.')
+        .map_or(0, |(_, digits)| digits.len() as i32);
+    let scale = decimals - exponent;
+    let numerator = mantissa
+        .bytes()
+        .filter(|byte| *byte != b'.')
+        .try_fold(0_u128, |n, byte| {
+            n.checked_mul(10)?
+                .checked_add(u128::from(byte.checked_sub(b'0')?))
+        })?
+        .checked_mul(count as u128)?;
+    if scale < 0 {
+        return Some(numerator.checked_mul(10_u128.checked_pow((-scale) as u32)?)? as f64);
+    }
+    let denominator = 10_u128.checked_pow(scale as u32)?;
+    (numerator % denominator == 0).then(|| (numerator / denominator) as f64)
 }
 
 pub(super) fn result(
@@ -605,4 +704,28 @@ fn rebase(expr: Expr, mapping: &[(Expr, Column)]) -> Result<Expr> {
             other => other.into(),
         })?;
     Ok(transformed.data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile_product_value;
+    #[test]
+    fn percentile_products_correct_only_exact_decimal_integer_ranks() {
+        assert_eq!(percentile_product_value(0.28, 25.0), 7.0);
+        assert_eq!(percentile_product_value(0.56, 25.0), 14.0);
+        for (fraction, count) in [
+            (1e-16, 1.0),
+            (f64::from_bits(1), 1.0),
+            (0.5000000000000001, 2.0),
+            (0.2800000000000001, 25.0),
+            (0.29, 25.0),
+            (15.0 / 22.0, 22.0),
+        ] {
+            assert_eq!(
+                percentile_product_value(fraction, count).to_bits(),
+                (fraction * count).to_bits()
+            );
+        }
+        assert!(percentile_product_value(f64::NAN, 2.0).is_nan());
+    }
 }

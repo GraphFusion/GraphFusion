@@ -222,6 +222,9 @@
   quotient rounded to the nearest value, including inputs above 2^53.
 - Compute an integer STDDEV_POP or STDDEV_SAMP from the exact sum and sum of
   squares, then round once to Float64.
+- Correct exact decimal integer percentile ranks without discarding nearby
+  fractional weights, so `PERCENTILE_DISC` of 25 values at 0.28 returns the
+  7th value while nearby fractions retain their interpolation weight.
 
 ## 0.2.0 — 2026-10-05
 
