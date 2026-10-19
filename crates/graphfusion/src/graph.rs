@@ -245,6 +245,23 @@ impl Table {
         })
     }
 
+    /// Rebuild a live property projection while retaining allocated identity history.
+    pub(crate) fn project_live_properties(
+        &self,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        reserved: &[&str],
+    ) -> Result<Self> {
+        let mut projected = Self::try_new(
+            self.labels.iter().cloned().collect(),
+            schema,
+            batches,
+            reserved,
+        )?;
+        projected.max_id = projected.max_id.max(self.max_id);
+        Ok(projected)
+    }
+
     pub(crate) fn append_rows(&mut self, extra: Table) -> Result<()> {
         if self.file_id.is_some() {
             return Err(Error::Corrupt(

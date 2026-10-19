@@ -773,10 +773,74 @@ async fn patch(
     if ids.is_empty() {
         return Ok(None);
     }
+    // A null result removes the property. Keeping an all-null typed column
+    // would make the property look absent while still blocking a later type.
+    let (schema, batches) = without_null_assignments(edit, schema, batches)?;
     Ok(Some((
         memory(schema, batches)?.alias("__gf_patch")?.build()?,
         ids,
     )))
+}
+
+/// Drop patch columns that are null on every row and record those properties
+/// as removals. A literal NULL never creates a column; this covers expressions
+/// such as `1 + NULL` whose result type is not `Null`.
+fn without_null_assignments(
+    edit: &mut Edit,
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+    let mut null_columns = BTreeSet::new();
+    for column in edit.values.values().flatten() {
+        let mut all_null = true;
+        for batch in &batches {
+            let index = batch
+                .schema()
+                .index_of(column)
+                .map_err(|_| Error::Corrupt(format!("missing patch column {column}")))?;
+            let values = batch.column(index);
+            all_null &= values.null_count() == values.len();
+        }
+        if all_null {
+            null_columns.insert(column.clone());
+        }
+    }
+    if null_columns.is_empty() {
+        return Ok((schema, batches));
+    }
+    for column in edit.values.values_mut() {
+        if column
+            .as_ref()
+            .is_some_and(|name| null_columns.contains(name))
+        {
+            *column = None;
+        }
+    }
+    let keep: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| !null_columns.contains(field.name()))
+        .map(|(index, _)| index)
+        .collect();
+    let projected = Arc::new(Schema::new(
+        keep.iter()
+            .map(|index| schema.field(*index).clone())
+            .collect::<Vec<_>>(),
+    ));
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            RecordBatch::try_new(
+                projected.clone(),
+                keep.iter()
+                    .map(|index| batch.column(*index).clone())
+                    .collect(),
+            )
+            .map_err(|err| Error::Corrupt(format!("invalid null assignment patch: {err}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((projected, batches))
 }
 
 async fn edit_graph(
@@ -841,6 +905,18 @@ async fn edit_graph(
                     {
                         source = cast(source, DataType::Float64);
                     } else if incoming.data_type() != existing.data_type() {
+                        if !trace.validate_only && incoming.is_nullable() {
+                            let check = changed
+                                .clone()
+                                .filter(source.clone().is_not_null())?
+                                .limit(0, Some(1))?
+                                .project([lit(1_i64)])?
+                                .build()?;
+                            let (_, values) = trace.collect(ctx, &check).await?;
+                            if values.iter().all(|batch| batch.num_rows() == 0) {
+                                continue;
+                            }
+                        }
                         return Err(Error::UnsupportedFeature(format!(
                             "mixed types for graph property {}",
                             existing.name()
@@ -868,8 +944,15 @@ async fn edit_graph(
             trace,
         )
         .await?;
+        let changed = match changed {
+            Some(table) => Some(without_null_properties(table, kind, ctx, trace).await?),
+            None => None,
+        };
         let mut kept = old.clone();
         kept.mask_rows(ids)?;
+        if kept.row_count != 0 {
+            kept = without_null_properties(kept, kind, ctx, trace).await?;
+        }
         let kept = (kept.row_count != 0).then_some(kept);
         for table in [kept, changed].into_iter().flatten() {
             if kind == ElementKind::Node {
@@ -880,6 +963,75 @@ async fn edit_graph(
         }
     }
     GraphData::from_mutation(nodes, edges)
+}
+
+/// A masked fragment can retain only NULL rows for a property after the last
+/// actual value is removed. Rebuild only those layouts, leaving immutable files
+/// and pinned snapshots intact. Unchanged layouts retain their storage identity.
+async fn without_null_properties(
+    table: Table,
+    kind: ElementKind,
+    ctx: &SessionContext,
+    trace: &mut Trace,
+) -> Result<Table> {
+    if trace.validate_only || table.row_count == 0 {
+        return Ok(table);
+    }
+    let candidates: Vec<_> = table
+        .schema
+        .fields()
+        .iter()
+        .filter(|field| field.is_nullable() && !crate::graph::is_reserved_property(field.name()))
+        .map(|field| field.name().clone())
+        .collect();
+    if candidates.is_empty() {
+        return Ok(table);
+    }
+    let scan = LogicalPlanBuilder::scan(
+        "__gf_null_properties",
+        provider_as_source(table.provider.clone()),
+        None,
+    )?;
+    let (_, batches) = trace
+        .collect(
+            ctx,
+            &scan
+                .clone()
+                .project(
+                    candidates
+                        .iter()
+                        .map(|name| Expr::Column(Column::new_unqualified(name))),
+                )?
+                .build()?,
+        )
+        .await?;
+    let absent: BTreeSet<_> = candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            batches
+                .iter()
+                .all(|batch| batch.column(index).null_count() == batch.num_rows())
+                .then_some(name)
+        })
+        .collect();
+    if absent.is_empty() {
+        return Ok(table);
+    }
+    let columns = table
+        .schema
+        .fields()
+        .iter()
+        .filter(|field| !absent.contains(field.name()))
+        .map(|field| Expr::Column(Column::new_unqualified(field.name())))
+        .collect::<Vec<_>>();
+    let (schema, batches) = trace.collect(ctx, &scan.project(columns)?.build()?).await?;
+    let reserved: &[&str] = if kind == ElementKind::Edge {
+        &[ID, SOURCE, DESTINATION]
+    } else {
+        &[ID]
+    };
+    table.project_live_properties(schema, batches, reserved)
 }
 
 async fn refresh(
@@ -1002,7 +1154,11 @@ async fn delete_graph(
     for node in &data.nodes {
         let mut table = node.0.clone();
         if !nodes.is_empty() {
-            deleted_nodes.extend(table.mask_rows(&nodes)?);
+            let removed = table.mask_rows(&nodes)?;
+            if !removed.is_empty() && table.row_count != 0 {
+                table = without_null_properties(table, ElementKind::Node, ctx, trace).await?;
+            }
+            deleted_nodes.extend(removed);
         }
         if table.row_count != 0 {
             new_nodes.push(NodeTable(table));
@@ -1022,7 +1178,11 @@ async fn delete_graph(
         }
         let mut table = edge.table.clone();
         if !removed.is_empty() {
-            deleted_edges.extend(table.mask_rows(&removed)?);
+            let removed_ids = table.mask_rows(&removed)?;
+            if !removed_ids.is_empty() && table.row_count != 0 {
+                table = without_null_properties(table, ElementKind::Edge, ctx, trace).await?;
+            }
+            deleted_edges.extend(removed_ids);
         }
         if table.row_count != 0 {
             new_edges.push(EdgeTable {
