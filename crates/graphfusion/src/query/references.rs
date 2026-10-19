@@ -83,6 +83,53 @@ pub(super) fn result_domains(
     result
 }
 
+/// Source layouts retained across materialized query results. Only a direct
+/// element copy has one source; expressions spanning domains keep the fallback.
+pub(super) type ReferenceSources = std::collections::BTreeMap<String, ElementBinding>;
+
+pub(super) fn result_sources(body: &ast::QueryBody, scope: &Bindings) -> ReferenceSources {
+    let source = |name: &str| {
+        scope
+            .elements
+            .get(name)
+            .or_else(|| scope.reference_sources.get(name))
+    };
+    let mut result = ReferenceSources::new();
+    for item in &body.result_clause.items {
+        match &item.expr {
+            ast::Expr::Wildcard => {
+                for name in &scope.order {
+                    if let Some(binding) = source(name) {
+                        result.insert(name.clone(), binding.clone());
+                    }
+                }
+            }
+            ast::Expr::Identifier(name) => {
+                if let Some(binding) = source(&name.value) {
+                    let output = item.alias.as_ref().unwrap_or(name);
+                    result.insert(output.value.clone(), binding.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// A composite result can reuse a layout only when every branch agrees.
+pub(super) fn retain_common_sources(left: &mut ReferenceSources, right: &ReferenceSources) {
+    left.retain(|name, source| {
+        right.get(name).is_some_and(|other| {
+            source.graph == other.graph
+                && source.kind == other.kind
+                && source.constrained == other.constrained
+                && source.source_labels == other.source_labels
+                && source.properties == other.properties
+                && source.tombstones == other.tombstones
+        })
+    });
+}
+
 #[derive(Clone)]
 pub(super) struct ReferenceBinding {
     pub parts: Vec<ElementBinding>,
