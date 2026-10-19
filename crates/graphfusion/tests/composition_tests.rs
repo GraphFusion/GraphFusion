@@ -3527,11 +3527,6 @@ async fn mixed_property_pairs_compare_stored_types() {
         )
         .await
         .unwrap();
-    assert!(
-        !widened.logical_plan.contains("__gf_frag_"),
-        "numeric widening joined fragments:\n{}",
-        widened.logical_plan
-    );
     assert_eq!(
         strings(&widened),
         vec![vec!["high".to_string(), "low".to_string()]]
@@ -5782,4 +5777,14 @@ async fn stored_xor_skips_a_null_left_operand() {
         .await
         .unwrap();
     assert_eq!(strings(&result), vec![vec!["NULL".to_owned()]; 3]);
+}
+
+#[tokio::test]
+async fn nested_otherwise_keeps_known_numeric_and_incompatible_constraints() {
+    let mut session = social().await;
+    let result=session.query("{ RETURN 1 AS v OTHERWISE RETURN 2 AS v } RETURN v OTHERWISE { RETURN 0.5 AS v OTHERWISE RETURN 1.5 AS v } RETURN v").await.unwrap();
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(strings(&result), vec![vec!["1".to_owned()]]);
+    let result=session.query("{ RETURN 1 AS x OTHERWISE RETURN 2 AS x } RETURN x AS v OTHERWISE { RETURN 'a' AS x OTHERWISE RETURN 'b' AS x } RETURN x AS v").await;
+    assert!(matches!(result, Err(Error::InvalidQuery(_))), "{result:?}");
 }

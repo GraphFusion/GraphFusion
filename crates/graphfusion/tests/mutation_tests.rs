@@ -1127,3 +1127,29 @@ async fn insert_edge_dependencies_match_variable_case() {
     assert_eq!(rows(&result), vec![vec!["7"]]);
     assert_eq!(result.affected_elements, 3);
 }
+
+#[tokio::test]
+async fn inserted_destination_reads_edge_identity_and_predicates() {
+    let db = Database::new();
+    let mut s = session(&db);
+    let result=run(&mut s,"INSERT (a:A)-[Edge:E {w:2}]->(b:B {ident:ELEMENT_ID(edge),has:PROPERTY_EXISTS(edge,w),directed:edge IS DIRECTED,labeled:edge IS LABELED E}) RETURN b.ident=ELEMENT_ID(Edge) AS ident,b.has AS has,b.directed AS directed,b.labeled AS labeled").await;
+    assert_eq!(rows(&result), vec![vec!["true", "true", "true", "true"]]);
+    assert_eq!(result.affected_elements, 3);
+}
+
+#[tokio::test]
+async fn deferred_insert_values_widen_to_existing_label_layouts() {
+    let db = Database::new();
+    let mut s = session(&db);
+    run(&mut s, "INSERT (:N {k:1.5})").await;
+    let result = run(
+        &mut s,
+        "INSERT (a:A)-[e:E {w:2}]->(b:N {k:e.w}) RETURN b.k AS k",
+    )
+    .await;
+    assert_eq!(
+        result.schema.field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Float64
+    );
+    assert_eq!(rows(&result), vec![vec!["2"]]);
+}

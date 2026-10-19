@@ -194,27 +194,10 @@ async fn stored_value(
 }
 
 fn mentions_identifier(expr: &ast::Expr, name: &str) -> bool {
-    use ast::visit::Visitor;
-    struct Find<'a> {
-        name: &'a str,
-        found: bool,
-    }
-    impl<'ast> ast::visit::Visitor<'ast> for Find<'_> {
-        type Break = ();
-
-        fn visit_expr(&mut self, expr: &'ast ast::Expr) -> std::ops::ControlFlow<()> {
-            if matches!(expr, ast::Expr::Identifier(identifier) if identifier.value.eq_ignore_ascii_case(self.name))
-            {
-                self.found = true;
-                std::ops::ControlFlow::Break(())
-            } else {
-                ast::visit::walk_expr(self, expr)
-            }
-        }
-    }
-    let mut find = Find { name, found: false };
-    let _ = find.visit_expr(expr);
-    find.found
+    super::native::named_variable(expr, name)
+        || super::native::children(expr)
+            .into_iter()
+            .any(|child| mentions_identifier(child, name))
 }
 
 /// Split a new destination's properties into those the connecting edge can see
@@ -739,8 +722,19 @@ async fn assign_inserted_properties(
     ctx: &SessionContext,
     trace: &mut Trace,
 ) -> Result<LogicalPlanBuilder> {
-    let (plan, values) =
+    use datafusion::logical_expr::ExprSchemable;
+    let (plan, mut values) =
         properties(Some(properties_map), session, plan, scope, ctx, trace, true).await?;
+    // Deferred values obey the same stored-layout widening as initial INSERT values.
+    for (name, value) in &mut values {
+        if value.get_type(plan.schema())? == DataType::Int64
+            && binding.source_labels.iter().any(|labels| {
+                stored_property_type(data, binding.kind, labels, name) == Some(DataType::Float64)
+            })
+        {
+            *value = cast(value.clone(), DataType::Float64);
+        }
+    }
     let mut edit = Edit::default();
     let Some((patch_plan, ids)) = patch(&plan, binding, values, &mut edit, ctx, trace).await?
     else {

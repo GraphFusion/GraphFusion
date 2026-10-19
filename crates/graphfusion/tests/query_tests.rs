@@ -1458,3 +1458,192 @@ async fn boolean_short_circuit_preserves_three_valued_truth_tables() {
             .unwrap_or_else(|error| panic!("{query}: {error}"));
     }
 }
+
+#[tokio::test]
+async fn integer_float_comparisons_preserve_exact_integers() {
+    let mut session = Database::new().session();
+    let result = session
+        .query(
+            "RETURN
+                9007199254740993 = 9007199254740992.0 AS eq,
+                9007199254740993 > 9007199254740992.0 AS gt,
+                9007199254740993 <> 9007199254740992.0 AS ne,
+                9007199254740993 <= 9007199254740992.0 AS le,
+                9007199254740992 = 9007199254740992.0 AS exact,
+                -9007199254740993 < -9007199254740992.0 AS neg,
+                9223372036854775807 = 9223372036854775807.0 AS max_eq,
+                9223372036854775807 < 9223372036854775807.0 AS max_lt,
+                -9223372036854775807 > -9223372036854775808.0 AS near_min,
+                -9223372036854775808 = -9223372036854775808.0 AS min_eq,
+                1 = 1.0 AS one,
+                2 > 1.5 AS frac,
+                -2 < -1.5 AS neg_frac,
+                0 = -0.0 AS neg_zero",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(Some(true)),
+        ]
+    );
+    let result = session
+        .query(
+            "FOR n IN [9007199254740993, NULL]
+             RETURN n = 9007199254740992.0 AS eq ORDER BY n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        exact_column(&result),
+        vec![
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(None)
+        ]
+    );
+    let result = session
+        .query(
+            "FOR n IN [9007199254740992.0, NULL]
+             RETURN 9007199254740993 > n AS gt ORDER BY n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        exact_column(&result),
+        vec![ScalarValue::Boolean(Some(true)), ScalarValue::Boolean(None)]
+    );
+    assert_eq!(
+        session
+            .query("FILTER 9007199254740993 = 9007199254740992.0 RETURN 1 AS x")
+            .await
+            .unwrap()
+            .row_count(),
+        0
+    );
+
+    session
+        .run("CREATE GRAPH g ANY GRAPH; SESSION SET GRAPH g; INSERT (:N {id: 9007199254740993}), (:N {id: 1})")
+        .await
+        .unwrap();
+    let result = session
+        .query("MATCH (n:N) WHERE n.id > 9007199254740992.0 RETURN n.id AS id")
+        .await
+        .unwrap();
+    assert_eq!(
+        exact_column(&result),
+        vec![ScalarValue::Int64(Some(9007199254740993))]
+    );
+    let result = session
+        .query("MATCH (n:N) WHERE 9007199254740992.0 < n.id RETURN n.id AS id")
+        .await
+        .unwrap();
+    assert_eq!(
+        exact_column(&result),
+        vec![ScalarValue::Int64(Some(9007199254740993))]
+    );
+    assert_eq!(
+        session
+            .query("MATCH (n:N {id: 9007199254740992.0}) RETURN n.id AS id")
+            .await
+            .unwrap()
+            .row_count(),
+        0
+    );
+    let result = session
+        .query("MATCH (n:N {id: 1.0}) RETURN n.id AS id")
+        .await
+        .unwrap();
+    assert_eq!(exact_column(&result), vec![ScalarValue::Int64(Some(1))]);
+    let result = session
+        .query("MATCH (n:N) WHERE n.id <> 9007199254740992.0 RETURN n.id AS id ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        exact_column(&result),
+        vec![
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(9007199254740993))
+        ]
+    );
+
+    session
+        .set_parameter("inf", Value::Float(f64::INFINITY))
+        .unwrap();
+    let result = session
+        .query("RETURN $inf = 9007199254740993 AS eq, $inf > 1 AS gt")
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&result),
+        vec![
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(Some(true))
+        ]
+    );
+}
+
+fn exact_column(result: &QueryResult) -> Vec<ScalarValue> {
+    result
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .map(|row| ScalarValue::try_from_array(batch.column(0), row).unwrap())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn repeated_exact_comparison_is_one_ordering_expression() {
+    let mut session = Database::new().session();
+    let result=session.query("FOR n IN [9007199254740993,1] RETURN DISTINCT n > 9007199254740992.0 AS greater ORDER BY n > 9007199254740992.0").await.unwrap();
+    assert_eq!(
+        exact_column(&result),
+        vec![
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(Some(true))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn mixed_numeric_property_comparisons_keep_integer_precision() {
+    let mut session = Database::new().session();
+    session.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:I {v:9007199254740993}),(:F {v:9007199254740992.0})").await.unwrap();
+    let result = session
+        .query("MATCH(n:I|F) RETURN n.v>9007199254740992.0 AS greater ORDER BY greater")
+        .await
+        .unwrap();
+    assert_eq!(
+        exact_column(&result),
+        vec![
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(Some(true))
+        ]
+    );
+    let result = session
+        .query("MATCH(n:I|F),(i:I) RETURN n.v=i.v AS equal_value ORDER BY equal_value")
+        .await
+        .unwrap();
+    assert_eq!(
+        exact_column(&result),
+        vec![
+            ScalarValue::Boolean(Some(false)),
+            ScalarValue::Boolean(Some(true))
+        ]
+    );
+}
