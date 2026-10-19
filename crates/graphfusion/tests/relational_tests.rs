@@ -1033,3 +1033,64 @@ async fn output_aliases_shadow_elements_in_group_having_and_order_contexts() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn later_order_by_sorts_only_the_earlier_page() {
+    let mut s = fixture().await;
+    // An earlier ORDER BY fixes the page. A later ORDER BY sorts that page only.
+    check(
+        &mut s,
+        "FOR n IN [10, 20, 30] ORDER BY n ASC OFFSET 1 ORDER BY n DESC RETURN n",
+        &[&["30"], &["20"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [10, 20, 30] ORDER BY n ASC OFFSET 1 RETURN n ORDER BY n DESC",
+        &[&["30"], &["20"]],
+    )
+    .await;
+    // List unnest order is the page when no earlier ORDER BY is present.
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3, 4] LIMIT 2 ORDER BY n DESC RETURN n",
+        &[&["2"], &["1"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3, 4] LIMIT 2 RETURN n ORDER BY n DESC",
+        &[&["2"], &["1"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3, 4] ORDER BY n ASC LIMIT 2 ORDER BY n DESC RETURN n",
+        &[&["2"], &["1"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3, 4] ORDER BY n ASC LIMIT 2 RETURN n ORDER BY n DESC",
+        &[&["2"], &["1"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3, 4, 5] LIMIT 3 ORDER BY n DESC LIMIT 2 RETURN n",
+        &[&["3"], &["2"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3, 4, 5] ORDER BY n DESC OFFSET 1 LIMIT 2 RETURN n",
+        &[&["4"], &["3"]],
+    )
+    .await;
+    check(
+        &mut s,
+        "FOR n IN [1, 2, 3, 4, 5] OFFSET 1 LIMIT 2 RETURN n",
+        &[&["2"], &["3"]],
+    )
+    .await;
+}

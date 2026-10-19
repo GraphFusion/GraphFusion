@@ -602,6 +602,8 @@ async fn plan_body(
                 }
             }
             ast::QueryClause::OrderByPage(clause) => {
+                plan =
+                    freeze_page_before_sort(plan, !clause.order_by.is_empty(), ctx, trace).await?;
                 plan = order_and_page(
                     plan,
                     session,
@@ -691,10 +693,31 @@ async fn plan_body(
         let expr = Binder::with_bindings(session, plan.schema(), &scope).predicate(predicate)?;
         plan = plan.filter(expr)?;
     }
+    plan = freeze_page_before_sort(plan, !body.order_by.is_empty(), ctx, trace).await?;
     Ok((
         aggregates::result(plan, session, &scope, body)?.build()?,
         current_graph,
     ))
+}
+
+/// A later sort must see only the rows an earlier LIMIT or OFFSET already kept.
+/// DataFusion otherwise absorbs that limit into a TopK or pushes the sort under
+/// the offset, so the new key chooses a different page.
+async fn freeze_page_before_sort(
+    plan: LogicalPlanBuilder,
+    ordering: bool,
+    ctx: &SessionContext,
+    trace: &mut execution::Trace,
+) -> Result<LogicalPlanBuilder> {
+    if ordering && contains_limit(plan.plan()) {
+        execution::freeze(plan, ctx, trace, None).await
+    } else {
+        Ok(plan)
+    }
+}
+
+fn contains_limit(plan: &LogicalPlan) -> bool {
+    matches!(plan, LogicalPlan::Limit(_)) || plan.inputs().iter().any(|input| contains_limit(input))
 }
 
 fn order_and_page(
