@@ -300,6 +300,8 @@ fn apply_yield(
     for (output, source) in &renamed {
         if let Some(types) = value_types.get(source) {
             renamed_types.insert(output.clone(), types.clone());
+            renamed_types.mark_deferred(output, value_types.is_deferred(source));
+            renamed_types.mark_non_null(output, value_types.is_non_null(source));
         }
     }
     *value_types = renamed_types;
@@ -411,6 +413,7 @@ async fn plan(
         validation.output_value_types = checked_types;
         let schema = checked.schema().clone();
         if trace.validate_only {
+            validation.output_value_types.defer_all();
             let checked =
                 apply_trailing_page(checked, &context, trailing_page, ctx, &mut validation).await?;
             trace.sources.extend(validation.sources);
@@ -698,7 +701,8 @@ async fn plan_body(
                         .await?;
             }
             ast::QueryClause::BindingTable(expression) => {
-                let saved_domains = trace.output_domains.clone();
+                let saved_domains = std::mem::take(&mut trace.output_domains);
+                let saved_sources = std::mem::take(&mut trace.output_reference_sources);
                 let saved_types = std::mem::take(&mut trace.output_value_types);
                 let nested = binding::source(
                     expression,
@@ -713,10 +717,13 @@ async fn plan_body(
                 .await?;
                 let nested_domains = std::mem::replace(&mut trace.output_domains, saved_domains);
                 let nested_types = std::mem::replace(&mut trace.output_value_types, saved_types);
+                let nested_sources =
+                    std::mem::replace(&mut trace.output_reference_sources, saved_sources);
                 scope.sources.extend(trace.sources.clone());
                 plan = relational::derived(plan, &mut scope, nested)?;
                 scope.domains.extend(nested_domains);
                 scope.value_types.extend(nested_types);
+                scope.reference_sources.extend(nested_sources);
                 plan = references::prepare(plan, &mut scope, ctx, trace).await?;
             }
             ast::QueryClause::NestedQuery(query) => {
@@ -740,6 +747,9 @@ async fn plan_body(
                 scope.domains.extend(trace.output_domains.clone());
                 plan = relational::derived(plan, &mut scope, nested)?;
                 scope.value_types.extend(trace.output_value_types.clone());
+                scope
+                    .reference_sources
+                    .extend(trace.output_reference_sources.clone());
                 plan = references::prepare(plan, &mut scope, ctx, trace).await?;
             }
             ast::QueryClause::For(clause) => {
@@ -748,6 +758,7 @@ async fn plan_body(
             }
             ast::QueryClause::Let(clause) => {
                 for item in &clause.items {
+                    scope.value_types.set_schema(plan.schema().clone());
                     if item.typed || item.value_type.is_some() {
                         return Err(unsupported("typed LET definitions"));
                     }
@@ -790,7 +801,12 @@ async fn plan_body(
                     let types = expressions::stored_property_types(Some(&scope), &item.value)
                         .unwrap_or(vec![expression.get_type(plan.schema())?]);
                     let column = scope.scalar(&item.name.value);
+                    let deferred = expressions::value_types_deferred(&scope, &item.value);
+                    let non_null = !expression.nullable(plan.schema())?
+                        || expressions::known_non_null(Some(&scope), &item.value);
                     scope.value_types.insert(item.name.value.clone(), types);
+                    scope.value_types.mark_non_null(&item.name.value, non_null);
+                    scope.value_types.mark_deferred(&item.name.value, deferred);
                     if let Some(domain) = domain {
                         scope.domains.insert(item.name.value.clone(), domain);
                     }
@@ -897,6 +913,9 @@ async fn plan_body(
         scope.domains.extend(trace.output_domains.clone());
         plan = relational::derived(plan, &mut scope, nested)?;
         scope.value_types.extend(trace.output_value_types.clone());
+        scope
+            .reference_sources
+            .extend(trace.output_reference_sources.clone());
         plan = references::prepare(plan, &mut scope, ctx, trace).await?;
     }
     if body.result_clause.kind == ast::ResultKind::Finish {
@@ -977,6 +996,9 @@ fn order_and_page(
 ) -> Result<LogicalPlanBuilder> {
     if !ordering.is_empty() {
         let mut sorts = Vec::new();
+        if let Some(scope) = scope.as_deref_mut() {
+            scope.value_types.set_schema(plan.schema().clone());
+        }
         for item in ordering {
             let (next, mixed) = if let Some(scope) = scope.as_deref_mut() {
                 expressions::ensure_one_family(scope, &item.expr, "ORDER BY")?;

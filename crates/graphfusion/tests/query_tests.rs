@@ -1186,3 +1186,71 @@ async fn decimal_parameters_accept_every_exact_integer_within_precision() {
             .is_err());
     }
 }
+
+#[tokio::test]
+async fn integer_sum_overflow_is_an_execution_error() {
+    let mut session = Database::new().session();
+    let overflow = session
+        .query("FOR x IN [9223372036854775807, 1] RETURN SUM(x) AS s")
+        .await
+        .unwrap_err();
+    assert!(
+        overflow.to_string().contains("integer overflow"),
+        "{overflow}"
+    );
+    assert!(!overflow.to_string().contains("Arrow"), "{overflow}");
+    let negative = session
+        .query("FOR x IN [-9223372036854775808, -1] RETURN SUM(x) AS s")
+        .await
+        .unwrap_err();
+    assert!(
+        negative.to_string().contains("integer overflow"),
+        "{negative}"
+    );
+
+    let total = session
+        .query("FOR x IN [10, 20, NULL] RETURN SUM(x) AS s")
+        .await
+        .unwrap();
+    assert_eq!(row(&total), vec![ScalarValue::Int64(Some(30))]);
+    assert_eq!(total.schema.field(0).data_type(), &DataType::Int64);
+    let empty = session.query("RETURN SUM(NULL) AS s").await.unwrap();
+    assert_eq!(row(&empty), vec![ScalarValue::Int64(None)]);
+    let boundary = session
+        .query("FOR x IN [9223372036854775807, -1, 1] RETURN SUM(x) AS s")
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&boundary),
+        vec![ScalarValue::Int64(Some(9223372036854775807))]
+    );
+}
+
+mod checked_sum_regressions {
+    use graphfusion::Database;
+    #[tokio::test]
+    async fn repeated_integer_sum_is_one_distinct_ordering_expression() {
+        let mut s = Database::new().session();
+        s.query("FOR x IN [1,2] RETURN DISTINCT SUM(x) AS v ORDER BY SUM(x)")
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn checked_integer_sum_reuses_derived_ordering_and_null_groups() {
+    let mut session = Database::new().session();
+    let result = session
+        .query("FOR x IN [1,2] RETURN DISTINCT SUM(x) AS v ORDER BY SUM(x)+0")
+        .await
+        .unwrap();
+    assert_eq!(row(&result), vec![ScalarValue::Int64(Some(3))]);
+    let result = session
+        .query("FOR x IN [1,2] RETURN x AS x,SUM(NULL) AS v GROUP BY x ORDER BY x")
+        .await
+        .unwrap();
+    assert_eq!(result.row_count(), 2);
+    for batch in &result.batches {
+        assert_eq!(batch.column(1).null_count(), batch.num_rows());
+    }
+}

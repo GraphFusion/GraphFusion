@@ -814,6 +814,9 @@ pub(super) fn stored_property_types(
                     }
                 }
             }
+            if known_non_null(bindings, arg) {
+                break;
+            }
         }
         return known.then_some(result);
     }
@@ -865,6 +868,9 @@ pub(super) fn ensure_one_family(
     expr: &ast::Expr,
     operation: &str,
 ) -> Result<()> {
+    if value_types_deferred(bindings, expr) {
+        return Ok(());
+    }
     let Some(types) = stored_property_types(Some(bindings), expr) else {
         return Ok(());
     };
@@ -906,17 +912,192 @@ fn value_family(ty: &DataType) -> Option<String> {
     })
 }
 
-pub(super) type StoredTypes = super::casefold::CaseFoldMap<Vec<DataType>>;
+/// During OTHERWISE validation a value can still come from different branches.
+/// Its family constraint is checked again once execution selects that branch.
+#[derive(Clone, Default)]
+pub(super) struct StoredTypes {
+    values: super::casefold::CaseFoldMap<Vec<DataType>>,
+    deferred: super::casefold::CaseFoldMap<()>,
+    non_null: super::casefold::CaseFoldMap<()>,
+    schema: Option<datafusion::common::DFSchemaRef>,
+}
+
+impl std::ops::Deref for StoredTypes {
+    type Target = super::casefold::CaseFoldMap<Vec<DataType>>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl StoredTypes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert(&mut self, name: impl AsRef<str>, types: Vec<DataType>) -> Option<Vec<DataType>> {
+        self.deferred.remove(name.as_ref());
+        self.non_null.remove(name.as_ref());
+        self.values.insert(name, types)
+    }
+    pub fn extend(&mut self, other: Self) {
+        for (name, types) in other.values {
+            self.insert(&name, types);
+            self.mark_deferred(&name, other.deferred.contains_key(&name));
+            self.mark_non_null(&name, other.non_null.contains_key(&name));
+        }
+    }
+    pub fn clear(&mut self) {
+        self.values.clear();
+        self.deferred.clear();
+        self.non_null.clear();
+        self.schema = None;
+    }
+    pub fn is_deferred(&self, name: &str) -> bool {
+        self.deferred.contains_key(name)
+    }
+    pub fn mark_deferred(&mut self, name: &str, deferred: bool) {
+        if deferred {
+            self.deferred.insert(name, ());
+        } else {
+            self.deferred.remove(name);
+        }
+    }
+    pub fn set_schema(&mut self, schema: datafusion::common::DFSchemaRef) {
+        self.schema = Some(schema);
+    }
+    pub fn is_non_null(&self, name: &str) -> bool {
+        self.non_null.contains_key(name)
+    }
+    pub fn mark_non_null(&mut self, name: &str, non_null: bool) {
+        if non_null {
+            self.non_null.insert(name, ());
+        } else {
+            self.non_null.remove(name);
+        }
+    }
+    pub fn defer_all(&mut self) {
+        for name in self.values.keys() {
+            self.deferred.insert(name, ());
+        }
+    }
+}
+
+pub(super) fn value_types_deferred(scope: &super::graph::Bindings, expr: &ast::Expr) -> bool {
+    if let ast::Expr::Identifier(name) = expr {
+        return scope.value_types.is_deferred(&name.value);
+    }
+    if let ast::Expr::Coalesce(args) = expr {
+        for arg in args {
+            if value_types_deferred(scope, arg) {
+                return true;
+            }
+            if known_non_null(Some(scope), arg) {
+                break;
+            }
+        }
+        return false;
+    }
+    super::native::children(expr)
+        .into_iter()
+        .any(|child| value_types_deferred(scope, child))
+}
+
+/// A proof about successful evaluations; expressions that can return null keep
+/// their fallback provenance. Stored operators are not inferred from unified
+/// input types, since incompatible fragments can produce null.
+pub(super) fn known_non_null(bindings: Option<&super::graph::Bindings>, expr: &ast::Expr) -> bool {
+    use ast::Expr as E;
+    match expr {
+        E::Literal(ast::Literal::Null | ast::Literal::Unknown) => false,
+        E::Literal(_)
+        | E::List(_)
+        | E::TypedList { .. }
+        | E::IsNull { .. }
+        | E::IsUnknown { .. }
+        | E::IsTruth { .. } => true,
+        E::Coalesce(args) => args.iter().any(|arg| known_non_null(bindings, arg)),
+        E::Function { name, .. } => {
+            name.value.eq_ignore_ascii_case("COUNT")
+                || name.value.eq_ignore_ascii_case("COLLECT_LIST")
+        }
+        E::Identifier(name) => {
+            let Some(scope) = bindings else {
+                return false;
+            };
+            if scope.value_types.is_non_null(&name.value) {
+                return true;
+            }
+            let Some(schema) = &scope.value_types.schema else {
+                return false;
+            };
+            let value = scope
+                .scalars
+                .get(&name.value)
+                .cloned()
+                .map(Expr::Column)
+                .or_else(|| {
+                    scope
+                        .elements
+                        .get(&name.value)
+                        .map(|binding| binding.column(crate::graph::ID))
+                });
+            value.is_some_and(|value| value.nullable(schema).is_ok_and(|nullable| !nullable))
+        }
+        E::Property { base, key } => {
+            let Some(scope) = bindings else {
+                return false;
+            };
+            let E::Identifier(name) = base.as_ref() else {
+                return false;
+            };
+            let Some(schema) = &scope.value_types.schema else {
+                return false;
+            };
+            let value = if let Some(binding) = scope.elements.get(&name.value) {
+                Some(binding.property(&key.value))
+            } else if let (Some(reference), Some(column)) = (
+                scope.references.get(&name.value),
+                scope.scalars.get(&name.value),
+            ) {
+                reference
+                    .property(Expr::Column(column.clone()), &key.value, schema)
+                    .ok()
+            } else {
+                None
+            };
+            value.is_some_and(|value| value.nullable(schema).is_ok_and(|nullable| !nullable))
+        }
+        E::Unary { .. } | E::Binary { .. } if scalar_constant(expr) => {
+            super::native::children(expr)
+                .into_iter()
+                .all(|child| known_non_null(bindings, child))
+        }
+        _ => false,
+    }
+}
+
+fn scalar_constant(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(_) => true,
+        ast::Expr::Unary { .. } | ast::Expr::Binary { .. } => super::native::children(expr)
+            .into_iter()
+            .all(scalar_constant),
+        _ => false,
+    }
+}
 
 pub(super) fn merge_value_types(left: &mut StoredTypes, right: &StoredTypes) {
-    for (name, types) in right {
+    for (name, types) in right.iter() {
         let mut values = left.get(name).cloned().unwrap_or_default();
         for ty in types {
             if !values.contains(ty) {
                 values.push(ty.clone());
             }
         }
+        let deferred = left.is_deferred(name) || right.is_deferred(name);
+        let non_null = left.is_non_null(name) && right.is_non_null(name);
         left.insert(name.clone(), values);
+        left.mark_deferred(name, deferred);
+        left.mark_non_null(name, non_null);
     }
 }
 
@@ -951,6 +1132,17 @@ pub(super) fn result_value_types(
             field.name().clone(),
             types.unwrap_or_else(|| vec![field.data_type().clone()]),
         );
+        let deferred = sources
+            .get(field.name())
+            .map(|source| value_types_deferred(scope, source))
+            .unwrap_or_else(|| scope.value_types.is_deferred(field.name()));
+        result.mark_deferred(field.name(), deferred);
+        let non_null = !field.is_nullable()
+            || sources
+                .get(field.name())
+                .map(|source| known_non_null(Some(scope), source))
+                .unwrap_or_else(|| scope.value_types.is_non_null(field.name()));
+        result.mark_non_null(field.name(), non_null);
     }
     result
 }

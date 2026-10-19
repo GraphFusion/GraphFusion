@@ -99,6 +99,7 @@ pub(super) async fn for_clause(
     {
         return Err(Error::InvalidQuery("FOR variable is already bound".into()));
     }
+    scope.value_types.set_schema(plan.schema().clone());
     let mut source = Binder::with_bindings(session, plan.schema(), scope).bind(&clause.source)?;
     if source.get_type(plan.schema())? == DataType::Null {
         source = cast(source, DataType::new_list(DataType::Null, true));
@@ -110,6 +111,13 @@ pub(super) async fn for_clause(
         return Err(Error::InvalidQuery("FOR requires a list value".into()));
     }
     let source_types = super::expressions::stored_property_types(Some(scope), &clause.source);
+    let deferred = super::expressions::value_types_deferred(scope, &clause.source);
+    let element_non_null = match source.get_type(plan.schema())? {
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            !field.is_nullable()
+        }
+        _ => false,
+    } || matches!(&clause.source, ast::Expr::List(args) if !args.is_empty() && args.iter().all(|arg| super::expressions::known_non_null(Some(scope), arg)));
     let variable = scope.scalar(&clause.variable.value);
     if let Some(types) = source_types {
         let mut elements = Vec::new();
@@ -129,6 +137,12 @@ pub(super) async fn for_clause(
             .insert(clause.variable.value.clone(), elements);
     }
 
+    scope
+        .value_types
+        .mark_deferred(&clause.variable.value, deferred);
+    scope
+        .value_types
+        .mark_non_null(&clause.variable.value, element_non_null);
     if let Some(domain) = super::references::domain(&clause.source, scope) {
         scope.domains.insert(clause.variable.value.clone(), domain);
     }

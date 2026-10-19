@@ -145,7 +145,8 @@ pub(super) fn call(
         function.params.distinct = distinct;
     }
     if sum_integer {
-        expression = cast(expression, DataType::Int64);
+        expression =
+            super::arithmetic::checked_int_sum(expression.clone(), expression.get_type(schema)?)?;
     }
     if collect {
         let empty = ScalarValue::List(ScalarValue::new_list(&[], &data_type, true));
@@ -457,6 +458,7 @@ pub(super) fn result(
     body: &ast::QueryBody,
     input_order: Option<Expr>,
 ) -> Result<LogicalPlanBuilder> {
+    outer.value_types.set_schema(plan.schema().clone());
     let mut aliases = CaseFoldMap::new();
     let mut result_sources = CaseFoldMap::new();
     let mut result_scope = outer.clone();
@@ -508,6 +510,15 @@ pub(super) fn result(
             let types = super::expressions::stored_property_types(Some(outer), &item.expr)
                 .unwrap_or(vec![expr.get_type(plan.schema())?]);
             result_scope.value_types.insert(name.clone(), types);
+            result_scope.value_types.mark_non_null(
+                &name,
+                !expr.nullable(plan.schema())?
+                    || super::expressions::known_non_null(Some(outer), &item.expr),
+            );
+            result_scope.value_types.mark_deferred(
+                &name,
+                super::expressions::value_types_deferred(outer, &item.expr),
+            );
             result_scope.scalars.remove(&name);
             result_scope.elements.remove(&name);
             result_scope.references.remove(&name);
@@ -915,6 +926,9 @@ fn ensure_result_family(
         ast::Expr::Coalesce(args) => {
             for arg in args {
                 ensure_result_family(input, result, sources, arg, operation)?;
+                if super::expressions::known_non_null(Some(result), arg) {
+                    break;
+                }
             }
             return Ok(());
         }
