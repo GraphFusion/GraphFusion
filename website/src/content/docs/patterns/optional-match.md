@@ -23,6 +23,6 @@ OPTIONAL { MATCH (p)-[:Knows]->(friend) MATCH (friend)-[:Knows]->(next) }
 RETURN p.name AS name, next.name AS next ORDER BY name;
 ```
 
-The block succeeds as a whole or pads its new bindings with nulls. Null element properties and ELEMENT_ID return null. COUNT(element) ignores missing elements; null mutation targets are skipped by SET/REMOVE/DELETE. INSERT rejects a null endpoint.
+The block succeeds as a whole or pads its new bindings with nulls. Null element properties and ELEMENT_ID return null. COUNT(element) ignores missing elements; null mutation targets are skipped by SET/REMOVE/DELETE. INSERT rejects a null endpoint as an invalid query and inserts nothing.
 
 The implementation buffers optional inputs and matches. See [limits](/storage/limits/) for memory-accounting boundaries.
