@@ -53,6 +53,7 @@ struct Node {
     children: Vec<usize>,
     variants: Vec<Variant>,
     readable: Option<Expr>,
+    aggregate_key: Option<String>,
 }
 
 struct Compiler<'a> {
@@ -115,12 +116,10 @@ pub(super) fn compile(
         };
         arms.push((Box::new(variant.mask.clone()), Box::new(value)));
     }
-    let value = Expr::Case(datafusion::logical_expr::expr::Case::new(
-        None,
-        arms,
-        Some(Box::new(lit(ScalarValue::try_from(&ty)?))),
-    ));
-    let value = if datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty() {
+    let value = conditional_value(arms, &ty)?;
+    let value = if !value.column_refs().is_empty()
+        && datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty()
+    {
         compiler
             .project(vec![("value", value, dependencies)])?
             .remove(0)
@@ -246,6 +245,7 @@ impl Compiler<'_> {
             children,
             variants: groups,
             readable,
+            aggregate_key: None,
         });
         Ok(id)
     }
@@ -355,6 +355,25 @@ impl Compiler<'_> {
     }
     fn build(&mut self, expression: &ast::Expr) -> Result<usize> {
         use ast::Expr as E;
+        if matches!(expression, E::Function { .. }) {
+            let key = cache_key(
+                expression,
+                self.session,
+                self.plan.schema(),
+                self.scope,
+                self.context,
+            )?;
+            if let Some(cached) = self.scope.operator_cache.values.get(&key) {
+                if cached.expression.column_refs().iter().all(|column| {
+                    self.plan
+                        .schema()
+                        .qualified_field_from_column(column)
+                        .is_ok()
+                }) {
+                    return self.base(cached.expression.clone());
+                }
+            }
+        }
         match expression {
             E::Property { base, key } if matches!(base.as_ref(), E::Identifier(_)) => {
                 let E::Identifier(name) = base.as_ref() else {
@@ -419,9 +438,18 @@ impl Compiler<'_> {
                         .first()
                         .is_some_and(|arg| mixed_operator(arg, self.scope, false)) =>
             {
+                let key = cache_key(
+                    expression,
+                    self.session,
+                    self.plan.schema(),
+                    self.scope,
+                    self.context,
+                )?;
                 let child = self.build(&args[0])?;
                 let child = self.unified(child)?;
-                self.ast(expression.clone(), vec![child], Lazy::None)
+                let id = self.ast(expression.clone(), vec![child], Lazy::None)?;
+                self.nodes[id].aggregate_key = Some(key);
+                Ok(id)
             }
             E::NumericFunction { args, .. } => {
                 let children = args
@@ -626,6 +654,7 @@ impl Compiler<'_> {
     }
     fn emit(&mut self, id: usize, demands: Vec<Expr>) -> Result<Vec<Expr>> {
         let node = self.nodes[id].clone();
+        let cacheable = demands.len() == 1 && literal_bool(&demands[0], true);
         if matches!(node.kind, Kind::Unified) {
             let child = node.children[0];
             let variants = self.nodes[child].variants.clone();
@@ -754,16 +783,7 @@ impl Compiler<'_> {
                 };
                 arms.push((Box::new(active), Box::new(value)));
             }
-            let null = lit(ScalarValue::try_from(&variant.ty)?);
-            let value = if arms.is_empty() {
-                null
-            } else {
-                Expr::Case(datafusion::logical_expr::expr::Case::new(
-                    None,
-                    arms,
-                    Some(Box::new(null)),
-                ))
-            };
+            let value = conditional_value(arms, &variant.ty)?;
             if !value.column_refs().is_empty()
                 && datafusion::logical_expr::utils::find_aggregate_exprs([&value]).is_empty()
             {
@@ -779,8 +799,35 @@ impl Compiler<'_> {
         for (index, column) in indices.into_iter().zip(self.project(projected)?) {
             result[index] = column;
         }
+        if cacheable && result.len() == 1 {
+            if let Some(key) = node.aggregate_key {
+                if !datafusion::logical_expr::utils::find_aggregate_exprs([&result[0]]).is_empty() {
+                    self.scope.operator_cache.values.insert(
+                        key,
+                        Cached {
+                            expression: result[0].clone(),
+                        },
+                    );
+                }
+            }
+        }
         Ok(result)
     }
+}
+
+fn conditional_value(mut arms: Vec<(Box<Expr>, Box<Expr>)>, ty: &DataType) -> Result<Expr> {
+    if arms.len() == 1 && literal_bool(&arms[0].0, true) {
+        return Ok(*arms.pop().expect("single arm").1);
+    }
+    let null = lit(ScalarValue::try_from(ty)?);
+    if arms.is_empty() {
+        return Ok(null);
+    }
+    Ok(Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        arms,
+        Some(Box::new(null)),
+    )))
 }
 
 fn node_nonnull(kind: &Kind, operands: &[Vec<Variant>], indices: &[usize]) -> bool {
@@ -870,7 +917,7 @@ fn or(left: Expr, right: Expr) -> Expr {
         left.or(right)
     }
 }
-fn contains_aggregate(expr: &ast::Expr) -> bool {
+pub(super) fn contains_aggregate(expr: &ast::Expr) -> bool {
     matches!(expr, ast::Expr::Function { .. }) || children(expr).into_iter().any(contains_aggregate)
 }
 fn mixed_operator(expr: &ast::Expr, scope: &Bindings, inside: bool) -> bool {

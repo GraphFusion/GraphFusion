@@ -5057,3 +5057,177 @@ async fn stored_aggregate_wrappers_keep_empty_groups_and_repeated_values() {
         "{result:?}"
     );
 }
+
+#[tokio::test]
+async fn cross_element_comparisons_keep_stored_types() {
+    let mut session = social().await;
+    session
+        .run(
+            "INSERT (:Person {name: 'Cy', id: 10}), (:Person {name: 'Dee', id: 9});
+             INSERT (:Document {title: 'Ten', id: '10'});
+             INSERT (:Flag {name: 'on', ok: true});
+             INSERT (:Note {name: 'mark', ok: 'yes'})",
+        )
+        .await
+        .unwrap();
+
+    let matched = session
+        .query(
+            "MATCH (n:Person|Document), (m:Person)
+             WHERE n.id = m.id AND n.name = 'Ada'
+             RETURN m.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&matched), vec![vec!["Ada".to_string()]]);
+
+    let greater = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id > m.score
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&greater),
+        vec![
+            vec!["Bea".to_string()],
+            vec!["Cy".to_string()],
+            vec!["Dee".to_string()]
+        ],
+        "{}",
+        greater.logical_plan
+    );
+
+    let below = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id < m.score
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&below), vec![vec!["Ada".to_string()]]);
+
+    let equal = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id = m.score
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(equal.row_count(), 0);
+
+    let ordered = session
+        .query(
+            "MATCH (n:Person|Document), (m:Person|Document)
+             WHERE n.id > m.id AND n.name = 'Cy' AND m.name = 'Dee'
+             RETURN n.name AS left_name, m.name AS right_name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&ordered),
+        vec![vec!["Cy".to_string(), "Dee".to_string()]]
+    );
+
+    let digits = session
+        .query(
+            "MATCH (n:Person|Document), (m:Person|Document)
+             WHERE n.id = m.id AND n.name = 'Cy' AND m.title = 'Ten'
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(digits.row_count(), 0);
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE NOT n.id = m.score AND n.title = 'Spec'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(negated.row_count(), 0);
+
+    let mismatched = session
+        .query("MATCH (n:Person), (m:Document) WHERE n.id = m.id RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        mismatched
+            .to_string()
+            .contains("incomparable types Int64 and Utf8"),
+        "{mismatched}"
+    );
+
+    let no_pair = session
+        .query("MATCH (n:Flag|Note), (m:Person) WHERE n.ok = m.id RETURN n.name AS name")
+        .await
+        .unwrap_err();
+    assert!(
+        no_pair
+            .to_string()
+            .contains("incomparable types Boolean and Int64"),
+        "{no_pair}"
+    );
+}
+
+mod stored_reference_pair_regressions {
+    use graphfusion::Database;
+    async fn session() -> graphfusion::Session {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:T {v:'text'})")
+            .await
+            .unwrap();
+        s
+    }
+    #[tokio::test]
+    async fn element_and_its_reference_compare_equal() {
+        let mut s = session().await;
+        let r = s
+            .query("MATCH(n) LET r=n RETURN n.v=r.v AS same")
+            .await
+            .unwrap();
+        assert_eq!(r.row_count(), 2);
+        for b in &r.batches {
+            for i in 0..b.num_rows() {
+                assert_eq!(
+                    datafusion::common::ScalarValue::try_from_array(b.column(0), i)
+                        .unwrap()
+                        .to_string(),
+                    "true"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stored_aggregate_demand_preserves_global_cardinality() {
+    let mut session = social().await;
+    for condition in ["", "WHERE n.name='absent'"] {
+        let result = session
+            .query(&format!(
+                "MATCH(n:Person|Document) {condition} RETURN COALESCE(1,SUM(n.id+0)) AS v"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(strings(&result), vec![vec!["1".to_owned()]]);
+    }
+}
+
+#[tokio::test]
+async fn stored_aggregate_identity_survives_enclosing_order_expression() {
+    let mut session = social().await;
+    let result = session
+        .query(
+            "MATCH(n:Person|Document) RETURN DISTINCT SUM(n.id+0) AS total ORDER BY SUM(n.id+0)+0",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["3".to_owned()]]);
+}
