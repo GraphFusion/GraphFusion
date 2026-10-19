@@ -460,6 +460,7 @@ pub(super) fn result(
     let mut aliases = CaseFoldMap::new();
     let mut result_scope = outer.clone();
     let mut projections = Vec::new();
+    let mut aggregate_outputs = std::collections::BTreeSet::new();
     let mut stored = Vec::new();
     for (i, item) in body.result_clause.items.iter().enumerate() {
         if matches!(item.expr, ast::Expr::Wildcard) {
@@ -483,6 +484,9 @@ pub(super) fn result(
                     ast::Expr::Identifier(name) => name.value.clone(),
                     _ => format!("column_{}", i + 1),
                 });
+            if super::native::contains_aggregate(&item.expr) {
+                aggregate_outputs.insert(name.clone());
+            }
             // Result items are simultaneous: an earlier output name is not
             // visible to a later projection.
             let (next, expr, dependent) =
@@ -568,7 +572,13 @@ pub(super) fn result(
     all_expressions.extend(&ordering);
     let mut aggregates = find_aggregate_exprs(all_expressions);
     let explicit = !body.group_by.is_empty() || body.empty_grouping_set;
-    let grouped = explicit || !aggregates.is_empty() || having.is_some();
+    // Lazy value pruning must not erase the grouping declared by an aggregate.
+    let declared_aggregate = !aggregate_outputs.is_empty()
+        || body
+            .order_by
+            .iter()
+            .any(|item| super::native::contains_aggregate(&item.expr));
+    let grouped = explicit || !aggregates.is_empty() || having.is_some() || declared_aggregate;
     let mut groups = Vec::new();
     if explicit {
         for expr in &body.group_by {
@@ -617,12 +627,13 @@ pub(super) fn result(
             }
         }
     } else if grouped {
-        for (_, expr, property) in &projections {
+        for (name, expr, property) in &projections {
             // Property reads stay row-dependent even when every selected
             // fragment lacks the column and the binder folds them to null.
             // Grouping by that null keeps an empty match from inventing a
             // (NULL, 0) group, while a written NULL or numeric constant does not.
-            if find_aggregate_exprs([expr]).is_empty()
+            if !aggregate_outputs.contains(name)
+                && find_aggregate_exprs([expr]).is_empty()
                 && (!expr.column_refs().is_empty() || *property)
                 && !groups.contains(expr)
             {

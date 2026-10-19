@@ -258,6 +258,9 @@
 - Evaluate arithmetic and concatenation inside aggregate arguments on each
   fragment's stored type. A fragment that cannot apply the operator contributes
   null, and the argument is a type error only when no selected fragment can.
+- Compare properties of two elements in each side's stored type. A property
+  read back as a string can still match a number on the other element, and a
+  fragment that cannot compare stays unknown instead of failing the query.
 
 ## 0.2.0 — 2026-10-05
 

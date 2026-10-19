@@ -2412,7 +2412,7 @@ fn compile_property_pair(
     let expr = match parts.len() {
         0 => unknown(),
         1 => parts.pop().expect("property comparison"),
-        _ => coalesce(parts),
+        _ => super::expressions::boolean_value(cast(coalesce(parts), DataType::Int64)),
     };
     let expr = left.ensure_live(
         right.ensure_live(expr, DataType::Boolean),
@@ -2489,4 +2489,8 @@ pub(super) async fn fragment_predicate_ordered(
         plan.filter(value)?
             .project(columns.into_iter().map(Expr::Column))?,
     ))
+}
+
+pub(super) fn contains_aggregate(expression: &ast::Expr) -> bool {
+    operators::contains_aggregate(expression)
 }

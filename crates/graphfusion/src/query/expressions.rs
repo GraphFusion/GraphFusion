@@ -710,3 +710,47 @@ fn string(data_type: &DataType) -> bool {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
     )
 }
+
+/// Decode nullable integer truth flags without exposing Boolean COALESCE to
+/// optimizer rewrites that can generate incorrect dynamic join filters.
+pub(super) fn boolean_value(flag: Expr) -> Expr {
+    use datafusion::{
+        arrow::array::{BooleanArray, Int64Array},
+        error::DataFusionError,
+        logical_expr::{create_udf, ColumnarValue, ScalarUDF, Volatility},
+    };
+    use std::sync::{Arc, OnceLock};
+    static FUNCTION: OnceLock<ScalarUDF> = OnceLock::new();
+    FUNCTION
+        .get_or_init(|| {
+            create_udf(
+                "gql_boolean_value",
+                vec![DataType::Int64],
+                DataType::Boolean,
+                Volatility::Immutable,
+                Arc::new(|args| {
+                    let arrays = ColumnarValue::values_to_arrays(args)?;
+                    let flags =
+                        arrays[0]
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or_else(|| {
+                                DataFusionError::Internal("expected integer truth flags".into())
+                            })?;
+                    let output: BooleanArray =
+                        flags.iter().map(|value| value.map(|n| n != 0)).collect();
+                    if args
+                        .iter()
+                        .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
+                    {
+                        Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                            &output, 0,
+                        )?))
+                    } else {
+                        Ok(ColumnarValue::Array(Arc::new(output)))
+                    }
+                }),
+            )
+        })
+        .call(vec![flag])
+}
