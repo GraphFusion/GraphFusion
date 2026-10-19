@@ -5742,3 +5742,44 @@ async fn coalesce_families_ignore_unreachable_mixed_fallbacks() {
         "{result:?}"
     );
 }
+
+#[tokio::test]
+async fn nested_otherwise_reference_projection_keeps_the_selected_type() {
+    let mut session = social().await;
+    let query="{ MATCH(p:Person) RETURN p AS n OTHERWISE MATCH(n:Person|Document) RETURN n } RETURN n.id AS v OTHERWISE RETURN NULL AS v";
+    let result = session.query(query).await.unwrap();
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Int64);
+    let mut rows = strings(&result);
+    rows.sort();
+    assert_eq!(rows, vec![vec!["1".to_owned()], vec!["2".to_owned()]]);
+}
+
+#[tokio::test]
+async fn conditional_reference_schema_widens_numeric_and_null_fallbacks() {
+    let mut session = social().await;
+    for (predicate, rows) in [("", 2), (" {id:-1}", 1)] {
+        let query=format!("{{ MATCH(p:Person{predicate}) RETURN p AS n OTHERWISE MATCH(n:Person|Document {{id:-2}}) RETURN n }} RETURN n.id AS v OTHERWISE RETURN NULL AS v");
+        let result = session.query(&query).await.unwrap();
+        assert_eq!(
+            result.schema.field(0).data_type(),
+            &DataType::Int64,
+            "{query}"
+        );
+        assert_eq!(result.row_count(), rows);
+    }
+    let result=session.query("{ MATCH(p:Person) RETURN p AS n OTHERWISE MATCH(n:Person|Document) RETURN n } RETURN n.id AS v OTHERWISE RETURN 0.5 AS v").await.unwrap();
+    assert_eq!(result.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(result.row_count(), 2);
+    let result=session.query("{ MATCH(p:Person) RETURN p AS n OTHERWISE MATCH(n:Person|Document) RETURN n } RETURN n.id AS v OTHERWISE RETURN 'fallback' AS v").await;
+    assert!(matches!(result, Err(Error::InvalidQuery(_))), "{result:?}");
+}
+
+#[tokio::test]
+async fn stored_xor_skips_a_null_left_operand() {
+    let mut session = social().await;
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN NULL XOR (1/(n.id-1)>0) AS v")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["NULL".to_owned()]; 3]);
+}

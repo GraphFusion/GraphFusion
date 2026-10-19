@@ -27,9 +27,7 @@ use datafusion::{
     common::{Column, DFSchema, ScalarValue, TableReference},
     datasource::provider_as_source,
     functions::core::expr_fn::{coalesce, nullif},
-    logical_expr::{
-        cast, expr::BinaryExpr, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator,
-    },
+    logical_expr::{cast, lit, Expr, ExprSchemable, JoinType, LogicalPlanBuilder, Operator},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -414,10 +412,14 @@ fn compile_in(
             value.clone(),
             value_type,
         )?,
-        NativeAtom::And(left, right) => compile_in(left, schema, qualifier, metadata)?
-            .and(compile_in(right, schema, qualifier, metadata)?),
-        NativeAtom::Or(left, right) => compile_in(left, schema, qualifier, metadata)?
-            .or(compile_in(right, schema, qualifier, metadata)?),
+        NativeAtom::And(left, right) => super::expressions::logical_and(
+            compile_in(left, schema, qualifier, metadata)?,
+            compile_in(right, schema, qualifier, metadata)?,
+        ),
+        NativeAtom::Or(left, right) => super::expressions::logical_or(
+            compile_in(left, schema, qualifier, metadata)?,
+            compile_in(right, schema, qualifier, metadata)?,
+        ),
         NativeAtom::Xor(left, right) => xor(
             compile_in(left, schema, qualifier, metadata)?,
             compile_in(right, schema, qualifier, metadata)?,
@@ -515,11 +517,7 @@ fn compile_in(
 }
 
 fn xor(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryExpr(BinaryExpr::new(
-        Box::new(left),
-        Operator::NotEq,
-        Box::new(right),
-    ))
+    super::expressions::logical_xor(left, right)
 }
 
 fn compare_property(
@@ -1729,14 +1727,14 @@ fn combine_fragments(
         .collect::<Result<Vec<_>>>()?
         .into_iter();
     let expression = match composition {
-        C::And => values
-            .next()
-            .expect("left operand")
-            .and(values.next().expect("right operand")),
-        C::Or => values
-            .next()
-            .expect("left operand")
-            .or(values.next().expect("right operand")),
+        C::And => super::expressions::logical_and(
+            values.next().expect("left operand"),
+            values.next().expect("right operand"),
+        ),
+        C::Or => super::expressions::logical_or(
+            values.next().expect("left operand"),
+            values.next().expect("right operand"),
+        ),
         C::Xor => xor(
             values.next().expect("left operand"),
             values.next().expect("right operand"),

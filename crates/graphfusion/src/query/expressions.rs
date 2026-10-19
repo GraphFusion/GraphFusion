@@ -317,11 +317,11 @@ impl<'a> Binder<'a> {
                     B::And | B::Or | B::Xor => {
                         self.require(&left, boolean, "boolean operand")?;
                         self.require(&right, boolean, "boolean operand")?;
-                        match op {
-                            B::And => Operator::And,
-                            B::Or => Operator::Or,
-                            _ => Operator::NotEq,
-                        }
+                        return Ok(match op {
+                            B::And => logical_and(left, right),
+                            B::Or => logical_or(left, right),
+                            _ => logical_xor(left, right),
+                        });
                     }
                     B::Add | B::Sub | B::Mul | B::Div => {
                         self.require(&left, numeric, "numeric operand")?;
@@ -1145,4 +1145,116 @@ pub(super) fn result_value_types(
         result.mark_non_null(field.name(), non_null);
     }
     result
+}
+
+/// Integer CASE results keep boolean simplification from restoring eager batch
+/// evaluation. Duplicate only the smaller operand, bounding both associations
+/// of long chains while preserving left-to-right, per-row short circuiting.
+pub(super) fn logical_and(left: Expr, right: Expr) -> Expr {
+    logical_boolean(left, right, Operator::And)
+}
+pub(super) fn logical_or(left: Expr, right: Expr) -> Expr {
+    logical_boolean(left, right, Operator::Or)
+}
+pub(super) fn logical_xor(left: Expr, right: Expr) -> Expr {
+    logical_boolean(left, right, Operator::NotEq)
+}
+fn expression_size(expr: &Expr) -> usize {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut count = 0;
+    expr.apply(|_| {
+        count += 1;
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("counting cannot fail");
+    count
+}
+fn integer_case(operand: Option<Expr>, arms: Vec<(Expr, Expr)>, otherwise: Expr) -> Expr {
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        operand.map(Box::new),
+        arms.into_iter()
+            .map(|(a, b)| (Box::new(a), Box::new(b)))
+            .collect(),
+        Some(Box::new(otherwise)),
+    ))
+}
+fn logical_boolean(left: Expr, right: Expr, op: Operator) -> Expr {
+    use datafusion::logical_expr::{cast, lit};
+    let null = lit(ScalarValue::Int64(None));
+    let flag = if expression_size(&left) <= expression_size(&right) {
+        let (condition, decided) = match op {
+            Operator::And => (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(left.clone()),
+                    Operator::IsNotDistinctFrom,
+                    Box::new(lit(false)),
+                )),
+                lit(0_i64),
+            ),
+            Operator::Or => (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(left.clone()),
+                    Operator::IsNotDistinctFrom,
+                    Box::new(lit(true)),
+                )),
+                lit(1_i64),
+            ),
+            Operator::NotEq => (left.clone().is_null(), null.clone()),
+            _ => unreachable!(),
+        };
+        let remaining = Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)));
+        integer_case(
+            None,
+            vec![(condition, decided)],
+            cast(remaining, DataType::Int64),
+        )
+    } else {
+        let right = cast(right, DataType::Int64);
+        let arms = match op {
+            Operator::And => vec![(lit(0_i64), lit(0_i64)), (lit(1_i64), right.clone())],
+            Operator::Or => vec![(lit(1_i64), lit(1_i64)), (lit(0_i64), right.clone())],
+            Operator::NotEq => vec![
+                (lit(0_i64), right.clone()),
+                (
+                    lit(1_i64),
+                    datafusion::logical_expr::lit(1_i64) - right.clone(),
+                ),
+            ],
+            _ => unreachable!(),
+        };
+        let otherwise = match op {
+            Operator::And => integer_case(Some(right), vec![(lit(0_i64), lit(0_i64))], null),
+            Operator::Or => integer_case(Some(right), vec![(lit(1_i64), lit(1_i64))], null),
+            Operator::NotEq => null,
+            _ => unreachable!(),
+        };
+        integer_case(Some(cast(left, DataType::Int64)), arms, otherwise)
+    };
+    boolean_value(flag)
+}
+
+#[cfg(test)]
+mod boolean_plan_growth {
+    use super::*;
+    #[test]
+    fn boolean_chains_have_bounded_expression_size() {
+        for operator in [Operator::And, Operator::Or, Operator::NotEq] {
+            for right_associated in [false, true] {
+                let mut expr = Expr::Column(Column::new_unqualified("a"));
+                for _ in 0..64 {
+                    let next = Expr::Column(Column::new_unqualified("b"));
+                    expr = if right_associated {
+                        logical_boolean(next, expr, operator)
+                    } else {
+                        logical_boolean(expr, next, operator)
+                    };
+                }
+                let count = expression_size(&expr);
+                assert!(
+                    count < 3000,
+                    "{operator:?} right_associated={right_associated}: {count} nodes"
+                );
+            }
+        }
+    }
 }

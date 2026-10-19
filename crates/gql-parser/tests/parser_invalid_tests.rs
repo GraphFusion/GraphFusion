@@ -1204,3 +1204,14 @@ fn next_call_does_not_import_its_working_table_into_the_body() {
         );
     }
 }
+
+#[test]
+fn next_modifying_lookahead_does_not_import_into_nested_queries() {
+    for input in [
+        "RETURN 1 AS x NEXT INSERT (:Seen {ok: EXISTS { RETURN * }})",
+        "RETURN 1 AS x NEXT SET x.ok = EXISTS { RETURN * }",
+        "RETURN 1 AS x NEXT INSERT (:Seen {ok: EXISTS { RETURN * }}) RETURN *",
+    ] {
+        parse(input).expect_err(input);
+    }
+}

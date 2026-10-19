@@ -674,3 +674,8 @@ fn next_call_keeps_explicit_inner_bindings_and_the_outer_continuation() {
         gql_parser::parse(input).unwrap_or_else(|error| panic!("{input}: {error}"));
     }
 }
+
+#[test]
+fn next_modifying_lookahead_keeps_the_outer_input() {
+    gql_parser::parse("RETURN 1 AS x NEXT INSERT (n:Seen {id:x}) RETURN *").unwrap();
+}

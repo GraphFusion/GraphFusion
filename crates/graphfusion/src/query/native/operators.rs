@@ -35,6 +35,7 @@ enum Lazy {
     NullIf,
     And,
     Or,
+    Xor,
 }
 #[derive(Clone)]
 enum Kind {
@@ -387,6 +388,7 @@ impl Compiler<'_> {
                 let lazy = match op {
                     ast::BinaryOp::And => Lazy::And,
                     ast::BinaryOp::Or => Lazy::Or,
+                    ast::BinaryOp::Xor => Lazy::Xor,
                     _ => Lazy::None,
                 };
                 self.ast(expression.clone(), vec![a, b], lazy)
@@ -723,7 +725,7 @@ impl Compiler<'_> {
                                     lit(true)
                                 }
                                 Lazy::Coalesce => first.clone().is_null(),
-                                Lazy::NullIf => first.clone().is_not_null(),
+                                Lazy::NullIf | Lazy::Xor => first.clone().is_not_null(),
                                 Lazy::And => first.clone().is_not_false(),
                                 Lazy::Or => first.clone().is_not_true(),
                                 Lazy::None => lit(true),
