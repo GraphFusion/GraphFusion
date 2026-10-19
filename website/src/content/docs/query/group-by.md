@@ -26,3 +26,5 @@ GROUP BY () HAVING COUNT(*) > 0;
 SELECT HAVING filters completed groups. Ungrouped input references and nested aggregate calls are rejected. An empty global aggregate still returns one row: COUNT is 0, COLLECT_LIST is an empty list, and numeric aggregates are null.
 
 [Aggregate functions →](/expressions/aggregates/)
+
+Arithmetic and concatenation in HAVING use each stored fragment type. An incompatible operation produces null before IS UNKNOWN or other enclosing wrappers are evaluated. Stored helper columns remain dependent on the original group bindings.

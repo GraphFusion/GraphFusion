@@ -4644,3 +4644,219 @@ async fn stored_operator_demands_keep_long_chains_bounded() {
         result.logical_plan.len()
     );
 }
+
+#[tokio::test]
+async fn having_operators_use_stored_types() {
+    let mut session = social().await;
+    let added = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.name AS name
+             GROUP BY n HAVING n.id + 0 = 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&added), vec![vec!["Ada".to_string()]]);
+
+    let multiplied = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.name AS name
+             GROUP BY n HAVING n.id * 1 = 2",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&multiplied), vec![vec!["Bea".to_string()]]);
+
+    let negated = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.name AS name
+             GROUP BY n HAVING -n.id = -1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Ada".to_string()]]);
+
+    let not_stringified = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.name AS name
+             GROUP BY n HAVING n.id || '' = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_stringified.row_count(), 0);
+
+    let concatenated = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.title AS title
+             GROUP BY n HAVING n.id || '!' = 'doc!'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&concatenated), vec![vec!["Spec".to_string()]]);
+
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.name AS name
+             GROUP BY n HAVING n.id + 0 = 1 OR n.name = 'Bea' ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&either),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let kept = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.id AS id
+             GROUP BY n HAVING n.id + 0 = 1 OR TRUE ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&kept),
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["doc".to_string()]
+        ]
+    );
+
+    let dropped = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.name AS name
+             GROUP BY n HAVING NOT (n.id + 0 = 1) ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&dropped), vec![vec!["Bea".to_string()]]);
+
+    let labeled = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.id AS id
+             GROUP BY n HAVING n.id + 0 = 1 OR n:Document ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&labeled),
+        vec![vec!["1".to_string()], vec!["doc".to_string()]]
+    );
+
+    let widened = session
+        .query(
+            "MATCH (n:Person|Metric) SELECT n.score AS score
+             GROUP BY n HAVING n.score + 0 > 1 ORDER BY score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
+
+    let plain = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.name AS name
+             GROUP BY n HAVING n.name = 'Ada'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&plain), vec![vec!["Ada".to_string()]]);
+
+    let incompatible = session
+        .query(
+            "MATCH (d:Document) SELECT d.title AS title
+             GROUP BY d HAVING d.id + 0 = 1",
+        )
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+    let incompatible_or = session
+        .query(
+            "MATCH (d:Document) SELECT d.title AS title
+             GROUP BY d HAVING d.id + 0 = 1 OR TRUE",
+        )
+        .await;
+    assert!(
+        matches!(incompatible_or, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible_or:?}"
+    );
+
+    let ungrouped = session
+        .query(
+            "MATCH (n:Person|Document) SELECT n.name AS name
+             HAVING n.id + 0 = 1",
+        )
+        .await;
+    assert!(
+        matches!(ungrouped, Err(graphfusion::Error::InvalidQuery(_))),
+        "{ungrouped:?}"
+    );
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d)",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() SELECT e.since AS since
+             GROUP BY e HAVING e.since * 1 = 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge), vec![vec!["1".to_string()]]);
+    let edge_text = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() SELECT e.since AS since
+             GROUP BY e HAVING e.since || '' = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge_text.row_count(), 0);
+}
+
+mod stored_clause_95_regressions {
+    use graphfusion::Database;
+    async fn session() -> graphfusion::Session {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:T {v:'text'})")
+            .await
+            .unwrap();
+        s
+    }
+    #[tokio::test]
+    async fn having_unknown_wrapper_observes_incompatible_operator() {
+        let mut s = session().await;
+        let r = s
+            .query("MATCH(n) SELECT n.v AS v GROUP BY n HAVING (n.v+0=1) IS UNKNOWN")
+            .await
+            .unwrap();
+        assert_eq!(r.row_count(), 1, "{r:?}");
+    }
+}
+
+#[tokio::test]
+async fn stored_having_respects_group_bindings_and_output_aliases() {
+    let mut session = social().await;
+    let error = session.query("MATCH(n:Person|Metric) LET bucket=n.score*0 SELECT COUNT(*) AS c GROUP BY bucket HAVING n.score+0>1").await;
+    assert!(
+        matches!(error, Err(graphfusion::Error::InvalidQuery(_))),
+        "{error:?}"
+    );
+    let result = session.query("MATCH(n:Person|Metric) SELECT n.score+0 AS value, COUNT(*) AS c GROUP BY value HAVING value>1 ORDER BY value").await.unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![
+            vec!["1.5".to_owned(), "1".to_owned()],
+            vec!["2".to_owned(), "1".to_owned()]
+        ]
+    );
+}

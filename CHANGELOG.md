@@ -251,6 +251,10 @@
 - Compute `STDDEV_POP(DISTINCT)` and `STDDEV_SAMP(DISTINCT)` from each distinct
   number. Repeated inputs do not change the deviation; one distinct value has
   population deviation 0 and a null sample deviation.
+- Evaluate SELECT HAVING arithmetic and concatenation on each fragment's stored
+  type when the grouped columns cover the predicate. A fragment that cannot
+  apply the operator is unknown, and the operator is a type error only when no
+  selected fragment can.
 
 ## 0.2.0 — 2026-10-05
 
