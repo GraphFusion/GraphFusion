@@ -187,6 +187,8 @@
   outer one.
 - Apply an earlier `LIMIT` or `OFFSET` before a later `ORDER BY`, so the later
   sort reorders only that window.
+- Project variables declared by `INSERT` from `RETURN *`. An anonymous insert
+  still has no columns for the wildcard to expand.
 
 ## 0.2.0 — 2026-10-05
 

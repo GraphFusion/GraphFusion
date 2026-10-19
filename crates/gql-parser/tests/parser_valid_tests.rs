@@ -652,4 +652,9 @@ valid_cases! {
         input: "MATCH (n) FINISH",
         statement_count: 1,
     }
+
+    insert_variable_return_star {
+        input: "INSERT (n:Seen {k: 1})-[e:E]->(m:Seen {k: 2}) RETURN *",
+        statement_count: 1,
+    }
 }
