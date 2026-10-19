@@ -5,14 +5,14 @@ sidebar:
   order: 10
 ---
 
-Parenthesized subpaths let you constrain a segment before an enclosing selector. Repeating a group joins each iteration's endpoint to the next start.
+Parenthesized subpaths let you constrain a segment before an enclosing selector. Repeating a group joins each iteration's endpoint to the next start. A repeated body that is a fixed chain of nodes and edges extends only the paths reached so far. A quantifier, alternative, or optional subpath inside the body is still matched as one step and then joined to that frontier. That one-step relation is shared across input rows when the body does not read an outer variable; dependent bodies keep a step for each row.
 
 ```gql test
 MATCH p = (a {name: 'Alice'})((x)-[edges:Knows]->(y)){0,2}(b)
 RETURN b.name AS destination, PATH_LENGTH(p) AS hops ORDER BY hops;
 ```
 
-New element declarations inside a repeated group become ordered lists outside it. Zero repetitions expose empty lists. Nested groups concatenate their lists. Variables must be fresh relative to the outer bindings; declaration capture is rejected.
+New element declarations inside a repeated group become ordered lists outside it. Zero repetitions expose empty lists. Nested groups concatenate their lists. Variables must be fresh relative to the outer bindings; declaration capture is rejected. A MATCH `WHERE` sees those lists, so `WHERE x.name = 'Alice'` is rejected. Put that comparison on the node inside the group to test each repetition.
 
 ```gql test
 MATCH p = ALL SHORTEST
