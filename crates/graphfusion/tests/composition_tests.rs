@@ -4860,3 +4860,45 @@ async fn stored_having_respects_group_bindings_and_output_aliases() {
         ]
     );
 }
+
+#[tokio::test]
+async fn stored_mutations_read_earlier_insert_bindings() {
+    let mut session = Database::new().session();
+    session
+        .run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:F {v:1.5})")
+        .await
+        .unwrap();
+    session
+        .run("MATCH(n:P|F) INSERT(a:A {v:10}),(:Copy {v:n.v+a.v})")
+        .await
+        .unwrap();
+    let result = session
+        .query("MATCH(c:Copy) RETURN c.v AS v ORDER BY v")
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&result),
+        vec![vec!["11".to_owned()], vec!["11.5".to_owned()]]
+    );
+}
+
+#[tokio::test]
+async fn null_set_targets_skip_stored_map_evaluation() {
+    let mut session = Database::new().session();
+    session
+        .run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:F {v:1.5})")
+        .await
+        .unwrap();
+    let result=session.run("MATCH(a:P|F),(b:P|F) OPTIONAL MATCH(p:Missing) SET p={x:a.v/0,y:b.v+0} RETURN a.v AS v").await.unwrap();
+    let graphfusion::StatementOutput::Query(result) = result.into_iter().next().unwrap() else {
+        panic!("expected query");
+    };
+    assert_eq!(result.row_count(), 4);
+    let result = session
+        .run("MATCH(a:P|F) OPTIONAL MATCH(p:Missing) SET p.x=unbound+1 RETURN a.v AS v")
+        .await;
+    assert!(
+        matches!(result, Err(graphfusion::Error::InvalidQuery(_))),
+        "{result:?}"
+    );
+}
