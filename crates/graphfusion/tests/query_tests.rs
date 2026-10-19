@@ -666,3 +666,70 @@ async fn repeated_float_aggregate_orders_by_the_same_expression() {
         .unwrap();
     assert_eq!(table(&result), vec![vec!["1", "20"], vec!["2", "5"]]);
 }
+
+#[tokio::test]
+async fn repeated_reference_expression_orders_by_the_same_value() {
+    let mut session = Database::new().session();
+    session
+        .execute("CREATE GRAPH g ANY; SESSION SET GRAPH g")
+        .unwrap();
+    session
+        .run(
+            "INSERT (:P {name:'Ann', age:30}), (:P {name:'Ann', age:30}), (:P {name:'Bea', age:20})",
+        )
+        .await
+        .unwrap();
+    session
+        .run("MATCH (a {name:'Ann'}), (b {name:'Bea'}) INSERT (a)-[:E]->(b)")
+        .await
+        .unwrap();
+    let result = session
+        .query(
+            "MATCH (p:P) LET person = p RETURN DISTINCT person.name AS name ORDER BY person.name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["Ann"], vec!["Bea"]]);
+    let result = session
+        .query(
+            "MATCH (p:P) LET person = p RETURN person.name AS name, COUNT(*) AS rows ORDER BY person.name DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["Bea", "1"], vec!["Ann", "2"]]);
+    let result = session
+        .query(
+            "MATCH (p:P) LET person = p RETURN DISTINCT person.age AS age ORDER BY person.age DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["30"], vec!["20"]]);
+    let result = session
+        .query(
+            "MATCH (p:P) LET person = p RETURN DISTINCT PROPERTY_EXISTS(person, name) AS present ORDER BY PROPERTY_EXISTS(person, name)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["true"]]);
+    let result = session
+        .query(
+            "MATCH (p:P) LET person = p RETURN DISTINCT person IS LABELED P AS labeled ORDER BY person IS LABELED P",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["true"]]);
+    let result = session
+        .query(
+            "MATCH (a)-[e:E]->(b) LET edge = e RETURN DISTINCT edge IS DIRECTED AS directed ORDER BY edge IS DIRECTED",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["true"]]);
+    let result = session
+        .query(
+            "MATCH p = (a {name:'Ann'})-[:E]->(b) FOR x IN ELEMENTS(p) FILTER x.name IS NOT NULL RETURN DISTINCT x.name AS name ORDER BY x.name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(table(&result), vec![vec!["Ann"], vec!["Bea"]]);
+}
