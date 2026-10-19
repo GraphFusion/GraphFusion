@@ -1976,3 +1976,142 @@ async fn inline_bound_comparison_keeps_a_null_test_conjunct() {
     let r=s.query("LET k=1 MATCH(n:Person|Document WHERE n.id=k AND n.name IS NOT NULL) RETURN n.name AS name").await.unwrap();
     assert_eq!(strings(&r), vec![vec!["Ada".to_string()]]);
 }
+
+#[tokio::test]
+async fn where_property_exists_keeps_stored_types() {
+    let mut session = social().await;
+    session
+        .run("INSERT (:Person {name: 'Cara'})")
+        .await
+        .unwrap();
+
+    let present = session
+        .query(
+            "MATCH (n:Person|Document) WHERE PROPERTY_EXISTS(n, id) AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&present), vec![vec!["Ada".to_string()]]);
+
+    let titled = session
+        .query(
+            "MATCH (n:Person|Document) WHERE n.id = 1 OR PROPERTY_EXISTS(n, title)
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&titled),
+        vec![vec!["Ada".to_string()], vec!["NULL".to_string()]]
+    );
+
+    let missing_id = session
+        .query(
+            "MATCH (n:Person|Document) WHERE NOT PROPERTY_EXISTS(n, id) OR n.id = 1
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&missing_id),
+        vec![vec!["Ada".to_string()], vec!["Cara".to_string()]]
+    );
+
+    let document = session
+        .query(
+            "MATCH (n:Person|Document)
+             WHERE PROPERTY_EXISTS(n, title) AND n.id = 'doc'
+             RETURN n.title AS title",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&document), vec![vec!["Spec".to_string()]]);
+
+    let no_title = session
+        .query(
+            "MATCH (n:Person|Document) WHERE PROPERTY_EXISTS(n, title) AND n.id = 1
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_title.row_count(), 0);
+
+    let inline = session
+        .query(
+            "MATCH (n:Person|Document WHERE n.id = 1 OR PROPERTY_EXISTS(n, title))
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&inline),
+        vec![vec!["Ada".to_string()], vec!["NULL".to_string()]]
+    );
+
+    let string_id = session
+        .query(
+            "MATCH (n:Person|Document) WHERE PROPERTY_EXISTS(n, id) OR n.id = 'doc'
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&string_id),
+        vec![
+            vec!["Ada".to_string()],
+            vec!["Bea".to_string()],
+            vec!["NULL".to_string()]
+        ]
+    );
+
+    let joined = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             WHERE n.id = 1 AND PROPERTY_EXISTS(m, name)
+             RETURN n.name AS name, m.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&joined),
+        vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
+
+    let absent = session
+        .query(
+            "MATCH (n:Person|Document) WHERE NOT PROPERTY_EXISTS(n, id)
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&absent), vec![vec!["Cara".to_string()]]);
+
+    let error = session
+        .query(
+            "MATCH (d:Document) WHERE d.id = 1 OR PROPERTY_EXISTS(d, title)
+             RETURN d.title AS title",
+        )
+        .await
+        .unwrap_err();
+    match error {
+        Error::InvalidQuery(message) => assert!(message.contains("incomparable"), "{message}"),
+        other => panic!("expected invalid query, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn stored_exists_keeps_internal_fields_hidden_and_optional_misses_unknown() {
+    let mut s = social().await;
+    assert_eq!(
+        s.query("MATCH(n) WHERE PROPERTY_EXISTS(n,__gf_id) RETURN n")
+            .await
+            .unwrap()
+            .row_count(),
+        0
+    );
+    let r=s.query("LET keep=TRUE OPTIONAL MATCH(n:Person|Document {name:'absent'}) FILTER PROPERTY_EXISTS(n,id) OR keep RETURN 1 AS v").await.unwrap();
+    assert_eq!(r.row_count(), 1);
+    let r=s.query("MATCH(n:Person|Document) LET r=n,k=1 FILTER r.id=k AND PROPERTY_EXISTS(r,id) RETURN r.name AS name").await.unwrap();
+    assert_eq!(strings(&r), vec![vec!["Ada".to_string()]]);
+}

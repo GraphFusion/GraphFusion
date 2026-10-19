@@ -34,6 +34,9 @@ pub(super) enum NativeAtom {
     Or(Box<NativeAtom>, Box<NativeAtom>),
     Xor(Box<NativeAtom>, Box<NativeAtom>),
     Not(Box<NativeAtom>),
+    Exists {
+        property: String,
+    },
     Null {
         property: Option<String>,
         negated: bool,
@@ -192,6 +195,7 @@ pub(super) fn validate<'a>(
 
 fn validate_atom(atom: &NativeAtom, tables: &[&Table]) -> Result<()> {
     match atom {
+        NativeAtom::Exists { .. } => Ok(()),
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => {
@@ -297,6 +301,7 @@ fn qualified_column(qualifier: Option<&str>, property: &str) -> Expr {
 
 fn compile_in(atom: &NativeAtom, schema: &Schema, qualifier: Option<&str>) -> Result<Expr> {
     Ok(match atom {
+        NativeAtom::Exists { property } => exists_expr(schema, property, qualifier),
         NativeAtom::And(left, right) => {
             compile_in(left, schema, qualifier)?.and(compile_in(right, schema, qualifier)?)
         }
@@ -472,6 +477,25 @@ fn null_expr(
     }
 }
 
+fn exists_expr(schema: &Schema, property: &str, qualifier: Option<&str>) -> Expr {
+    if schema.field_with_name(crate::graph::ID).is_err() {
+        return unknown();
+    }
+    let present = if !property.starts_with("__gf_") && schema.field_with_name(property).is_ok() {
+        qualified_column(qualifier, property).is_not_null()
+    } else {
+        lit(false)
+    };
+    Expr::Case(datafusion::logical_expr::expr::Case::new(
+        None,
+        vec![(
+            Box::new(qualified_column(qualifier, crate::graph::ID).is_null()),
+            Box::new(unknown()),
+        )],
+        Some(Box::new(present)),
+    ))
+}
+
 fn column(name: &str) -> Expr {
     Expr::Column(Column::new_unqualified(name))
 }
@@ -488,6 +512,9 @@ enum Local {
     Or(Box<Local>, Box<Local>),
     Xor(Box<Local>, Box<Local>),
     Not(Box<Local>),
+    Exists {
+        property: String,
+    },
     Null {
         property: Option<String>,
         negated: bool,
@@ -592,6 +619,12 @@ fn sole_variable(expr: &ast::Expr) -> Option<String> {
 
 fn local_tree(expr: &ast::Expr, variable: &str) -> Option<Local> {
     match expr {
+        ast::Expr::PropertyExists {
+            variable: name,
+            property,
+        } if name.value == variable => Some(Local::Exists {
+            property: property.value.clone(),
+        }),
         ast::Expr::Binary {
             left,
             op: ast::BinaryOp::And,
@@ -751,6 +784,9 @@ fn bind_local_value(
     working_row: bool,
 ) -> Result<Option<NativeAtom>> {
     Ok(match local {
+        Local::Exists { property } => Some(NativeAtom::Exists {
+            property: property.clone(),
+        }),
         Local::And(left, right) => match (
             bind_local_value(session, schema, scope, left, working_row)?,
             bind_local_value(session, schema, scope, right, working_row)?,
@@ -935,6 +971,9 @@ fn property_bases(expr: &ast::Expr, names: &mut BTreeSet<String>) {
         if let ast::Expr::Identifier(name) = expr.as_ref() {
             names.insert(name.value.clone());
         }
+    }
+    if let ast::Expr::PropertyExists { variable, .. } = expr {
+        names.insert(variable.value.clone());
     }
     for child in children(expr) {
         property_bases(child, names);
@@ -1168,6 +1207,7 @@ fn property_mixes(scope: &Bindings, binding: &ElementBinding, atom: &NativeAtom)
 
 fn atom_mixes(atom: &NativeAtom, tables: &[&Table]) -> bool {
     match atom {
+        NativeAtom::Exists { .. } => false,
         NativeAtom::And(left, right)
         | NativeAtom::Or(left, right)
         | NativeAtom::Xor(left, right) => atom_mixes(left, tables) || atom_mixes(right, tables),
