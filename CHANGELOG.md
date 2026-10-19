@@ -189,6 +189,8 @@
   sort reorders only that window.
 - Project variables declared by `INSERT` from `RETURN *`. An anonymous insert
   still has no columns for the wildcard to expand.
+- Project `IS [NOT] TRUE` and `IS [NOT] FALSE` under `DISTINCT`. A null boolean
+  is not true and not false, and the predicate no longer fails planning.
 
 ## 0.2.0 — 2026-10-05
 
