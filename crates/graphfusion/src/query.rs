@@ -377,7 +377,7 @@ async fn plan(
         for (body, context) in std::iter::once((&query.body, &first_context))
             .chain(query.set_operations.iter().map(|op| (&op.body, &context)))
         {
-            let (branch, _) = plan_body(
+            let (branch, branch_graph) = plan_body(
                 body,
                 context,
                 tx,
@@ -390,7 +390,9 @@ async fn plan(
             let branch = relational::coerce(branch, &schema)?;
             let (schema, batches) = trace.collect(ctx, &branch).await?;
             if batches.iter().any(|b| b.num_rows() > 0) {
-                return Ok((execution::memory(schema, batches)?.build()?, graph));
+                // Keep the graph focus of the branch that produced the rows.
+                // An empty earlier branch must not leave NEXT on its graph.
+                return Ok((execution::memory(schema, batches)?.build()?, branch_graph));
             }
         }
         return Ok((
