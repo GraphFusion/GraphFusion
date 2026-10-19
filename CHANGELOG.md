@@ -71,6 +71,9 @@
 - Refresh a bound element without adopting a one-label-apart neighbor's
   property types. A label edit can still find the moved row, and a later
   comparison keeps the type stored on the bound label set.
+- Recognize a repeated arithmetic expression as the same `ORDER BY` key. `DISTINCT`
+  and grouped results can sort by `n + 1` when that expression is already the
+  projected or grouping value, instead of failing while planning.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
