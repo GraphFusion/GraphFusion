@@ -82,6 +82,9 @@
   `ORDER BY` key. `DISTINCT` and grouped results can sort by `person.name`,
   `PROPERTY_EXISTS`, `IS LABELED`, or `IS DIRECTED` when that expression is
   already projected or grouped.
+- Recognize a repeated element value as the same `ORDER BY` key. `DISTINCT` and
+  grouped results can sort by a returned node or edge, or by `ELEMENTS(path)`,
+  when that value is already projected.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read

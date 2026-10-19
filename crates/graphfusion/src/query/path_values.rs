@@ -12,7 +12,9 @@ use datafusion::{
     common::{DFSchema, ScalarValue},
     error::DataFusionError,
     functions::core::expr_fn::get_field,
-    logical_expr::{cast, create_udf, lit, ColumnarValue, Expr, ExprSchemable, Volatility},
+    logical_expr::{
+        cast, create_udf, lit, ColumnarValue, Expr, ExprSchemable, ScalarUDF, Volatility,
+    },
 };
 use std::sync::Arc;
 
@@ -106,100 +108,134 @@ pub(super) fn references(graph: Expr, nodes: Option<Expr>, edges: Option<Expr>) 
     let mut arguments = vec![graph];
     arguments.extend(nodes);
     arguments.extend(edges);
-    create_udf(
-        name,
-        input,
-        DataType::new_list(data_type(), true),
-        Volatility::Immutable,
-        Arc::new(move |args| {
-            let arrays = ColumnarValue::values_to_arrays(args)?;
-            let graphs = arrays[0]
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| DataFusionError::Internal("element graph type".into()))?;
-            let ids = arrays[1]
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| DataFusionError::Internal("element list type".into()))?;
-            let edge_ids = if path {
-                Some(
-                    arrays[2]
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .ok_or_else(|| DataFusionError::Internal("path edge list type".into()))?,
-                )
-            } else {
-                None
-            };
-            let mut builder = ListBuilder::new(StructBuilder::from_fields(fields(), 0));
-            for row in 0..ids.len() {
-                if graphs.is_null(row)
-                    || ids.is_null(row)
-                    || edge_ids.is_some_and(|a| a.is_null(row))
-                {
-                    builder.append(false);
-                    continue;
-                }
-                let values = ids.value(row);
-                let values = values
+    // One encoder per value shape. A fresh closure would not compare equal, so
+    // DISTINCT and grouped plans could not recognize the same element or
+    // ELEMENTS(path) expression in ORDER BY.
+    element_list_udf(name, input, path, node_group).call(arguments)
+}
+
+fn element_list_udf(
+    name: &'static str,
+    input: Vec<DataType>,
+    path: bool,
+    node_group: bool,
+) -> ScalarUDF {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<ScalarUDF> = OnceLock::new();
+    static NODES: OnceLock<ScalarUDF> = OnceLock::new();
+    static EDGES: OnceLock<ScalarUDF> = OnceLock::new();
+    let slot = if path {
+        &PATH
+    } else if node_group {
+        &NODES
+    } else {
+        &EDGES
+    };
+    slot.get_or_init(|| {
+        create_udf(
+            name,
+            input,
+            DataType::new_list(data_type(), true),
+            Volatility::Immutable,
+            Arc::new(move |args| {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let graphs = arrays[0]
                     .as_any()
                     .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| DataFusionError::Internal("element ID type".into()))?;
-                let edges = edge_ids.map(|a| a.value(row));
-                let edges = edges.as_ref().map(|a| {
-                    a.as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .expect("UInt64 edge IDs")
-                });
-                if edges.is_some_and(|e| e.len() + 1 != values.len()) {
-                    return Err(DataFusionError::Internal(
-                        "invalid path value lengths".into(),
-                    ));
-                }
-                for (index, id) in values.iter().enumerate() {
-                    let Some(id) = id else {
-                        if path {
-                            return Err(DataFusionError::Internal("null path element ID".into()));
-                        }
-                        let value = builder.values();
-                        value
-                            .field_builder::<UInt64Builder>(0)
-                            .expect("graph builder")
-                            .append_null();
-                        value
-                            .field_builder::<StringBuilder>(1)
-                            .expect("kind builder")
-                            .append_null();
-                        value
-                            .field_builder::<UInt64Builder>(2)
-                            .expect("id builder")
-                            .append_null();
-                        value.append(false);
+                    .ok_or_else(|| DataFusionError::Internal("element graph type".into()))?;
+                let ids = arrays[1]
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .ok_or_else(|| DataFusionError::Internal("element list type".into()))?;
+                let edge_ids = if path {
+                    Some(
+                        arrays[2]
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .ok_or_else(|| {
+                                DataFusionError::Internal("path edge list type".into())
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                let mut builder = ListBuilder::new(StructBuilder::from_fields(fields(), 0));
+                for row in 0..ids.len() {
+                    if graphs.is_null(row)
+                        || ids.is_null(row)
+                        || edge_ids.is_some_and(|a| a.is_null(row))
+                    {
+                        builder.append(false);
                         continue;
-                    };
-                    append(
-                        builder.values(),
-                        graphs.value(row),
-                        if path || node_group { "n" } else { "e" },
-                        id,
-                    );
-                    if let Some(edges) = edges {
-                        if index < edges.len() {
-                            append(builder.values(), graphs.value(row), "e", edges.value(index));
+                    }
+                    let values = ids.value(row);
+                    let values = values
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| DataFusionError::Internal("element ID type".into()))?;
+                    let edges = edge_ids.map(|a| a.value(row));
+                    let edges = edges.as_ref().map(|a| {
+                        a.as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .expect("UInt64 edge IDs")
+                    });
+                    if edges.is_some_and(|e| e.len() + 1 != values.len()) {
+                        return Err(DataFusionError::Internal(
+                            "invalid path value lengths".into(),
+                        ));
+                    }
+                    for (index, id) in values.iter().enumerate() {
+                        let Some(id) = id else {
+                            if path {
+                                return Err(DataFusionError::Internal(
+                                    "null path element ID".into(),
+                                ));
+                            }
+                            let value = builder.values();
+                            value
+                                .field_builder::<UInt64Builder>(0)
+                                .expect("graph builder")
+                                .append_null();
+                            value
+                                .field_builder::<StringBuilder>(1)
+                                .expect("kind builder")
+                                .append_null();
+                            value
+                                .field_builder::<UInt64Builder>(2)
+                                .expect("id builder")
+                                .append_null();
+                            value.append(false);
+                            continue;
+                        };
+                        append(
+                            builder.values(),
+                            graphs.value(row),
+                            if path || node_group { "n" } else { "e" },
+                            id,
+                        );
+                        if let Some(edges) = edges {
+                            if index < edges.len() {
+                                append(
+                                    builder.values(),
+                                    graphs.value(row),
+                                    "e",
+                                    edges.value(index),
+                                );
+                            }
                         }
                     }
+                    builder.append(true);
                 }
-                builder.append(true);
-            }
-            let output: ArrayRef = Arc::new(builder.finish());
-            if args.iter().all(|a| matches!(a, ColumnarValue::Scalar(_))) {
-                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
-                    &output, 0,
-                )?))
-            } else {
-                Ok(ColumnarValue::Array(output))
-            }
-        }),
-    )
-    .call(arguments)
+                let output: ArrayRef = Arc::new(builder.finish());
+                if args.iter().all(|a| matches!(a, ColumnarValue::Scalar(_))) {
+                    Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                        &output, 0,
+                    )?))
+                } else {
+                    Ok(ColumnarValue::Array(output))
+                }
+            }),
+        )
+    })
+    .clone()
 }
