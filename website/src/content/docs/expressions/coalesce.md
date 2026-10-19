@@ -19,3 +19,11 @@ Both functions execute through DataFusion. Null-only inputs retain a null type u
 ```gql test
 RETURN COALESCE(NULL, X'0A') AS value, COALESCE(X'0B', NULL) AS first;
 ```
+
+`COALESCE` evaluates a fallback only on rows that still need it. Mixing integer and float arguments returns a float; a selected integer must be exactly representable as a float. `NULLIF` compares integer/float pairs by their exact values and keeps the left argument's type.
+
+```gql test
+RETURN COALESCE(1, 1 / 0) AS guarded,
+       COALESCE(1, 1.5) AS widened,
+       NULLIF(9007199254740993, 9007199254740992.0) AS kept;
+```
