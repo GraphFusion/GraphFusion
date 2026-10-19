@@ -515,6 +515,13 @@ impl<'a> Binder<'a> {
                 quantifier,
                 args,
             } if self.aggregates => {
+                if matches!(name.value.to_ascii_uppercase().as_str(), "MIN" | "MAX") {
+                    if let Some(bindings) = self.bindings {
+                        for arg in args {
+                            ensure_one_family(bindings, arg, &name.value)?;
+                        }
+                    }
+                }
                 let star = args.len() == 1 && matches!(args[0], E::Wildcard);
                 let bound = if star {
                     vec![]
@@ -753,4 +760,106 @@ pub(super) fn boolean_value(flag: Expr) -> Expr {
             )
         })
         .call(vec![flag])
+}
+
+/// A value-preserving wrapper retains the stored families of its properties.
+fn stored_property_types(
+    bindings: Option<&super::graph::Bindings>,
+    expr: &ast::Expr,
+) -> Option<Vec<DataType>> {
+    if let ast::Expr::Coalesce(args) = expr {
+        let mut result = Vec::new();
+        let mut known = false;
+        for arg in args {
+            if let Some(types) = stored_property_types(bindings, arg) {
+                known = true;
+                for ty in types {
+                    if !result.contains(&ty) {
+                        result.push(ty);
+                    }
+                }
+            }
+        }
+        return known.then_some(result);
+    }
+    if let ast::Expr::NullIf { left, .. } = expr {
+        return stored_property_types(bindings, left);
+    }
+    let ast::Expr::Property { base, key } = expr else {
+        return None;
+    };
+    let ast::Expr::Identifier(name) = base.as_ref() else {
+        return None;
+    };
+    let bindings = bindings?;
+    let sources = if let Some(element) = bindings.elements.get(&name.value) {
+        vec![element.clone()]
+    } else if let Some(reference) = bindings.references.get(&name.value) {
+        reference.parts.clone()
+    } else {
+        bindings.reference_sources.get(&name.value)?.clone()
+    };
+    let mut result = Vec::new();
+    for source in sources {
+        let Some(graph) = bindings.sources.get(&source.graph) else {
+            continue;
+        };
+        let tables: Vec<&crate::graph::Table> = match source.kind {
+            super::graph::ElementKind::Node => graph.nodes.iter().map(|table| &table.0).collect(),
+            super::graph::ElementKind::Edge => {
+                graph.edges.iter().map(|table| &table.table).collect()
+            }
+        };
+        for table in tables {
+            if !source.source_labels.contains(&table.labels) {
+                continue;
+            }
+            if let Some(field) = crate::graph::property_field(&table.schema, &key.value) {
+                let ty = field.data_type();
+                if *ty != DataType::Null && !result.contains(ty) {
+                    result.push(ty.clone());
+                }
+            }
+        }
+    }
+    Some(result)
+}
+
+pub(super) fn ensure_one_family(
+    bindings: &super::graph::Bindings,
+    expr: &ast::Expr,
+    operation: &str,
+) -> Result<()> {
+    let Some(types) = stored_property_types(Some(bindings), expr) else {
+        return Ok(());
+    };
+    let mut families = Vec::new();
+    for ty in &types {
+        let family = value_family(ty);
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    if families.len() <= 1 {
+        return Ok(());
+    }
+    let mut labels = types.iter().map(ToString::to_string).collect::<Vec<_>>();
+    labels.sort();
+    Err(Error::InvalidQuery(format!(
+        "{} cannot combine {}",
+        operation.to_ascii_uppercase(),
+        labels.join(" and ")
+    )))
+}
+
+fn value_family(ty: &DataType) -> String {
+    match ty {
+        ty if ty.is_numeric() => "numeric".into(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string".into(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytes".into(),
+        DataType::List(field) | DataType::LargeList(field) => {
+            format!("list<{}>", value_family(field.data_type()))
+        }
+        other => other.to_string(),
+    }
 }

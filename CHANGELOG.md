@@ -261,6 +261,9 @@
 - Compare properties of two elements in each side's stored type. A property
   read back as a string can still match a number on the other element, and a
   fragment that cannot compare stays unknown instead of failing the query.
+- Reject `MIN` and `MAX` when a property's selected fragments are not one
+  comparable family. Integers and floats still widen; a string fragment no
+  longer makes the extreme a lexicographic value.
 
 ## 0.2.0 — 2026-10-05
 

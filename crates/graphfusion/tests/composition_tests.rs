@@ -5231,3 +5231,102 @@ async fn stored_aggregate_identity_survives_enclosing_order_expression() {
         .unwrap();
     assert_eq!(strings(&result), vec![vec!["3".to_owned()]]);
 }
+
+#[tokio::test]
+async fn min_max_reject_mixed_property_families() {
+    let mut session = social().await;
+    let people = session
+        .query("MATCH (p:Person) RETURN MIN(p.id) AS lo, MAX(p.id) AS hi")
+        .await
+        .unwrap();
+    assert_eq!(people.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&people),
+        vec![vec!["1".to_string(), "2".to_string()]]
+    );
+
+    let scores = session
+        .query("MATCH (n:Person|Document) RETURN MIN(n.score) AS lo, MAX(n.score) AS hi")
+        .await
+        .unwrap();
+    assert_eq!(scores.schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        strings(&scores),
+        vec![vec!["1".to_string(), "2".to_string()]]
+    );
+
+    let widened = session
+        .query("MATCH (n:Person|Metric) RETURN MIN(n.score) AS lo, MAX(n.score) AS hi")
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1".to_string(), "2".to_string()]]
+    );
+
+    let minimum = session
+        .query("MATCH (n:Person|Document) RETURN MIN(n.id) AS lo")
+        .await
+        .unwrap_err();
+    assert!(
+        minimum
+            .to_string()
+            .contains("MIN cannot combine Int64 and Utf8"),
+        "{minimum}"
+    );
+    let maximum = session
+        .query("MATCH (n:Person|Document) RETURN MAX(DISTINCT n.id) AS hi")
+        .await
+        .unwrap_err();
+    assert!(
+        maximum
+            .to_string()
+            .contains("MAX cannot combine Int64 and Utf8"),
+        "{maximum}"
+    );
+}
+
+mod mixed_extrema_regressions {
+    use graphfusion::Database;
+    async fn session() -> graphfusion::Session {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:P {v:1}),(:T {v:'1'})")
+            .await
+            .unwrap();
+        s
+    }
+    #[tokio::test]
+    async fn mixed_family_provenance_is_checked_0() {
+        let mut s = session().await;
+        let r = s
+            .query("MATCH(n) RETURN MIN(COALESCE(n.v,NULL)) AS v")
+            .await;
+        assert!(r.is_err(), "mixed families accepted: {r:?}");
+    }
+    #[tokio::test]
+    async fn mixed_family_provenance_is_checked_1() {
+        let mut s = session().await;
+        let r = s.query("MATCH(n) LET r=n RETURN MIN(r.v) AS v").await;
+        assert!(r.is_err(), "mixed families accepted: {r:?}");
+    }
+}
+
+#[tokio::test]
+async fn extrema_wrappers_keep_reference_types_and_numeric_results() {
+    let mut session = social().await;
+    let result=session.query("MATCH(n:Person|Metric) LET r=n RETURN MIN(COALESCE(r.score,NULL)) AS lo, MAX(r.score+0) AS hi").await.unwrap();
+    assert_eq!(strings(&result), vec![vec!["1".to_owned(), "2".to_owned()]]);
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN MIN(NULLIF(n.id,NULL)) AS v")
+        .await;
+    assert!(
+        matches!(result, Err(graphfusion::Error::InvalidQuery(_))),
+        "{result:?}"
+    );
+    let result = session
+        .query("MATCH(n:Person|Document) RETURN MIN(COALESCE(n.id+0,NULL)) AS v")
+        .await
+        .unwrap();
+    assert_eq!(strings(&result), vec![vec!["1".to_owned()]]);
+}
