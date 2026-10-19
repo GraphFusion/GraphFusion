@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Unreleased
 
+- Report integer overflow and division by zero as execution errors
+  (`integer overflow`, `division by zero`). `1 / 0`, `9223372036854775807 + 1`,
+  and `i64::MIN / -1` no longer surface an Arrow error. A null dividend divided
+  by zero stays null.
 - Do not store an INSERT property when its value is null on every new row.
   `INSERT (:P {v: 1 + NULL})` leaves `v` unset, the same as omitting it, so a
   later value of a different type is not rejected as a mixed type.

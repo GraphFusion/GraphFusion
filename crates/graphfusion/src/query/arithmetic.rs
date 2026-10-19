@@ -69,7 +69,19 @@ pub(super) fn checked(left: Expr, op: Operator, right: Expr, data_type: DataType
                 Operator::Multiply => numeric::mul(left, right),
                 Operator::Divide => numeric::div(left, right),
                 _ => unreachable!("only arithmetic operators are bound to this UDF"),
-            }?;
+            };
+            // Integer kernels report these as Arrow failures. Surface the same
+            // execution errors as the float checks above, including MIN / -1.
+            let output = match output {
+                Ok(output) => output,
+                Err(datafusion::arrow::error::ArrowError::DivideByZero) => {
+                    return Err(DataFusionError::Execution("division by zero".into()));
+                }
+                Err(datafusion::arrow::error::ArrowError::ArithmeticOverflow(_)) => {
+                    return Err(DataFusionError::Execution("integer overflow".into()));
+                }
+                Err(error) => return Err(DataFusionError::from(error)),
+            };
             if let Some(values) = output.as_any().downcast_ref::<Float64Array>() {
                 if values.iter().flatten().any(|n| !n.is_finite()) {
                     return Err(DataFusionError::Execution(
@@ -490,17 +502,43 @@ mod tests {
         ])
         .unwrap();
         let data = SessionContext::new().read_batch(batch).unwrap();
-        assert!(data
+        let overflow = data
             .select(vec![checked(
                 col("a"),
                 Operator::Plus,
                 col("b"),
-                DataType::Int64
+                DataType::Int64,
             )])
             .unwrap()
             .collect()
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(
+            overflow.to_string().contains("integer overflow"),
+            "{overflow}"
+        );
+
+        let batch = RecordBatch::try_from_iter([
+            ("a", Arc::new(Int64Array::from(vec![1, 4])) as ArrayRef),
+            ("b", Arc::new(Int64Array::from(vec![0, 2])) as ArrayRef),
+        ])
+        .unwrap();
+        let data = SessionContext::new().read_batch(batch).unwrap();
+        let division = data
+            .select(vec![checked(
+                col("a"),
+                Operator::Divide,
+                col("b"),
+                DataType::Int64,
+            )])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(
+            division.to_string().contains("division by zero"),
+            "{division}"
+        );
     }
 
     #[tokio::test]
