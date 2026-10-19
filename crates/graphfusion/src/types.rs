@@ -156,6 +156,22 @@ impl ValueType {
                             return Err(Error::InvalidDefinition("CHAR accepts one length".into()))
                         }
                     }
+                } else if kind == "decimal" {
+                    match parameters.as_slice() {
+                        [] => {}
+                        [precision] => {
+                            t.parameters.insert("precision".into(), *precision);
+                        }
+                        [precision, scale] => {
+                            t.parameters.insert("precision".into(), *precision);
+                            t.parameters.insert("scale".into(), *scale);
+                        }
+                        _ => {
+                            return Err(Error::InvalidDefinition(
+                                "decimal accepts precision and scale".into(),
+                            ))
+                        }
+                    }
                 } else {
                     // Named syntax is retained semantically; precision is not an AST serialization.
                     for (i, v) in parameters.iter().enumerate() {
