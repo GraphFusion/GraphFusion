@@ -3075,3 +3075,19 @@ async fn next_except_and_intersect_keep_the_left_reference_layout() {
         assert_eq!(strings(&r), vec![vec!["1".to_string()],vec!["2".to_string()]], "{query}");
     }
 }
+
+#[tokio::test]
+async fn early_where_does_not_repeat_native_integer_comparisons_after_widening() {
+    let mut s = Database::new().session();
+    s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:I {v:9007199254740993}),(:F {v:0.0}),(:M {k:1})").await.unwrap();
+    for q in [
+        "MATCH(n:I|F) WHERE n.v>9007199254740992 RETURN COUNT(*) AS hits",
+        "MATCH(n:I|F),(m:M) WHERE n.v>9007199254740992 AND m.k=1 RETURN COUNT(*) AS hits",
+    ] {
+        assert_eq!(
+            strings(&s.query(q).await.unwrap()),
+            vec![vec!["1".to_string()]],
+            "{q}"
+        );
+    }
+}

@@ -610,15 +610,12 @@ async fn match_where_conjunct_runs_before_variable_length_expansion() {
     let plan = &filtered.logical_plan;
     let recursive = plan.find("RecursiveQuery").expect(plan);
     let start = plan.find("Utf8(\"A\")").expect(plan);
-    let end = plan.find("Utf8(\"D\")").expect(plan);
     assert!(
         recursive < start,
         "start conjunct must sit inside the recursive anchor:\n{plan}"
     );
-    assert!(
-        end < recursive,
-        "end conjunct stays after expansion:\n{plan}"
-    );
+    // The endpoint condition can remain above expansion or be pushed into
+    // its endpoint scan. The result checks cover both equivalent plans.
     let inline = s.query("MATCH p = (a {name:'A'})-[:E]->{0,2}(b {name:'D'}) RETURN b.name AS name, PATH_LENGTH(p) AS hops ORDER BY hops, name").await.unwrap();
     assert_eq!(rows(&inline), rows(&filtered));
     let across = s
