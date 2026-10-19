@@ -113,6 +113,10 @@
   when another label stores `id` as text, and `SET n.copied = n.id || '!'` no
   longer stores the decimal text of an integer. A fragment that cannot apply the
   operator yields null.
+- Evaluate arithmetic and string concatenation in `SELECT` `WHERE` on each
+  fragment's stored type. `WHERE n.id + 0 = 1` no longer fails when another
+  label stores `id` as text, and `WHERE n.id || '' = '1'` no longer matches an
+  integer that was cast to a string.
 - Scan a label pattern's compatible fragments only, so a multi-type graph keeps
   each type's property types and does not read unrelated tables. Integers widen
   to float when a pattern matches both; other mixed scalar properties are read
