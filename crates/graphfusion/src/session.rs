@@ -946,7 +946,14 @@ fn eval(tx: &mut StatementTxn, session: &SessionState, expression: &ast::Expr) -
             ast::Literal::Null | ast::Literal::Unknown => Value::Null,
             ast::Literal::Boolean(v) => Value::Boolean(*v),
             ast::Literal::Integer(v) => Value::Integer(*v),
-            ast::Literal::Decimal(v) => Value::Float(*v),
+            ast::Literal::Decimal(v) => {
+                if !v.is_finite() {
+                    return Err(Error::InvalidDefinition(
+                        "non-finite decimal literal".into(),
+                    ));
+                }
+                Value::Float(*v)
+            }
             ast::Literal::String(v) => Value::String(v.clone()),
             ast::Literal::Bytes(v) => Value::Bytes(v.clone()),
             _ => {
