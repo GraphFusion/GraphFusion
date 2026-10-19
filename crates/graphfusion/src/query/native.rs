@@ -147,6 +147,16 @@ pub(super) fn clause_filters(
     scope: &Bindings,
     expr: &ast::Expr,
 ) -> Result<Option<BTreeMap<String, NativeAtom>>> {
+    filters_with_values(session, schema, scope, expr, false)
+}
+
+fn filters_with_values(
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    expr: &ast::Expr,
+    working_row: bool,
+) -> Result<Option<BTreeMap<String, NativeAtom>>> {
     let Some(parts) = partition(expr) else {
         return Ok(None);
     };
@@ -157,7 +167,7 @@ pub(super) fn clause_filters(
     }
     let mut filters = BTreeMap::new();
     for (variable, local) in parts {
-        let Some(atom) = bind_local(session, schema, scope, &local)? else {
+        let Some(atom) = bind_local_value(session, schema, scope, &local, working_row)? else {
             return Ok(None);
         };
         filters.insert(variable, atom);
@@ -686,48 +696,62 @@ fn bind_local(
     scope: &Bindings,
     local: &Local,
 ) -> Result<Option<NativeAtom>> {
+    bind_local_value(session, schema, scope, local, false)
+}
+
+fn bind_local_value(
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    local: &Local,
+    working_row: bool,
+) -> Result<Option<NativeAtom>> {
     Ok(match local {
         Local::And(left, right) => match (
-            bind_local(session, schema, scope, left)?,
-            bind_local(session, schema, scope, right)?,
+            bind_local_value(session, schema, scope, left, working_row)?,
+            bind_local_value(session, schema, scope, right, working_row)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::And(Box::new(left), Box::new(right))),
             _ => None,
         },
         Local::Or(left, right) => match (
-            bind_local(session, schema, scope, left)?,
-            bind_local(session, schema, scope, right)?,
+            bind_local_value(session, schema, scope, left, working_row)?,
+            bind_local_value(session, schema, scope, right, working_row)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::Or(Box::new(left), Box::new(right))),
             _ => None,
         },
         Local::Xor(left, right) => match (
-            bind_local(session, schema, scope, left)?,
-            bind_local(session, schema, scope, right)?,
+            bind_local_value(session, schema, scope, left, working_row)?,
+            bind_local_value(session, schema, scope, right, working_row)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::Xor(Box::new(left), Box::new(right))),
             _ => None,
         },
-        Local::Not(inner) => {
-            bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Not(Box::new(inner)))
-        }
+        Local::Not(inner) => bind_local_value(session, schema, scope, inner, working_row)?
+            .map(|inner| NativeAtom::Not(Box::new(inner))),
         Local::Truth {
             inner,
             negated,
             value,
-        } => bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Truth {
-            inner: Box::new(inner),
-            negated: *negated,
-            value: *value,
-        }),
-        Local::Unknown { inner, negated } => {
-            bind_local(session, schema, scope, inner)?.map(|inner| NativeAtom::Unknown {
+        } => bind_local_value(session, schema, scope, inner, working_row)?.map(|inner| {
+            NativeAtom::Truth {
                 inner: Box::new(inner),
                 negated: *negated,
+                value: *value,
+            }
+        }),
+        Local::Unknown { inner, negated } => {
+            bind_local_value(session, schema, scope, inner, working_row)?.map(|inner| {
+                NativeAtom::Unknown {
+                    inner: Box::new(inner),
+                    negated: *negated,
+                }
             })
         }
         Local::Closed(expr) => {
-            let Some((bound, data_type)) = bind_closed(session, schema, scope, expr)? else {
+            let Some((bound, data_type)) = bind_value(session, schema, scope, expr, working_row)?
+            else {
                 return Ok(None);
             };
             if !matches!(data_type, DataType::Boolean | DataType::Null) {
@@ -743,7 +767,7 @@ fn bind_local(
             property,
             op,
             value,
-        } => bind_closed(session, schema, scope, value)?.map(|(expr, value_type)| {
+        } => bind_value(session, schema, scope, value, working_row)?.map(|(expr, value_type)| {
             NativeAtom::Compare {
                 property: property.clone(),
                 op: *op,
@@ -754,7 +778,7 @@ fn bind_local(
         Local::Coalesce(args) => {
             let mut bound = Vec::with_capacity(args.len());
             for arg in args {
-                let Some(atom) = bind_local(session, schema, scope, arg)? else {
+                let Some(atom) = bind_local_value(session, schema, scope, arg, working_row)? else {
                     return Ok(None);
                 };
                 bound.push(atom);
@@ -762,14 +786,15 @@ fn bind_local(
             Some(NativeAtom::Coalesce(bound))
         }
         Local::NullIf(left, right) => match (
-            bind_local(session, schema, scope, left)?,
-            bind_local(session, schema, scope, right)?,
+            bind_local_value(session, schema, scope, left, working_row)?,
+            bind_local_value(session, schema, scope, right, working_row)?,
         ) {
             (Some(left), Some(right)) => Some(NativeAtom::NullIf(Box::new(left), Box::new(right))),
             _ => None,
         },
         Local::Literal(value) => {
-            let Some((expr, value_type)) = bind_closed(session, schema, scope, value)? else {
+            let Some((expr, value_type)) = bind_value(session, schema, scope, value, working_row)?
+            else {
                 return Ok(None);
             };
             if value_type == DataType::Null {
@@ -784,7 +809,7 @@ fn bind_local(
             property,
             value,
             negated,
-        } => bind_closed(session, schema, scope, value)?.map(|(expr, value_type)| {
+        } => bind_value(session, schema, scope, value, working_row)?.map(|(expr, value_type)| {
             NativeAtom::NullIfNull {
                 property: property.clone(),
                 value: expr,
@@ -800,12 +825,15 @@ fn bind_local(
         } => {
             let mut bound = Vec::with_capacity(fallbacks.len());
             for fallback in fallbacks {
-                let Some((expr, data_type)) = bind_closed(session, schema, scope, fallback)? else {
+                let Some((expr, data_type)) =
+                    bind_value(session, schema, scope, fallback, working_row)?
+                else {
                     return Ok(None);
                 };
                 bound.push((expr, data_type));
             }
-            let Some((right, right_type)) = bind_closed(session, schema, scope, value)? else {
+            let Some((right, right_type)) = bind_value(session, schema, scope, value, working_row)?
+            else {
                 return Ok(None);
             };
             Some(NativeAtom::ValueCoalesce {
@@ -828,10 +856,21 @@ fn bind_closed(
     scope: &Bindings,
     value: &ast::Expr,
 ) -> Result<Option<(Expr, DataType)>> {
+    bind_value(session, schema, scope, value, false)
+}
+
+// Fragment joins can read the working row; scan pushdown cannot.
+fn bind_value(
+    session: &SessionState,
+    schema: &DFSchema,
+    scope: &Bindings,
+    value: &ast::Expr,
+    working_row: bool,
+) -> Result<Option<(Expr, DataType)>> {
     let Ok(expr) = Binder::with_bindings(session, schema, scope).bind(value) else {
         return Ok(None);
     };
-    if !expr.column_refs().is_empty() {
+    if !working_row && !expr.column_refs().is_empty() {
         return Ok(None);
     }
     let value_type = expr.get_type(schema)?;
@@ -1012,7 +1051,7 @@ pub(super) fn fragment_boolean(
     session: &SessionState,
     predicate: &ast::Expr,
 ) -> Result<(LogicalPlanBuilder, Option<Expr>)> {
-    let Some(filters) = clause_filters(session, plan.schema(), scope, predicate)? else {
+    let Some(filters) = filters_with_values(session, plan.schema(), scope, predicate, true)? else {
         return Ok((plan, None));
     };
     if filters

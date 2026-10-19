@@ -520,6 +520,132 @@ async fn mixed_label_filters_compare_stored_types() {
 }
 
 #[tokio::test]
+async fn filter_clause_compares_stored_types() {
+    let mut session = social().await;
+    let equal = session
+        .query("MATCH (n:Person|Document) FILTER n.id = 1 RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&equal), vec![vec!["Ada".to_string()]]);
+
+    let flipped = session
+        .query("MATCH (n:Person|Document) FILTER 1 = n.id RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&flipped), vec![vec!["Ada".to_string()]]);
+
+    let either = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id = 1 OR n.id = 'doc'
+             RETURN n.id AS id ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(either.schema.field(0).data_type(), &DataType::Utf8);
+    assert_eq!(
+        strings(&either),
+        vec![vec!["1".to_string()], vec!["doc".to_string()]]
+    );
+
+    let not_stringified = session
+        .query("MATCH (n:Person|Document) FILTER n.id = '1' RETURN n.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(not_stringified.row_count(), 0);
+
+    let negated = session
+        .query("MATCH (n:Person|Document) FILTER NOT n.id = 1 RETURN n.name AS name ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(strings(&negated), vec![vec!["Bea".to_string()]]);
+
+    let widened = session
+        .query("MATCH (n:Person|Metric) FILTER n.score > 1 RETURN n.score AS score ORDER BY score")
+        .await
+        .unwrap();
+    assert_eq!(widened.schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(
+        strings(&widened),
+        vec![vec!["1.5".to_string()], vec!["2".to_string()]]
+    );
+
+    let with_scalar = session
+        .query(
+            "MATCH (n:Person|Document) LET keep = TRUE
+             FILTER n.id = 1 OR NOT keep
+             RETURN n.name AS name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&with_scalar), vec![vec!["Ada".to_string()]]);
+
+    let across = session
+        .query(
+            "MATCH (n:Person|Document), (m:Metric)
+             FILTER n.id = 1 AND m.score = 1.5
+             RETURN n.name AS name, m.score AS score",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&across),
+        vec![vec!["Ada".to_string(), "1.5".to_string()]]
+    );
+
+    let exclusive = session
+        .query(
+            "MATCH (n:Person|Document) FILTER n.id = 1 XOR n.id <> 1
+             RETURN n.name AS name ORDER BY name",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&exclusive),
+        vec![vec!["Ada".to_string()], vec!["Bea".to_string()]]
+    );
+
+    let incompatible = session
+        .query("MATCH (d:Document) FILTER d.id = 1 RETURN d.title AS title")
+        .await;
+    assert!(
+        matches!(incompatible, Err(graphfusion::Error::InvalidQuery(_))),
+        "{incompatible:?}"
+    );
+
+    let unchanged = session
+        .query("MATCH (p:Person) FILTER FALSE RETURN p.name AS name")
+        .await
+        .unwrap();
+    assert_eq!(unchanged.row_count(), 0);
+
+    session
+        .run(
+            "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Bea'})
+             INSERT (a)-[:Knows {since: 1}]->(b);
+             MATCH (d:Document)
+             INSERT (d)-[:Cites {since: 'old'}]->(d)",
+        )
+        .await
+        .unwrap();
+    let edge = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() FILTER e.since = 1
+             RETURN e.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(strings(&edge), vec![vec!["1".to_string()]]);
+    let edge_text = session
+        .query(
+            "MATCH ()-[e:Knows|Cites]->() FILTER e.since = '1'
+             RETURN e.since AS since",
+        )
+        .await
+        .unwrap();
+    assert_eq!(edge_text.row_count(), 0);
+}
+
+#[tokio::test]
 async fn mixed_label_xor_compares_stored_types() {
     let mut session = social().await;
     let either = session
@@ -1234,5 +1360,37 @@ async fn closed_null_predicates_keep_stored_comparisons() {
                 "{q}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn stored_row_comparisons_keep_optional_misses_and_reference_types() {
+    let mut s = social().await;
+    let r = s.query("LET k = 1, keep = TRUE OPTIONAL MATCH (n:Person|Document {name:'absent'}) FILTER n.id = k OR keep RETURN 1 AS v").await.unwrap();
+    assert_eq!(r.row_count(), 1);
+    let r = s
+        .query("MATCH (n:Person|Document) LET r=n, k='doc' FILTER r.id = k RETURN r.title AS title")
+        .await
+        .unwrap();
+    assert_eq!(strings(&r), vec![vec!["Spec".to_string()]]);
+}
+
+#[tokio::test]
+async fn stored_row_comparisons_support_wrappers_and_repeated_predicates() {
+    let mut s = social().await;
+    for query in [
+        "MATCH (n:Person|Document) LET k='doc' FILTER n.id=k FILTER n.id=k RETURN n.title AS title",
+        "LET k='doc' MATCH (n:Person|Document WHERE n.id=k) WHERE n.id=k RETURN n.title AS title",
+        "LET k='doc' MATCH (n:Person|Document) WHERE (n.id=k) IS TRUE RETURN n.title AS title",
+        "MATCH (n:Person|Document) LET k='doc' FILTER COALESCE(n.id=k,FALSE) RETURN n.title AS title",
+    ] {
+        let r = s.query(query).await.unwrap();
+        assert_eq!(strings(&r), vec![vec!["Spec".to_string()]], "{query}");
+    }
+    for query in [
+        "MATCH (n:Person|Document) LET k='1' FILTER (n.id=k) IS TRUE RETURN n.name AS name",
+        "LET k='1' MATCH (n:Person|Document) WHERE (n.id=k) IS TRUE RETURN n.name AS name",
+    ] {
+        assert_eq!(s.query(query).await.unwrap().row_count(), 0, "{query}");
     }
 }

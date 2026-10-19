@@ -700,3 +700,21 @@ async fn stored_reference_comparison_rejects_deleted_aliases() {
     );
     assert_eq!(s.query("MATCH (n) RETURN n").await.unwrap().row_count(), 3);
 }
+
+#[tokio::test]
+async fn stored_row_comparison_rejects_deleted_elements() {
+    for variable in ["n", "r"] {
+        let mut s = Database::new().session();
+        s.run("CREATE GRAPH g ANY; SESSION SET GRAPH g; INSERT (:I {v:1,k:1}),(:I {v:2,k:2}),(:T {v:'1',k:3})").await.unwrap();
+        let query = format!("MATCH (n) LET r=n, target='1' MATCH (m:I {{k:1}}) DELETE m FILTER {variable}.v = target RETURN 1 AS v");
+        let error = s
+            .run(&query)
+            .await
+            .expect_err("deleted row comparison committed");
+        assert!(
+            error.to_string().contains("deleted or unavailable"),
+            "{error}"
+        );
+        assert_eq!(s.query("MATCH(n) RETURN n").await.unwrap().row_count(), 3);
+    }
+}

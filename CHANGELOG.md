@@ -2,6 +2,9 @@
 
 ## 0.3.0 — Unreleased
 
+- Compare a `FILTER` predicate on each matched fragment's stored property type.
+  `FILTER n.id = 1` no longer fails after a multi-type scan has unified those
+  values, and a string comparison does not match a stringified integer.
 - Evaluate `XOR` of property comparisons on each fragment's stored type. A
   multi-type filter such as `n.id = 1 XOR n.id <> 1` no longer fails after the
   scan has unified those values into one column.
