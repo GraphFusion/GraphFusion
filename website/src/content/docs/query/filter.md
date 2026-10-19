@@ -29,6 +29,8 @@ A property stored as different non-numeric types is compared on each fragment in
 
 A comparison between two properties uses each fragment's stored type, including a parenthesized path predicate. An integer is not equal to the same digits stored as text, and integer order is not lexicographic, when another fragment stores that name as a different type.
 
+Arithmetic and concatenation in `FILTER` use each source fragment's stored type. An integer property is not concatenated as its decimal text, and adding zero does not fail merely because another label stores that property as text. A fragment that cannot apply the operator is unknown.
+
 An OPTIONAL MATCH predicate participates in matching before null padding. A later FILTER runs after padding and can remove unmatched rows. Put conditions on the optional neighbor inside OPTIONAL MATCH when you want to keep input rows that have no such neighbor.
 
 A name bound on only some alternatives, or only on the present side of a questioned segment, is null on the other rows. A comparison with that null is unknown and does not keep the row. A repeated group exposes a list, so a property comparison on that name is rejected; write the comparison on the node inside the group to test each repetition.
