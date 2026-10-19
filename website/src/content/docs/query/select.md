@@ -26,3 +26,5 @@ HAVING COUNT(*) > 1;
 `WHERE` filters source rows; `HAVING` filters aggregate groups. `ALL`/`DISTINCT`, `GROUP BY ()`, output aliases and ordering are supported. A nested query cannot reference bindings from the outer query: correlated evaluation is not implemented.
 
 See [grouping](/query/group-by/) and [nested queries](/query/nested/).
+
+Arithmetic and concatenation in SELECT WHERE use each stored fragment type. An incompatible operation produces null before IS UNKNOWN or other enclosing wrappers are evaluated.

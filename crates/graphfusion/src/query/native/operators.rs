@@ -633,6 +633,17 @@ impl Compiler<'_> {
                     needed[index] = or(needed[index].clone(), active);
                 }
             }
+            let mut indices = Vec::new();
+            let mut projected = Vec::new();
+            for (index, demand) in needed.iter().enumerate() {
+                if !literal_bool(demand, true) && !literal_bool(demand, false) {
+                    indices.push(index);
+                    projected.push(("demand", demand.clone(), self.semantic(demand)));
+                }
+            }
+            for (index, column) in indices.into_iter().zip(self.project(projected)?) {
+                needed[index] = column;
+            }
             values.push(self.emit(*child, needed)?);
         }
         if let Some(readable) = node.readable {
@@ -843,8 +854,7 @@ fn cache_key(
                         .get(&binding.graph)
                         .map(|data| std::sync::Arc::as_ptr(data) as usize);
                     return Ok(format!(
-                        "property:{}:{}:{binding:?}:{snapshot:?}",
-                        name.value.to_ascii_lowercase(),
+                        "property:{}:{binding:?}:{snapshot:?}",
                         key.value.to_ascii_lowercase()
                     ));
                 }
