@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "graphfusion"
+version = "0.3.0.dev0"
+description = "Embedded GQL graph database powered by Apache DataFusion"
+readme = "python/README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["pyarrow>=18"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2"]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://graphfusion.github.io/"
+Repository = "https://github.com/GraphFusion/GraphFusion"
+
+[tool.maturin]
+manifest-path = "crates/graphfusion-python/Cargo.toml"
+python-source = "python"
+module-name = "graphfusion._native"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]

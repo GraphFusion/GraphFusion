@@ -77,6 +77,12 @@ support. Full ISO GQL conformance is not claimed. See the
 [limits](https://graphfusion.github.io/storage/limits/) before evaluating
 a workload.
 
+## Python
+
+The [Python bindings](python/README.md) provide in-memory and persistent databases,
+GQL scripts and queries, parameters, transactions, and Arrow/Pandas results.
+See the binding guide for source installation and PyPI release preparation.
+
 ## Development
 
 `crates/gql-parser` owns the lexer, AST and parser. `crates/graphfusion` owns the
