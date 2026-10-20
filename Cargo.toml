@@ -3,6 +3,7 @@ members = [
     "crates/graphfusion",
     "crates/gql-parser",
     "crates/graphfusion-wasm",
+    "crates/graphfusion-python",
 ]
 resolver = "2"
 

@@ -28,3 +28,12 @@ target
 /website/playwright-report/
 /website/legacy-dist/
 /website/public/wasm/
+
+# Python bindings
+/.venv/
+/dist/
+__pycache__/
+.pytest_cache/
+*.pyc
+/python/graphfusion/*.so
+/python/graphfusion/*.pyd
